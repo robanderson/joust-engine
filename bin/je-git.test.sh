@@ -553,10 +553,10 @@ rm -rf "$Y2"
 
 # Y4: SAFETY — je_cleanup NEVER touches a non-JE branch nor the base branch.
 Y4=$(mktemp -d); cleanup_setup "$Y4"
-git -C "$ADOPT_REPO" branch "rob/keepme" "$BASE"     # a non-JE local branch
+git -C "$ADOPT_REPO" branch "feature/keepme" "$BASE"     # a non-JE local branch
 ( cd "$ADOPT_REPO" && bash "$FLGIT" je_cleanup --apply "$BASE" "$RUNS_DIR" ) >/dev/null 2>&1
 git -C "$ADOPT_REPO" rev-parse --verify --quiet "refs/heads/$BASE" >/dev/null 2>&1 && ok "Y4: base branch preserved" || bad "Y4: base branch deleted (CATASTROPHIC)"
-git -C "$ADOPT_REPO" rev-parse --verify --quiet refs/heads/rob/keepme >/dev/null 2>&1 && ok "Y4: non-JE branch preserved" || bad "Y4: non-JE branch deleted"
+git -C "$ADOPT_REPO" rev-parse --verify --quiet refs/heads/feature/keepme >/dev/null 2>&1 && ok "Y4: non-JE branch preserved" || bad "Y4: non-JE branch deleted"
 [ -f "$ADOPT_REPO/README.md" ] && ok "Y4: main checkout files untouched" || bad "Y4: main checkout damaged"
 rm -rf "$Y4"
 

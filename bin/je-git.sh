@@ -68,8 +68,9 @@ je_suffix() {
   echo
 }
 
-# je_branch <loop> -> JE-<loop>-<suffix>. Overrides the global rob/ prefix for
-# loop branches only (the SKILL says so explicitly).
+# je_branch <loop> -> JE-<loop>-<suffix>. This fixed name is used as-is,
+# overriding any configured branch-prefix rule for loop branches only (the
+# SKILL says so explicitly).
 je_branch() {
   local k="${1:?loop number required}"
   echo "JE-${k}-$(je_suffix)"

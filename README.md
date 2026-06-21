@@ -247,7 +247,7 @@ In **two pass**, round 2 takes a **fresh Pool A draw only** — the distilled gu
 Per loop `k` (FAN topology — the default):
 
 1. **STOP-file kill switch** checked at the top of every iteration — create `<runDir>/STOP` at any time to halt before the next loop, without killing the harness.
-2. **Branch off base:** `JE-<loop>-<random7>` off the branch you started on. *(This name overrides the global `rob/` branch-prefix rule for loop branches only.)*
+2. **Branch off base:** `JE-<loop>-<random7>` off the branch you started on. *(This fixed name is used as-is, overriding any branch-prefix rule you have configured, for loop branches only.)*
 3. **Run the tournament** (the unchanged engine), with the task augmented by a **cross-loop ledger** of what prior loops already proposed, so each loop attacks something different.
 4. **Implement the winner** via the Opus `joust-implementer` agent — the *only* actor that writes to the real repo. It makes the smallest coherent change on the branch, leaves it **unstaged**, records ambiguities in `JE-NOTES.md`, and never runs git.
 5. **Verify, fail-closed.** Auto-detected commands (npm scripts, `ruff`/`pytest`, `make test/check`, `cargo`, `go`) run **fail-fast**; a failure or "no verify commands" routes the PR to **draft + `needs-human`** (with a capped tail of the failing output) and **halts the chain**.
@@ -275,7 +275,7 @@ bin/je-issue.sh new --sev sev2 --area parse \
    --title "…" --evidence-file EV.md                           # file an item (dedups first)
 bin/je-issue.sh next                                           # top open item (sev1 → sev3)
 bin/je-issue.sh claim <N> <run-id>                             # best-effort claim
-# fix on a rob/dogfood-<N> branch, open one PR with "Closes #<N>"
+# fix on a dogfood-<N> branch, open one PR with "Closes #<N>"
 ```
 
 - **Severity** `sev1` (wrong winners) · `sev2` (degraded but usable) · `sev3` (cosmetic/docs); **area** labels `area:review|runner|parse|git|skill|docs|infra`.

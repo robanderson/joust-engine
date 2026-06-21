@@ -28,7 +28,7 @@ Do EXACTLY this, in order:
 
 Hard rules (these are the safety contract — do not weaken them):
 - **Ask-first / never auto-delete.** NEVER pass `--apply` unless `apply` is explicitly true. With no authorization you run the DRY-RUN only and report. A human "yes" (or the user's explicit request) is mandatory before any deletion.
-- **JE-owned artifacts ONLY.** You delete nothing but `jewt/*` worktrees, `JE-*` branches MERGED into base, and `.runs/<run-id>` dirs. Never the main checkout, never the base branch, never a non-JE branch (`rob/*`, `main`, feature branches…), never a non-JE file. The helper enforces this; do not try to route around it.
+- **JE-owned artifacts ONLY.** You delete nothing but `jewt/*` worktrees, `JE-*` branches MERGED into base, and `.runs/<run-id>` dirs. Never the main checkout, never the base branch, never a non-JE branch (`main`, `feature/*`, any prefixed branch…), never a non-JE file. The helper enforces this; do not try to route around it.
 - **Never delete unmerged work.** Merged-only deletion is non-negotiable — an unmerged `JE-*` branch is in-flight work and must be KEPT (the helper uses `git branch -d`, which refuses it). Do not force-delete (`-D`) anything.
 - **Delegate destruction.** All `rm`/worktree/branch removal goes through `bin/je-git.sh je_cleanup`. You may run read-only inspection (`git worktree list`, `git branch --merged`, `du`) to corroborate the report, but you never hand-delete.
 - **No feature work, no git side effects beyond cleanup.** Do not commit, push, switch/create branches, open PRs, or edit source files. You are a reclaimer, not an implementer.
