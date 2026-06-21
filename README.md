@@ -1,6 +1,6 @@
 # Joust Engine
 
-> *Model-diverse agentic loops from concept to PR.*
+> *Model-diverse agentic coding tournaments taking concept to PR.*
 >
 > 🌐 **[joustengine.ai](https://joustengine.ai)** — *site coming soon*
 
@@ -24,6 +24,7 @@ That one line triggers the loop: it asks which model(s) to run the 5 attempts on
   - [Prose model spec](#prose-model-spec)
   - [Mixed and Top Mixed presets](#mixed-and-top-mixed-presets)
   - [Worked examples](#worked-examples)
+  - [The slash-command form](#the-slash-command-form)
 - [Model providers](#model-providers)
 - [Diversity injection](#diversity-injection-pool-a--pool-b)
 - [Grand loops (`Z >= 2`)](#grand-loops-z--2)
@@ -167,10 +168,38 @@ N = 5 → base 1 each (3), remainder 2 by priority → opus +1, glm-5.2 +1 → `
 | `@@JE two passes, 4 opus, 2 sonnet, 2 codex high, 2 glm 4.7, 2 minimax` | 12 | two | 1 | `[opus×4, sonnet×2, codex-high×2, glm-4.7×2, minimax-m3×2]` |
 | `@@JE:5:2:3` | 5 | two | 3 | grand-loop chain (authorization + per-loop PR) |
 | `joust:7:2` | 7 | two | 1 | prose marker, same as `@@JE:7:2` |
+| `/joust-engine:joust-engine @@JE:5 …` | 5 | single | 1 | [slash command](#the-slash-command-form); `@@JE:5` supplied as the arguments |
+| `/joust-engine:joust-engine 2 opus, 2 glm 5.2, …` | 4 | single | 1 | [slash command](#the-slash-command-form); prose spec → `[opus, opus, glm-5.2, glm-5.2]` (N inferred) |
+| `/joust-engine:joust-engine <bare task>` | gate | gate | 1 | [slash command](#the-slash-command-form); no sigil/spec → interactive gate, same as bare `@@JE` |
 
 > **Note the two different defaults.** When `@@JE` has **no N and no spec**, the parser returns `needsGate` — control passes to the interactive gate, where **N defaults to 6 and passes to 2**. That gate default is *not* the grammar default: an explicit `@@JE:5` (no M) is single pass, because the sigil's M defaults to **1**. Don't conflate the gate's "passes default to 2" with the sigil's "M defaults to 1."
 
 If you describe a generate-and-rank tournament in plain English with no marker at all, the skill can still infer single vs two pass and ask for N and the model.
+
+### The slash-command form
+
+The plugin also ships its triggers as **Claude Code slash commands**, so you can launch a tournament without writing a sigil at all. There are two:
+
+```text
+/joust-engine:joust-engine   ...      runs a tournament
+/joust-engine:joust-bench    ...      runs the throughput benchmark (see je-bench, below)
+```
+
+The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament skill are both named `joust-engine`, hence the doubled `/joust-engine:joust-engine`.
+
+**Whatever you type after the slash command is the arguments**, and Phase 0 feeds those arguments **verbatim** into the same `bin/je-parse.mjs` it would run on the body of an `@@JE` / `joust:` message. So the slash command is just a **different entry point into the same parser and the same skill** — it adds **no new flags** and changes **no behaviour**. Everything documented above (N, mode `M`, grand loops `Z`, task size, prose model specs, Top Mixed) works identically as slash-command arguments. You can even supply an explicit sigil in the arguments if you like:
+
+```text
+/joust-engine:joust-engine @@JE:5 Build a CLI that flattens nested JSON.
+/joust-engine:joust-engine 2 opus, 2 glm 5.2, Refactor the auth module.
+/joust-engine:joust-engine Design a rate-limiter.
+```
+
+- The **first** form passes an explicit `@@JE:5` as the arguments → 5 attempts, single pass.
+- The **second** is a prose model spec → N is inferred from the counts (`2 + 2 = 4`, `[opus, opus, glm-5.2, glm-5.2]`); no sigil needed.
+- The **third** is a bare task with no sigil and no spec → it falls back to the interactive model gate (where N defaults to 6 and passes to 2), exactly as a bare `@@JE` would.
+
+> **Don't confuse this with the install commands.** `/plugin marketplace add …` and `/plugin install …` (see [Installation & setup](#installation--setup)) are Claude Code's built-in commands for *adding* the plugin. `/joust-engine:joust-engine` and `/joust-engine:joust-bench` are the engine's own commands for *invoking* it once it's installed.
 
 ---
 
@@ -267,7 +296,7 @@ Joust Engine is a **self-contained Claude Code plugin** (`joust-engine`, skills 
 /plugin install joust-engine@joust-engine
 ```
 
-Once installed, the `@@JE` trigger and the `joust-engine` / `joust-bench` skills are available in your sessions; the bundled scripts under `bin/` are run with `node` / `bash` from the resolved plugin root. Confirm the `joust-engine` skill appears after installing.
+Once installed, the `@@JE` trigger and the `joust-engine` / `joust-bench` skills are available in your sessions; the bundled scripts under `bin/` are run with `node` / `bash` from the resolved plugin root. Confirm the `joust-engine` skill appears after installing. (To launch a tournament once installed, use the `@@JE` sigil, the `joust:` prose marker, or the [`/joust-engine:joust-engine` slash command](#the-slash-command-form) — all three feed the same parser.)
 
 > **Enabling dynamic workflows.** The preferred backend runs on Claude Code's dynamic-workflow orchestration. Turn it on by upgrading effort to its maximum: run `/effort` and select **ultracode** (max = xhigh reasoning + dynamic workflow orchestration). With it on, the tournament fans out through the `Workflow` engine and is watchable live in `/workflows`. Without it, the skill automatically falls back to manual Task-tool + `glm` CLI dispatch — the same tournament, just not driven by the workflow engine.
 
@@ -289,7 +318,7 @@ Every runner reads its key **from the environment** (exported in your shell prof
 
 ## The benchmarking system (`je-bench`)
 
-The `joust-bench` skill (trigger: ask to benchmark model speed, or run `/je-bench`) is a thin wrapper over `bin/je-bench.mjs`. It measures **generation throughput (tokens/second)** for every model the system can call, on a **cold** call (first call — connection/cache/route warmup for hosted providers, a genuine weight-load only for local MLX) and an immediate **hot** call (second identical call). It prints a table and **appends every result** to `<plugin>/.bench/results.jsonl` (append-only, written per-model immediately, so a crashed sweep keeps what it produced).
+The `joust-bench` skill (trigger: ask to benchmark model speed, run `/je-bench`, or the [`/joust-engine:joust-bench` slash command](#the-slash-command-form)) is a thin wrapper over `bin/je-bench.mjs`. It measures **generation throughput (tokens/second)** for every model the system can call, on a **cold** call (first call — connection/cache/route warmup for hosted providers, a genuine weight-load only for local MLX) and an immediate **hot** call (second identical call). It prints a table and **appends every result** to `<plugin>/.bench/results.jsonl` (append-only, written per-model immediately, so a crashed sweep keeps what it produced).
 
 ```sh
 # every callable model (local MLX list discovered live), cold + hot each:
