@@ -628,6 +628,9 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
       // Drop provider secrets before running untrusted candidate code (mirrors run_verify). The z.ai key
       // name is assembled at shell-runtime ("Z"+"AI_API_KEY") so the engine source keeps the #25 hygiene
       // guarantee (no literal ZAI key token in tournament.mjs); the same variable is still unset at runtime.
+      // Candidate (LLM-authored) verify/lint code below runs through `je_verify_exec` — the same sandbox
+      // chokepoint run_verify uses — so it is routed through the OS sandbox under the auto/strict policy
+      // (JE_VERIFY_SANDBOX), not executed directly. Secret-drop above remains the env-credential boundary.
       `for v in "Z""AI_API_KEY" MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN; do unset "$v"; done; ` +
       `enrichment_ok=0; vp=0; vf=0; vt=0; lp=0; lf=0; lt=0; bd=0; bf=0; bt=0; ` +
       `if bash "$helper" je_run_with_timeout "$timeout" -- bash "$helper" detect_verify "$ws" > "$commands" 2>/dev/null; then enrichment_ok=1; else : > "$commands"; fi; ` +
@@ -636,7 +639,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
         `read -r -a words <<< "$cmd"; [ "\${#words[@]}" -gt 0 ] || continue; ` +
         `is_lint=0; case "$cmd" in *lint*|*eslint*|*ruff*|*clippy*|*'go vet'*) is_lint=1;; esac; ` +
         `is_build=0; case "$cmd" in *build*) is_build=1; bd=1;; esac; ` +
-        `if (cd "$ws" && bash "$helper" je_run_with_timeout "$timeout" -- "\${words[@]}") >/dev/null 2>&1; then rc=0; else rc=$?; fi; ` +
+        `if (cd "$ws" && bash "$helper" je_run_with_timeout "$timeout" -- bash "$helper" je_verify_exec "\${words[@]}") >/dev/null 2>&1; then rc=0; else rc=$?; fi; ` +
         `if [ "$rc" -eq 0 ]; then vp=$((vp+1)); [ "$is_lint" -eq 0 ] || lp=$((lp+1)); ` +
         `elif [ "$rc" -eq 124 ]; then vt=$((vt+1)); [ "$is_lint" -eq 0 ] || lt=$((lt+1)); [ "$is_build" -eq 0 ] || bt=1; ` +
         `else vf=$((vf+1)); [ "$is_lint" -eq 0 ] || lf=$((lf+1)); [ "$is_build" -eq 0 ] || bf=1; fi; ` +
@@ -650,7 +653,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
       `while IFS= read -r cmd; do ` +
         `[ -n "$cmd" ] || continue; grep -Fqx "$cmd" "$commands" 2>/dev/null && continue; ` +
         `read -r -a words <<< "$cmd"; ` +
-        `if (cd "$ws" && bash "$helper" je_run_with_timeout "$timeout" -- "\${words[@]}") >/dev/null 2>&1; then rc=0; else rc=$?; fi; ` +
+        `if (cd "$ws" && bash "$helper" je_run_with_timeout "$timeout" -- bash "$helper" je_verify_exec "\${words[@]}") >/dev/null 2>&1; then rc=0; else rc=$?; fi; ` +
         `if [ "$rc" -eq 0 ]; then lp=$((lp+1)); elif [ "$rc" -eq 124 ]; then lt=$((lt+1)); else lf=$((lf+1)); fi; ` +
       `done < "$lint_commands"; ` +
       `bo=0; if [ "$bd" -eq 1 ] && [ "$bf" -eq 0 ] && [ "$bt" -eq 0 ]; then bo=1; fi; ` +

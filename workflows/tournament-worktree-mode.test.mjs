@@ -154,12 +154,14 @@ check('(enrich) pool replacement is atomic',
 // (5d) detector, every detected verify command, and every lint command use the landed timeout helper.
 check('(enrich) detect_verify targets candidate worktree and is timeout-wrapped',
   enrichSrc.includes('je_run_with_timeout "$timeout" -- bash "$helper" detect_verify "$ws"'))
-check('(enrich) verify commands are argv-split, never evaled, and timeout-wrapped',
+check('(enrich) verify commands are argv-split, never evaled, and timeout-wrapped through the sandbox chokepoint',
   enrichSrc.includes('read -r -a words <<< "$cmd"') &&
-  enrichSrc.includes('je_run_with_timeout "$timeout" -- "\\${words[@]}"') &&
+  enrichSrc.includes('je_run_with_timeout "$timeout" -- bash "$helper" je_verify_exec "\\${words[@]}"') &&
   !enrichSrc.includes('eval '))
-check('(enrich) lint commands share the same timeout-wrapped execution site',
-  (enrichSrc.match(/je_run_with_timeout \"\$timeout\" -- \"\\\$\{words\[@\]\}\"/g) || []).length === 2)
+check('(enrich) candidate code routes through je_verify_exec (sandbox policy), never executed directly',
+  !enrichSrc.includes('je_run_with_timeout "$timeout" -- "\\${words[@]}"'))
+check('(enrich) lint commands share the same sandbox-routed, timeout-wrapped execution site',
+  (enrichSrc.match(/je_run_with_timeout \"\$timeout\" -- bash \"\$helper\" je_verify_exec \"\\\$\{words\[@\]\}\"/g) || []).length === 2)
 check('(enrich) timeout is the canonical verify timeout default',
   enrichSrc.includes('timeout=\\${JE_VERIFY_CMD_TIMEOUT:-600}'))
 

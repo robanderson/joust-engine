@@ -22,6 +22,7 @@
 #   detect_verify [<dir>]                  -> prints detected verify commands (one/line); rc 0 if any; <dir> default '.'
 #   je_run_with_timeout <secs> -- <cmd...> -> run argv with a wall-clock watchdog; 124 == timed out
 #   je_verify_sandbox_exec <cmd...>        -> run argv through the selected sandbox; fail closed if unavailable
+#   je_verify_exec <cmd...>                -> run argv under the active sandbox policy (sandbox when active, else direct)
 #   run_verify                             -> reads commands on stdin or detects; fail-FAST; real rc
 #   commit_and_push <branch> <base> <msg>  -> commit (guarded) + push -u; rc propagated
 #   adopt_winner_branch <flBranch> <base> <winnerWorktreeBranch>
@@ -48,16 +49,66 @@ JE_NEEDS_HUMAN_LABEL="${JE_NEEDS_HUMAN_LABEL:-needs-human}"
 # which run_verify treats as a normal verify FAIL. Overridable (tests use a tiny value).
 JE_VERIFY_CMD_TIMEOUT="${JE_VERIFY_CMD_TIMEOUT:-600}"
 
-# Sandboxed verify is deliberately DEFAULT OFF. Only the Phase-7 driver may set
-# JE_VERIFY_SANDBOX=1, inline, after the nested audit cleared the exact diff.
+# JE_VERIFY_SANDBOX selects HOW verify commands (untrusted/attacker-influenced
+# build/test/lint code) are executed. It now defaults to AUTO (sandbox when one is
+# available) instead of OFF, so the safe path is the default rather than opt-in:
+#   auto  (DEFAULT, also when unset) -> route through the sandbox when one is
+#         available; otherwise run unsandboxed AND emit a loud warning, so hosts
+#         with no sandbox (e.g. Linux with no wrapper) keep working as before.
+#   1|on  -> ALWAYS route through the sandbox; if none is available the command is
+#         FAILED CLOSED (rc 125) and never run unsandboxed. The Phase-7 driver may
+#         set this inline, after the nested audit cleared the exact diff.
+#   0|off -> never sandbox (explicit opt-out; restores the pre-auto behavior, e.g.
+#         when a verify legitimately needs network/credentials the sandbox denies).
 # JE_VERIFY_SANDBOX_WRAPPER is an optional operator hook for a container/VM
 # launcher. It must name one executable which accepts:
 #
 #   wrapper -- <verify-command> <arg>...
 #
-# When unset, je_verify_sandbox_exec uses the macOS sandbox-exec reference
-# profile below. Missing/invalid wrappers fail closed; there is no unsandboxed
-# fallback while JE_VERIFY_SANDBOX=1.
+# When unset, je_verify_sandbox_exec uses the macOS sandbox-exec reference profile
+# below. Missing/invalid wrappers fail closed; there is no unsandboxed fallback once
+# a sandbox is being used (=1, or auto with a sandbox available).
+
+# --------------------------------------------------------------------------
+# Sandbox policy helpers (unattended verify-time RCE isolation).
+#
+# _je_sandbox_available — rc 0 iff a sandbox LEAF can actually run. Mirrors
+# je_verify_sandbox_exec's own resolution exactly: if JE_VERIFY_SANDBOX_WRAPPER is
+# set it must resolve on PATH; otherwise macOS `sandbox-exec` must be present. This
+# lets AUTO decide "sandbox or fall back" with the SAME availability test the leaf
+# will use, so the gate decision can never disagree with what execution does.
+# --------------------------------------------------------------------------
+_je_sandbox_available() {
+  local w="${JE_VERIFY_SANDBOX_WRAPPER:-}"
+  if [ -n "$w" ]; then
+    command -v "$w" >/dev/null 2>&1
+    return $?
+  fi
+  command -v sandbox-exec >/dev/null 2>&1
+}
+
+# _je_sandbox_active — rc 0 => verify execution MUST be routed through the sandbox;
+# rc 1 => run unsandboxed (only for off, or auto with no sandbox available).
+_je_sandbox_active() {
+  case "${JE_VERIFY_SANDBOX:-auto}" in
+    0|off|false|no)  return 1 ;;
+    1|on|true|yes)   return 0 ;;   # strict: route; je_verify_sandbox_exec fails closed if unavailable
+    *)               _je_sandbox_available ;;   # auto (the default)
+  esac
+}
+
+# je_verify_exec <cmd argv...> — the SINGLE chokepoint every untrusted verify command
+# flows through (run_verify here AND tournament.mjs enrichment). Routes argv to the
+# sandbox leaf when the policy is active, else runs it directly. The wall-clock
+# watchdog stays OUTSIDE this (callers wrap je_verify_exec in je_run_with_timeout),
+# so a hung sandbox/wrapper is still killed. No `eval`: argv is passed through intact.
+je_verify_exec() {
+  if _je_sandbox_active; then
+    je_verify_sandbox_exec "$@"
+  else
+    "$@"
+  fi
+}
 
 # --------------------------------------------------------------------------
 # je_suffix — 7 chars from [0-9a-z], macOS-portable, /dev/urandom only.
@@ -156,10 +207,12 @@ detect_verify() {
 #
 # Inspects modified (unstaged + staged) AND new untracked files. rc 0 == safe
 # (nothing executable touched), rc 1 == unsafe (prints the offending files). When
-# JE_VERIFY_SANDBOX=1, an unsafe hit is reported as accepted for sandbox routing
-# and returns 0; run_verify then MUST route every command through the sandbox
-# leaf. With the flag unset/0, behavior is byte-identical to issue #21. When not
-# inside a git work tree there is no implementer diff to gate, so rc 0.
+# a sandbox is active (JE_VERIFY_SANDBOX=1, or the AUTO default with a sandbox
+# available), an unsafe hit is reported as accepted for sandbox routing and returns
+# 0; run_verify then MUST route every command through the sandbox leaf. With no
+# sandbox active (JE_VERIFY_SANDBOX=0, or auto with none available), behavior is
+# byte-identical to issue #21 (refuse). When not inside a git work tree there is no
+# implementer diff to gate, so rc 0.
 # --------------------------------------------------------------------------
 verify_safe_diff() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
@@ -193,13 +246,13 @@ verify_safe_diff() {
     esac
   done
   if [ "${#hits[@]}" -gt 0 ]; then
-    if [ "${JE_VERIFY_SANDBOX:-0}" = "1" ]; then
+    if _je_sandbox_active; then
       echo "JE-VERIFY-SANDBOX-ROUTE: verify-executable file(s) accepted only for sandboxed verify:" >&2
       for f in "${hits[@]}"; do echo "  - $f" >&2; done
       return 0
     fi
-    # DEFAULT-OFF PATH: keep the issue-#21 output and return code exactly as
-    # before P6.
+    # NOT sandboxed (JE_VERIFY_SANDBOX=0, or auto with no sandbox available): keep the
+    # issue-#21 fail-closed output and return code exactly — a human must review.
     echo "JE-VERIFY-REFUSE-UNSAFE: implementer change touches verify-executable file(s); a human must review before local verify runs:" >&2
     for f in "${hits[@]}"; do echo "  - $f" >&2; done
     return 1
@@ -416,6 +469,17 @@ run_verify() {
     return 2
   fi
 
+  # SANDBOX-AUTO WARNING: under the auto default, when no sandbox is available we run
+  # verify UNSANDBOXED (so non-macOS hosts keep working) — but on-disk credentials are
+  # then NOT isolated, so say so loudly. Suppressed for the deliberate opt-out (=0/off)
+  # and never reached for strict (=1) or auto-with-sandbox (those route to the sandbox).
+  if ! _je_sandbox_active; then
+    case "${JE_VERIFY_SANDBOX:-auto}" in
+      0|off|false|no) : ;;   # deliberate opt-out — no warning
+      *) echo "JE-VERIFY-SANDBOX-WARN: no OS sandbox available; running verify UNSANDBOXED (on-disk credentials are NOT isolated). Set JE_VERIFY_SANDBOX_WRAPPER to a sandbox launcher, or JE_VERIFY_SANDBOX=0 to silence." >&2 ;;
+    esac
+  fi
+
   local rc=0 c
   local -a words
   for c in "${cmds[@]}"; do
@@ -426,27 +490,15 @@ run_verify() {
     read -r -a words <<< "$c"
     [ "${#words[@]}" -gt 0 ] || continue
     # Direct rc capture; break on first failure so a later success cannot mask it.
-    # Per-command wall-clock watchdog (macOS has no `timeout`); a 124 (timed out)
-    # is a nonzero rc and so is handled by the existing fail path below, as a FAIL.
-    if [ "${JE_VERIFY_SANDBOX:-0}" = "1" ]; then
-      # Timeout OUTSIDE, sandbox at the LEAF. The wrapper receives argv, not a
-      # shell string. Missing wrapper/profile returns nonzero before argv runs.
-      if je_run_with_timeout "$JE_VERIFY_CMD_TIMEOUT" -- je_verify_sandbox_exec "${words[@]}"; then
-        echo "JE-VERIFY-OK: $c"
-      else
-        rc=$?
-        echo "JE-VERIFY-FAIL: $c (exit $rc)" >&2
-        break
-      fi
+    # Per-command wall-clock watchdog (macOS has no `timeout`) stays OUTSIDE; the sandbox
+    # decision is at the LEAF via je_verify_exec. A 124 (timed out) or 125 (sandbox
+    # unavailable under strict) is a nonzero rc handled by the fail path below as a FAIL.
+    if je_run_with_timeout "$JE_VERIFY_CMD_TIMEOUT" -- je_verify_exec "${words[@]}"; then
+      echo "JE-VERIFY-OK: $c"
     else
-      # DEFAULT-OFF PATH: intentionally identical to pre-P6 execution.
-      if je_run_with_timeout "$JE_VERIFY_CMD_TIMEOUT" -- "${words[@]}"; then
-        echo "JE-VERIFY-OK: $c"
-      else
-        rc=$?
-        echo "JE-VERIFY-FAIL: $c (exit $rc)" >&2
-        break
-      fi
+      rc=$?
+      echo "JE-VERIFY-FAIL: $c (exit $rc)" >&2
+      break
     fi
   done
 
@@ -1022,6 +1074,7 @@ if ! _je_is_sourced; then
     verify_safe_diff)      verify_safe_diff "$@" ;;
     je_run_with_timeout)   je_run_with_timeout "$@" ;;
     je_verify_sandbox_exec) je_verify_sandbox_exec "$@" ;;
+    je_verify_exec)        je_verify_exec "$@" ;;
     run_verify)            run_verify "$@" ;;
     commit_and_push)       commit_and_push "$@" ;;
     adopt_winner_branch)   adopt_winner_branch "$@" ;;
@@ -1046,6 +1099,7 @@ Functions:
   verify_safe_diff                (rc 0 safe, rc 1 implementer touched executable file)
   je_run_with_timeout <secs> -- <cmd...>   (run argv with a wall-clock watchdog; rc 124 == timed out)
   je_verify_sandbox_exec <cmd...> (run argv through the selected sandbox; rc 125 == sandbox unavailable, fail-closed)
+  je_verify_exec <cmd...>         (run argv under the active sandbox policy: sandbox when active, else direct)
   run_verify                      (FROZEN commands on stdin one/line; gated + secrets dropped)
   commit_and_push <branch> <base> <message>
   adopt_winner_branch <flBranch> <base> <winnerWorktreeBranch>   (repo-anchored: alias JE- branch to winner's EXACT commit + push -u)
