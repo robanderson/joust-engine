@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "joust-engine",
-      "description": "Model-diverse agentic loops from concept to PR. Hand it a task; it produces N independent attempts in parallel across a mix of models, judges them blind with a fixed Opus reviewer, and names a winner. Two-pass adds a guided second round; grand loops implement each winner into a real branch and open a PR. Trigger with the @@JE sigil or the 'joust engine:N' prose marker.",
+      "description": "Model-diverse agentic loops from concept to PR. Hand it a task; it produces N independent attempts in parallel across a mix of models, judges them blind with a fixed Opus reviewer, and names a winner. Two-pass adds a guided second round; grand loops implement each winner into a real branch and open a PR. Trigger with the @@JE sigil or the 'joust:N' prose marker.",
       "source": "./"
     }
   ]

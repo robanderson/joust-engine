@@ -140,17 +140,17 @@ parseCase('bare @@JE', 'do abc @@JE',
   { task: 'do abc', n: null, mode: 1, z: 1, assignment: null, needsGate: true }, { noErrors: true });
 
 // --- prose marker ---
-parseCase('prose marker N', 'do abc :joust engine:5',
+parseCase('prose marker N', 'do abc :joust:5',
   { n: 5, mode: 1, z: 1 }, { noErrors: true });
-parseCase('prose marker N:2', 'do abc: joust engine:5:2',
+parseCase('prose marker N:2', 'do abc: joust:5:2',
   { n: 5, mode: 2, z: 1 }, { noErrors: true });
-parseCase('prose marker upper', 'refactor this JOUST ENGINE:5',
+parseCase('prose marker upper', 'refactor this JOUST:5',
   { n: 5, mode: 1, z: 1 }, { noErrors: true });
 
 // --- prose model spec (Feature 2) ---
 parseCase('spec headline', 'build a parser with 2 opus, 2 glm 5.2, 1 codex high @@JE',
   { n: 5, mode: 1, z: 1, assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
-parseCase('spec bare codex -> medium', 'do abc, 1 opus and 1 sonnet and 1 codex joust engine:3',
+parseCase('spec bare codex -> medium', 'do abc, 1 opus and 1 sonnet and 1 codex joust:3',
   { n: 3, mode: 1, z: 1, assignment: ['opus', 'sonnet', 'codex-medium'] }, { noErrors: true });
 parseCase('spec bare glm -> 5.2', 'do x with 3 glm @@JE',
   { n: 3, z: 1, assignment: ['glm-5.2', 'glm-5.2', 'glm-5.2'] }, { noErrors: true });
@@ -253,7 +253,7 @@ parseCase('Z=5 at the ceiling valid', 'tidy things up @@JE:3:1:5',
   { n: 3, mode: 1, z: 5 }, { noErrors: true });
 
 // --- Z>=2 via prose marker ---
-parseCase('Z=3 prose marker', 'optimise this loop, joust engine:4:2:3',
+parseCase('Z=3 prose marker', 'optimise this loop, joust:4:2:3',
   { n: 4, mode: 2, z: 3 }, { noErrors: true });
 
 // --- Z>=2 with N inferred from a prose spec (empty-N sigil form) ---
@@ -338,7 +338,7 @@ parseCase('D-0006 single pass -> mode 1', 'refactor @@JE:4 single pass',
   { task: 'refactor', n: 4, mode: 1, z: 1 }, { noErrors: true });
 parseCase('D-0006 one pass -> mode 1', 'do x @@JE:4 one pass',
   { mode: 1 }, { noErrors: true });
-parseCase('D-0006 prose marker + two pass', 'do X joust engine:4 two pass',
+parseCase('D-0006 prose marker + two pass', 'do X joust:4 two pass',
   { n: 4, mode: 2 }, { noErrors: true });
 // sigil :M wins; agreeing prose is fine.
 parseCase('D-0006 sigil M=2 agrees with two pass', '@@JE:4:2 two pass, do X',

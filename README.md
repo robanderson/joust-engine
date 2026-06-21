@@ -1,8 +1,8 @@
 # Joust Engine
 
 > *Model-diverse agentic loops from concept to PR.*
-
-![Joust Engine in action](docs/images/joust-engine-in-action.png)
+>
+> 🌐 **[joustengine.ai](https://joustengine.ai)** — *site coming soon*
 
 **Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* Anthropic Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax); the judge is always Opus, held fixed so the comparison stays honest.
 
@@ -109,7 +109,7 @@ Put a trigger anywhere in your message; **the text before it is the task**. All 
 
 **Positional skips are forbidden.** `@@JE:5::3` is invalid — to set Z with a default M, write `@@JE:5:1:3`. (`Z=1` and omitting Z are byte-identical: today's isolated tournament.)
 
-There is also a **prose marker** that extends identically: `joust engine:N[:M[:Z]]` — e.g. `do abc :joust engine:5` (single) or `do abc: joust engine:5:2` (two pass).
+There is also a **prose marker** that extends identically: `joust:N[:M[:Z]]` — e.g. `do abc :joust:5` (single) or `do abc: joust:5:2` (two pass).
 
 ### Task size (dynamic limits)
 
@@ -166,7 +166,7 @@ N = 5 → base 1 each (3), remainder 2 by priority → opus +1, glm-5.2 +1 → `
 | `@@JE 2 opus, 2 glm 5.2, 1 codex high` | 5 | single | 1 | `[opus, opus, glm-5.2, glm-5.2, codex-high]` (N inferred from the spec) |
 | `@@JE two passes, 4 opus, 2 sonnet, 2 codex high, 2 glm 4.7, 2 minimax` | 12 | two | 1 | `[opus×4, sonnet×2, codex-high×2, glm-4.7×2, minimax-m3×2]` |
 | `@@JE:5:2:3` | 5 | two | 3 | grand-loop chain (authorization + per-loop PR) |
-| `joust engine:7:2` | 7 | two | 1 | prose marker, same as `@@JE:7:2` |
+| `joust:7:2` | 7 | two | 1 | prose marker, same as `@@JE:7:2` |
 
 > **Note the two different defaults.** When `@@JE` has **no N and no spec**, the parser returns `needsGate` — control passes to the interactive gate, where **N defaults to 6 and passes to 2**. That gate default is *not* the grammar default: an explicit `@@JE:5` (no M) is single pass, because the sigil's M defaults to **1**. Don't conflate the gate's "passes default to 2" with the sigil's "M defaults to 1."
 
@@ -367,8 +367,7 @@ joust-engine/
 │   └── README.je-bench.md              # je-bench usage + results-format reference
 ├── docs/
 │   ├── dogfood/archive/                # read-only legacy D-NNNN evidence
-│   ├── dogfood/inbox/                  # committed offline drafts (no-gh fallback)
-│   └── *.md                            # design notes (grand loops, persisted outcomes, …)
+│   └── dogfood/inbox/                  # committed offline drafts (no-gh fallback)
 └── .bench/results.jsonl                # append-only je-bench history
 ```
 

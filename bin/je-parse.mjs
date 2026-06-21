@@ -309,7 +309,7 @@ function intSeg(raw) {
 // The trailing-segment groups are kept optional so '@@JE', '@@JE:5',
 // '@@JE:5:2' and '@@JE:5:2:3' all match.
 const SIGIL_RX = /@@je(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
-const PROSE_RX = /joust\s+engine(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
+const PROSE_RX = /joust\s*:\s*(\d*)(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
 
 // ---------------------------------------------------------------------------
 // Prose model-spec scan (two-stage).
@@ -488,7 +488,7 @@ function parse(rawInput) {
   if (!marker) {
     // No marker at all. Caller decides whether to trigger on plain language;
     // here we just report no usable invocation.
-    errors.push('No @@JE sigil or "joust engine:N" marker found.');
+    errors.push('No @@JE sigil or "joust:N" marker found.');
     result.errors = errors;
     return result;
   }
