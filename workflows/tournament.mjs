@@ -628,7 +628,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
       // Drop provider secrets before running untrusted candidate code (mirrors run_verify). The z.ai key
       // name is assembled at shell-runtime ("Z"+"AI_API_KEY") so the engine source keeps the #25 hygiene
       // guarantee (no literal ZAI key token in tournament.mjs); the same variable is still unset at runtime.
-      `for v in "Z""AI_API_KEY" MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN; do unset "$v"; done; ` +
+      `for v in "Z""AI_API_KEY" MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN; do unset "$v"; done; ` +
       `enrichment_ok=0; vp=0; vf=0; vt=0; lp=0; lf=0; lt=0; bd=0; bf=0; bt=0; ` +
       `if bash "$helper" je_run_with_timeout "$timeout" -- bash "$helper" detect_verify "$ws" > "$commands" 2>/dev/null; then enrichment_ok=1; else : > "$commands"; fi; ` +
       `while IFS= read -r cmd; do ` +
