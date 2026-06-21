@@ -1,0 +1,17 @@
+{
+  "name": "joust-engine",
+  "version": "0.0.1",
+  "description": "Tooling and test harness for the Joust Engine Claude Code plugin. The plugin itself is defined in .claude-plugin/; this manifest exists only to pin the toolchain and provide a single entry point for the deterministic test suite (Layer A). It is not published to npm.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "check": "node scripts/check-static.mjs",
+    "ci": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Rob Anderson",
+  "license": "SEE LICENSE IN LICENSE"
+}

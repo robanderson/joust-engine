@@ -1,0 +1,44 @@
+# CI lane 1 (see issue #6): deterministic, model-free checks that run on every
+# push and pull request. This exercises the Joust Engine's TOOLING (Layer A) — the
+# parser, git/gh helpers, contribution math, output parsing, key-hygiene guards —
+# all of which run with plain node/bash and call no model and no network.
+#
+# It deliberately does NOT test skill behaviour (Layer B: does Claude trigger on
+# @@JE, run blind attempts, etc.). That needs a model in the loop and belongs in a
+# separate, opt-in, secret-gated evals workflow — never on every PR.
+#
+# NOTE: the repo's top-level `workflows/` directory is the tournament ENGINE SOURCE,
+# not GitHub Actions. CI workflows live here, under `.github/workflows/`.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests + static checks
+    # The bin/*.sh tests are written to be macOS-portable (no GNU coreutils); run
+    # on both Linux and macOS so that portability claim stays honest.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      # No dependencies to install (no lockfile); this repo's tests are stdlib-only.
+      - name: Static checks (manifests + component files)
+        run: npm run check
+
+      - name: Deterministic test suite
+        run: npm test
