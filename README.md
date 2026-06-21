@@ -359,6 +359,10 @@ A Claude Code plugin: a manifest, two skills, eight agents, the workflow engine,
 ```text
 joust-engine/
 ├── plugin.json                         # plugin manifest (name, version, skills, agents)
+├── package.json                        # toolchain pin + test entry points (not published to npm)
+├── .nvmrc                              # pinned Node version for local dev + CI
+├── .github/workflows/ci.yml            # CI lane 1: runs `npm run ci` on push + PR
+├── scripts/                            # dev tooling (run-tests, static checks)
 ├── DOGFOOD.md                          # pointer stub → live backlog is GitHub Issues
 ├── skills/
 │   ├── joust-engine/
@@ -407,6 +411,36 @@ joust-engine/
 - **Agents are thin command-runners.** Anthropic attempts run native via the Task tool. Each non-Anthropic attempt runs through its wrapper agent (a cheap Bash-only driver) executing the matching `bin/*-run.sh` — the script sets provider env, closes stdin, calls the nested `claude`/`codex`, and writes the provenance marker. This indirection exists because a wrapper handed a *raw* nested command proved unreliable (it would solve the task itself, refuse on "safety," or let the weak inner model bail without saving); it matters most for **codex**, a fully autonomous external agent.
 - **The judge is fixed.** Reviewer and final ranker are always Opus via the Task tool. Before judging, the engine **stages** each deliverable into a clean blind tree (copying files and deleting the known engine files — `_brief.txt`, the run logs — by exact name, an *allowlist* that keeps legitimately `_`-prefixed deliverables), **validates** the success provenance contract, and **pools** the valid deliverables into one blind-labelled `_pool.md` the judge reads — failing closed on any invalid candidate.
 - **Grand loops** add `joust-implementer` (the only repo-writer) and `bin/je-git.sh` (all git/gh); the tournament engine itself stays repo-pure.
+
+---
+
+## Development
+
+The deterministic tooling (the `bin/` runners, the pure helpers in
+`workflows/tournament.mjs`) ships with a test suite. There is one entry point —
+the same command runs locally and in CI:
+
+```bash
+npm test       # run every test (node:test + the hand-rolled harnesses + the bash tests)
+npm run check  # static, model-free checks: manifests are valid JSON; every agent/skill
+               # named in plugin.json has its file on disk
+npm run ci     # check + test, exactly what CI runs
+```
+
+No dependencies to install — the tests are Node/Bash stdlib only. Node is pinned in
+`.nvmrc` (run `nvm use`). `npm test` discovers and runs each `*.test.mjs` /
+`*.test.sh` under `workflows/` and `bin/`; add a test by dropping a new file there.
+
+**Scope:** this covers the *tooling* — the parser, git/gh helpers, contribution
+math, output parsing, and key-hygiene guards — which call no model and need no
+network. It does **not** test skill *behaviour* (whether Claude triggers on `@@JE`,
+runs blind attempts, etc.); that needs a model in the loop and is an evals concern,
+not a unit test. CI runs on every push and PR via
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+> **Naming caveat:** the top-level `workflows/` directory is the tournament
+> **engine source**, *not* GitHub Actions. CI workflows live under
+> `.github/workflows/`.
 
 ---
 
