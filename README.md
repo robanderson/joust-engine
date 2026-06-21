@@ -4,7 +4,7 @@
 >
 > 🌐 **[joustengine.ai](https://joustengine.ai)** — *site coming soon*
 
-**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* Anthropic Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax); the judge is always Opus, held fixed so the comparison stays honest.
+**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* Anthropic Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax, xAI Grok); the judge is always Opus, held fixed so the comparison stays honest.
 
 ```text
 @@JE:5  Build a CLI that flattens nested JSON to dotted keys.
@@ -205,7 +205,7 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 
 ## Model providers
 
-Attempts can run on five providers. The **reviewer and final ranker are always Anthropic Opus**, dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
+Attempts can run on six providers. The **reviewer and final ranker are always Anthropic Opus**, dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
 
 | Provider | Models (selectable axis) | Dispatch | Auth (from the **environment**) |
 |---|---|---|---|
@@ -214,6 +214,7 @@ Attempts can run on five providers. The **reviewer and final ranker are always A
 | **Local MLX** | dynamic on-device list (via the `omlx` server) | `claude` pointed at `http://127.0.0.1:8000` via `bin/local-run.sh` | `OMLX_AUTH_TOKEN` |
 | **Codex (OpenAI)** | `gpt-5.5`, axis = reasoning effort: `codex-low/medium/high/xhigh` | `codex exec` via `bin/codex-run.sh` | `~/.codex/auth.json` (no env var) |
 | **MiniMax** | `MiniMax-M3` (the only model) | `claude` pointed at the MiniMax endpoint via `bin/minimax-run.sh` | `MINIMAX_API_KEY` |
+| **Grok (xAI)** | `grok-build` · `grok-composer-2.5-fast` | `grok` CLI via `bin/grok-run.sh` through the `joust-grok` agent | `grok.com` OAuth session (`~/.grok/auth.json`), or `XAI_API_KEY` (`xai-` prefix) as a headless fallback |
 
 A few provider specifics worth knowing:
 
@@ -222,10 +223,11 @@ A few provider specifics worth knowing:
 - **Local MLX** has a **dynamic** catalogue: fetch it live with `omlx-models` (or `curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_AUTH_TOKEN" | jq -r '.data[].id'`). Ids pass straight through as `--model <exact-id>`. Local models are **free** (on-device) but slower, and small ones can be unreliable at saving a deliverable; prefer hosted providers for heavy writing tasks.
 - **Codex** is **pinned to `gpt-5.5`** — the only model the local ChatGPT-account auth serves (other ids return HTTP 400 unless you set `OPENAI_API_KEY` for API-key billing). So the lever is **reasoning effort**: `low | medium | high | xhigh` ("Extra high"; `minimal` is rejected). Codex has **no turn cap**, so its only per-attempt backstop is the wall clock (`codexTimeoutSecs`, default 600s). It bills your OpenAI/ChatGPT plan.
 - **MiniMax** exposes one model, `MiniMax-M3` (512K context), pinned via `ANTHROPIC_MODEL=MiniMax-M3` (so there's no `--model` flag). It bills your MiniMax plan; M3 was fast and clean on a heavy multi-file build in testing.
+- **Grok** is the `grok` headless CLI, selected on a `-m` model axis (`grok-build` · `grok-composer-2.5-fast`) and dispatched through the `joust-grok` agent. Unlike GLM/MiniMax it injects **no** env key: `grok` resolves its own credential, preferring an active `grok.com` OAuth session (`~/.grok/auth.json`) and falling back to `XAI_API_KEY` (`xai-` prefix) on a headless box — mirroring how Codex reads `~/.codex/auth.json`. It honours **both** per-attempt guards (a `--max-turns` cap and the wall-clock timeout), and runs hermetic by default (no web search).
 
 **Every runner reads its key from the environment** — never by sourcing or grepping rc files — so the providers stay uniform. A provider whose key is unset produces an honest failure, not a fake fallback.
 
-**Provenance check (the anti-spoofing guard).** Every non-Anthropic attempt writes a marker into its run log proving it actually hit the intended endpoint — `JOUST-GLM-PROVENANCE endpoint=api.z.ai`, `JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000`, `JOUST-CODEX-PROVENANCE endpoint=api.openai.com`, `JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io` — plus a `DONE exit=0` with no `TIMEOUT`/`ERROR`. The validator is **line-anchored and provider-specific** (`^JOUST-<PROV>-…`), so an attempt whose own deliverable merely *mentions* a marker token can't false-fail. A candidate with no marker or no saved file is treated as a failed attempt and excluded; the round proceeds over the survivors.
+**Provenance check (the anti-spoofing guard).** Every non-Anthropic attempt writes a marker into its run log proving it actually hit the intended endpoint — `JOUST-GLM-PROVENANCE endpoint=api.z.ai`, `JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000`, `JOUST-CODEX-PROVENANCE endpoint=api.openai.com`, `JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io`, `JOUST-GROK-PROVENANCE endpoint=cli-chat-proxy.grok.com` — plus a `DONE exit=0` with no `TIMEOUT`/`ERROR`. The validator is **line-anchored and provider-specific** (`^JOUST-<PROV>-…`), so an attempt whose own deliverable merely *mentions* a marker token can't false-fail. A candidate with no marker or no saved file is treated as a failed attempt and excluded; the round proceeds over the survivors.
 
 ---
 
@@ -283,7 +285,7 @@ bin/je-issue.sh claim <N> <run-id>                             # best-effort cla
 - **PUBLIC repo:** never paste secrets or the `mapping.json` unblinding line — refer to a candidate as "blind B," not the model (the helper has refusal greps for both).
 - **Claiming is best-effort, not a mutex:** the GitHub API has no compare-and-swap, so `claim` is a TOCTOU read-after-write with a deterministic tiebreak; a git-ref push under `refs/dogfood-claims/` is the strict escape hatch for high fan-out / grand loops.
 - **No `gh` / offline?** `new` degrades to a committed draft under `docs/dogfood/inbox/` (never `.runs/`); re-file later with `drain-inbox`.
-- Legacy `D-NNNN` items live read-only under `docs/dogfood/archive/`.
+- Legacy `D-NNNN` items now live as closed `dogfood`-labelled GitHub Issues (see [`DOGFOOD.md`](DOGFOOD.md)).
 
 ---
 
@@ -322,6 +324,7 @@ After install + reload, the `joust-engine` and `joust-bench` skills and the `@@J
 | Local MLX | the `omlx` server running on `127.0.0.1:8000` + `OMLX_AUTH_TOKEN` | start `omlx`; export `OMLX_AUTH_TOKEN` |
 | Codex (OpenAI) | the `codex` CLI, signed in (`~/.codex/auth.json`) | `codex` login; optional `OPENAI_API_KEY` for non-`gpt-5.5` ids |
 | MiniMax | the `claude` CLI + `MINIMAX_API_KEY` | export `MINIMAX_API_KEY` in your shell profile |
+| Grok (xAI) | the `grok` CLI signed in (`~/.grok/auth.json`), or `XAI_API_KEY` | `grok` login; or export `XAI_API_KEY` for a headless box |
 
 Every runner reads its key **from the environment** (exported in your shell profile and inherited into the session at launch), exactly the same way for every provider. The skill probes liveness before spending a round where it can — e.g. a one-line Codex probe, an `omlx-models` fetch — and offers another tier if a provider is down or its CLI is stale (e.g. `brew upgrade codex`).
 
@@ -346,7 +349,7 @@ node "<plugin-root>/bin/je-bench.mjs" --list --models all
 node "<plugin-root>/bin/je-bench.mjs" --models opus,minimax-m3 --profile heavy
 ```
 
-**Selection grammar** (`--models`, comma-separated, de-duped): `all` (default) · a provider (`anthropic|glm|local|codex|minimax`) · `<provider>:<id>` (e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`) · a bare id (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, a local id).
+**Selection grammar** (`--models`, comma-separated, de-duped): `all` (default) · a provider (`anthropic|glm|local|codex|minimax|grok`) · `<provider>:<id>` (e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`) · a bare id (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, `grok-build`, a local id).
 
 **Two workload profiles** (`--profile`, default `light`; `--heavy`/`--light` shorthand):
 
@@ -369,7 +372,9 @@ A Claude Code plugin: a manifest, two skills, ten agents, the workflow engine, a
 
 ```text
 joust-engine/
-├── plugin.json                         # plugin manifest (name, version, skills, agents)
+├── .claude-plugin/
+│   ├── plugin.json                     # plugin manifest (name, version, skills, agents)
+│   └── marketplace.json                # marketplace manifest (marketplace name `joust-engine`)
 ├── package.json                        # toolchain pin + test entry points (not published to npm)
 ├── .nvmrc                              # pinned Node version for local dev + CI
 ├── .github/workflows/ci.yml            # CI lane 1: runs `npm run ci` on push + PR
@@ -410,7 +415,6 @@ joust-engine/
 │   ├── je-bench.mjs                    # the throughput benchmark
 │   └── README.je-bench.md              # je-bench usage + results-format reference
 ├── docs/
-│   ├── dogfood/archive/                # read-only legacy D-NNNN evidence
 │   └── dogfood/inbox/                  # committed offline drafts (no-gh fallback)
 └── .bench/results.jsonl                # append-only je-bench history
 ```
