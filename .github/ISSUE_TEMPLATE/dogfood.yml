@@ -1,0 +1,69 @@
+name: Dogfood finding
+description: A problem or feature-request found during/after a Joust Engine (@@JE) tournament run.
+title: "[dogfood] "
+labels: ["dogfood"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        **This repository is PUBLIC.** Do NOT paste secrets/tokens, and do NOT paste the
+        `mapping.json` *unblinding* line (which says which blind candidate was which model —
+        it de-anonymises a blind review). Refer to a candidate only as "blind B", never by model name.
+        Filing from an `@@JE` run? Prefer `bin/je-issue.sh new ...`, which enforces these rules.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: sev1 = wrong winners / corrupts outcome · sev2 = degraded but usable · sev3 = cosmetic/docs
+      options: [sev1, sev2, sev3]
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [review, runner, parse, git, skill, docs, infra]
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong and why it matters (the impact on tournament correctness/usability).
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Durable evidence (verbatim excerpt)
+      description: >
+        Paste the EXACT offending text from `review-*/verdict.md` / `guidance.md` /
+        `SUMMARY.blind.md`. With Issues this is no longer a gitignore workaround — issues persist —
+        but it is still REQUIRED triage content. PUBLIC REPO: no secrets, no `mapping.json`
+        unblinding line; say "blind B", not the model name.
+      placeholder: |
+        > Round-1 reviewer, on blind candidate B:
+        > "the core mechanism is wrong for this task"  (it was in fact the only correct one)
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro
+      description: Minimal steps to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: suspected_fix
+    attributes:
+      label: Suspected fix
+      description: Where the fix likely belongs (file/function) and the shape of it.
+    validations:
+      required: false
+  - type: input
+    id: provenance
+    attributes:
+      label: Provenance (non-durable breadcrumb)
+      description: "run-id only, e.g. je-...-20260615-105102. NOT a link — .runs/ is gitignored and may be gc'd."
+    validations:
+      required: false

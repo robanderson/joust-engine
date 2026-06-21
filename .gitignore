@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Python (legacy v1 reference tooling)
+__pycache__/
+*.pyc
+
+# Claude Code transient / local
+.claude/worktrees/
+.claude/settings.local.json
+
+# Joust Engine run scratch — NEVER committed (the dogfood inbox is the durable path)
+.runs/
+**/.runs/
+.bench/
+**/.bench/
