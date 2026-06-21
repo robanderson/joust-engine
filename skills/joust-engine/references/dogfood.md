@@ -71,7 +71,7 @@ enforced structurally by the form's `required` field + the helper's empty/placeh
 
 1. **Pick** the top open item: `bin/je-issue.sh next` (walks `sev1 → sev2 → sev3`, lowest issue #).
 2. **Claim** it: `bin/je-issue.sh claim <N> <run-id>` (best-effort — see below).
-3. **Fix** on a feature branch `rob/dogfood-<N>` (honours the global `rob/` prefix rule).
+3. **Fix** on a feature branch `dogfood-<N>` (apply your configured branch-prefix rule, if any).
 4. **Open one PR** with `Closes #<N>` in the body → merging auto-closes the issue and cross-links
    the PR. No manual roster edit. The closed issue + its PR are the permanent record.
 

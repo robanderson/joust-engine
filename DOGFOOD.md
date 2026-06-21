@@ -16,7 +16,7 @@ bin/je-issue.sh bootstrap                 # (once) create the dogfood label sche
 bin/je-issue.sh new --sev sev2 --area parse --title "…" --evidence-file EV.md
 bin/je-issue.sh next                       # top open item (sev1 → sev3)
 bin/je-issue.sh claim <N> <run-id>         # best-effort claim (see convention doc)
-# fix on a rob/dogfood-<N> branch, open one PR with "Closes #<N>"
+# fix on a dogfood-<N> branch, open one PR with "Closes #<N>"
 ```
 
 > Migrated from the Markdown roster via the `@@JE` two-pass tournament

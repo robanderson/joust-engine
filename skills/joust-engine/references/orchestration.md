@@ -352,9 +352,9 @@ PR routing: verify **pass** → normal PR. verify **fail or unverifiable** → a
 
 `je-git.sh stop_file_check <runDir>` is checked at the **top of every loop iteration**. Creating `<runDir>/STOP` at any time halts the chain before the next loop, without killing the harness. (`stop_file_check` returns rc 0 — success — when the STOP file is present, so the caller's `if stop_file_check ...; then halt; fi` reads naturally.)
 
-### Branch naming overrides the global `rob/` rule
+### Branch naming overrides any configured branch-prefix rule
 
-Loop branches are `JE-<loop>-<random7>` (7 lowercase alphanumerics from `/dev/urandom`). This **overrides the user's global `rob/` branch-prefix rule for these loop branches only**; the SKILL authorization (Phase 0b) states this explicitly. Non-loop work is unaffected.
+Loop branches are `JE-<loop>-<random7>` (7 lowercase alphanumerics from `/dev/urandom`). This fixed name is used as-is, **overriding any branch-prefix rule you have configured, for these loop branches only**; the SKILL authorization (Phase 0b) states this explicitly. Non-loop work is unaffected.
 
 ### Topology
 
