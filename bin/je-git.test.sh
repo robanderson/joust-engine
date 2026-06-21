@@ -101,6 +101,20 @@ check "C: ZAI_API_KEY dropped from verify env" "$got" "EMPTY"
 rm -rf "$C"
 
 # ---------------------------------------------------------------------------
+# C2) secret-drop covers XAI_API_KEY (Grok). Same shape as C; this is the key
+#     that was previously NOT in the unset list, so a verify command could read
+#     a live Grok token.
+# ---------------------------------------------------------------------------
+C2=$(mktemp -d); repo="$C2/repo"; mkrepo "$repo"
+printf 'edited\n' >> "$repo/README.md"
+leak="$C2/leak.sh"; keyout="$C2/KEYOUT"; rm -f "$keyout"
+printf '#!/usr/bin/env bash\necho "${XAI_API_KEY:-EMPTY}" > "$1"\n' > "$leak"
+( cd "$repo" && printf '%s\n' "bash $leak $keyout" | XAI_API_KEY=secret123 bash "$FLGIT" run_verify ) >/dev/null 2>&1
+got="$(cat "$keyout" 2>/dev/null || echo MISSING)"
+check "C2: XAI_API_KEY dropped from verify env" "$got" "EMPTY"
+rm -rf "$C2"
+
+# ---------------------------------------------------------------------------
 # D) no live re-detection: empty frozen set -> rc 2, never scans the tree.
 #    (committed package.json, clean tree -> gate passes; empty stdin -> rc 2.)
 # ---------------------------------------------------------------------------

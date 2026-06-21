@@ -391,7 +391,13 @@ run_verify() {
   fi
 
   # SECRET-DROP: strip credentials from this process (and thus every command it runs).
-  unset ZAI_API_KEY MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY \
+  # Covers EVERY provider key this plugin uses, including XAI_API_KEY (Grok — read by
+  # bin/grok-run.sh / bin/je-bench.mjs); omitting it left a Grok token readable by a
+  # verify command. NOTE: this only scrubs ENVIRONMENT secrets — on-disk credentials
+  # (~/.config/gh, ~/.git-credentials, ~/.codex/auth.json, ~/.grok/auth.json, ~/.aws, …)
+  # are NOT protected here; the OS sandbox (je_verify_sandbox_exec) is the boundary for
+  # those, so untrusted-repo runs should additionally enable JE_VERIFY_SANDBOX.
+  unset ZAI_API_KEY MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY \
         ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN 2>/dev/null || true
 
   local -a cmds=()
