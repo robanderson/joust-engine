@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "joust-engine",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "Joust Engine — model-diverse agentic loops from concept to PR.",
   "owner": {
     "name": "Rob Anderson"
