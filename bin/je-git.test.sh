@@ -8,10 +8,12 @@
 #   - no live re-detection: empty frozen set -> rc 2, never re-scan a mutated tree
 #   - argv execution: command lines run as argv (no `eval`), so `;`/`|`/`$()` are inert
 #   - preserved contract: fail-FAST (break on first failure), all-pass rc 0
-#   - P6 default-off gate: existing config-touch refusals remain unchanged
-#   - P6 opt-in route: config-touch is accepted only onto the sandbox path
-#   - P6 fail-closed route: a missing wrapper never falls back to direct execution
+#   - off-mode gate: explicit config-touch refusals remain unchanged
+#   - opt-in route: config-touch is accepted only onto the sandbox path
+#   - fail-closed route: a missing wrapper never falls back to direct execution
 #   - secret-drop still applies before the sandbox wrapper is entered
+#   - AUTO default (section Z): sandbox-when-available, else unsandboxed + warn,
+#     with the gate fail-closed when auto has no sandbox to route to
 #
 # Self-contained: builds throwaway git repos in mktemp dirs; no network, no toolchains.
 set -uo pipefail
@@ -19,9 +21,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLGIT="$HERE/je-git.sh"
 
-# Host/operator settings must not opt the issue-#21 regression tests into P6.
-# Test cases below set these inline only where explicitly required.
-unset JE_VERIFY_SANDBOX JE_VERIFY_SANDBOX_WRAPPER
+# The verify sandbox now DEFAULTS to "auto" (sandbox when available). The issue-#21
+# regression cases (A–H, T, …) assert the explicit OFF contract, so pin off-mode here;
+# section Z exercises the auto default deterministically with a fake wrapper. Set
+# inline overrides where a case needs strict (=1) or auto.
+export JE_VERIFY_SANDBOX=0
+unset JE_VERIFY_SANDBOX_WRAPPER
 
 pass=0; fail=0
 ok()   { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
@@ -232,6 +237,64 @@ out="$( cd "$repo" && printf '%s\n' "touch $proof" | \
 [ ! -e "$proof" ] && ok "S4: no unsandboxed fallback execution" || bad "S4: command ran unsandboxed after wrapper failure"
 case "$out" in *JE-VERIFY-SANDBOX-UNAVAILABLE*fail-closed*) ok "S4: emits stable unavailable/fail-closed marker";; *) bad "S4: missing unavailable/fail-closed marker";; esac
 rm -rf "$S"
+
+# ---------------------------------------------------------------------------
+# Z) AUTO default (sandbox-when-available). The default policy is now "auto":
+#    route through the sandbox when one is available, else run unsandboxed WITH a
+#    warning. Availability is decided with the SAME test the leaf uses, so a wrapper
+#    that is set-but-missing makes auto DETERMINISTICALLY unavailable on every host
+#    (no dependence on whether the host has sandbox-exec). The fake pass-through
+#    wrapper makes "available" deterministic too. These prove ROUTING, not isolation.
+# ---------------------------------------------------------------------------
+Z=$(mktemp -d); repo="$Z/repo"; mkrepo "$repo"
+printf '{"scripts":{"build":"true"}}' > "$repo/package.json"   # a verify-executable touch
+zwrap="$Z/fake-sandbox-wrapper"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf invoked > "${JE_TEST_WRAPPER_MARKER:?}"' \
+  '[ "${1:-}" = "--" ] && shift' \
+  'exec "$@"' > "$zwrap"
+chmod +x "$zwrap"
+missing="$Z/nope/sandbox-wrapper"
+
+# Z1: AUTO (env UNSET -> resolves to auto) WITH an available wrapper relaxes the
+#     config-touch gate to the sandbox route — proves unset defaults to auto.
+out="$( cd "$repo" && env -u JE_VERIFY_SANDBOX JE_VERIFY_SANDBOX_WRAPPER="$zwrap" bash "$FLGIT" verify_safe_diff 2>&1 )"; rc=$?
+check "Z1: auto(unset)+available wrapper relaxes gate -> rc 0" "$rc" "0"
+case "$out" in *JE-VERIFY-SANDBOX-ROUTE*package.json*) ok "Z1: auto routes the config-touch to the sandbox";; *) bad "Z1: missing sandbox-route marker under auto";; esac
+
+# Z2: AUTO with NO sandbox available (wrapper set-but-missing) REFUSES the
+#     config-touch (fail-closed, exactly like off) — there is no sandbox to route to.
+out="$( cd "$repo" && JE_VERIFY_SANDBOX=auto JE_VERIFY_SANDBOX_WRAPPER="$missing" bash "$FLGIT" verify_safe_diff 2>&1 )"; rc=$?
+[ "$rc" -ne 0 ] && ok "Z2: auto+no-sandbox refuses config-touch (rc=$rc)" || bad "Z2: auto+no-sandbox should refuse"
+case "$out" in *JE-VERIFY-REFUSE-UNSAFE*package.json*) ok "Z2: auto+no-sandbox emits the fail-closed refusal";; *) bad "Z2: missing refuse marker";; esac
+
+# Z3: AUTO + available wrapper ROUTES an actual verify command through the wrapper.
+zrepo2="$Z/repo2"; mkrepo "$zrepo2"; printf 'edited\n' >> "$zrepo2/README.md"   # safe diff
+marker="$Z/WRAP1"; ran="$Z/RAN1"; rm -f "$marker" "$ran"
+out="$( cd "$zrepo2" && printf '%s\n' "touch $ran" | \
+  JE_VERIFY_SANDBOX=auto JE_VERIFY_SANDBOX_WRAPPER="$zwrap" \
+  JE_TEST_WRAPPER_MARKER="$marker" bash "$FLGIT" run_verify 2>&1 )"; rc=$?
+check "Z3: auto+wrapper verify -> rc 0" "$rc" "0"
+[ -e "$marker" ] && ok "Z3: auto routed the verify command through the wrapper" || bad "Z3: wrapper not invoked under auto"
+[ -e "$ran" ] && ok "Z3: routed command actually ran" || bad "Z3: routed command did not run"
+case "$out" in *JE-VERIFY-SANDBOX-WARN*) bad "Z3: warned despite a sandbox being available";; *) ok "Z3: no unsandboxed-warning when sandbox is available";; esac
+
+# Z4: AUTO + NO sandbox + SAFE diff runs UNSANDBOXED but WARNS loudly.
+zrepo3="$Z/repo3"; mkrepo "$zrepo3"; printf 'edited\n' >> "$zrepo3/README.md"
+ran="$Z/RAN2"; rm -f "$ran"
+out="$( cd "$zrepo3" && printf '%s\n' "touch $ran" | \
+  JE_VERIFY_SANDBOX=auto JE_VERIFY_SANDBOX_WRAPPER="$missing" bash "$FLGIT" run_verify 2>&1 )"; rc=$?
+check "Z4: auto+no-sandbox safe verify -> rc 0" "$rc" "0"
+[ -e "$ran" ] && ok "Z4: ran unsandowed (auto fallback keeps non-sandbox hosts working)" || bad "Z4: command did not run under auto fallback"
+case "$out" in *JE-VERIFY-SANDBOX-WARN*) ok "Z4: emits the unsandboxed warning";; *) bad "Z4: missing unsandboxed warning";; esac
+
+# Z5: explicit OFF (=0) is silent — the deliberate opt-out must NOT warn.
+ran="$Z/RAN3"; rm -f "$ran"
+out="$( cd "$zrepo3" && printf '%s\n' "touch $ran" | JE_VERIFY_SANDBOX=0 bash "$FLGIT" run_verify 2>&1 )"; rc=$?
+check "Z5: off-mode safe verify -> rc 0" "$rc" "0"
+case "$out" in *JE-VERIFY-SANDBOX-WARN*) bad "Z5: off-mode wrongly warned";; *) ok "Z5: off-mode is silent (no warning)";; esac
+rm -rf "$Z"
 
 # ---------------------------------------------------------------------------
 # T) je_run_with_timeout in isolation: real rc passthrough, timeout->124, and
