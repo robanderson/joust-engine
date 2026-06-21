@@ -289,14 +289,25 @@ bin/je-issue.sh claim <N> <run-id>                             # best-effort cla
 
 ## Installation & setup
 
-Joust Engine is a **self-contained Claude Code plugin** (`joust-engine`, skills + agents + workflows + bin runners). This repo **is** its own plugin marketplace — there is no external dependency to install through — so a new user adds the marketplace and installs the plugin directly from Claude Code with:
+Install Joust Engine **from inside Claude Code** — it installs straight from this GitHub repo, so there is no external marketplace or registry to register with first. Run the first command, then the second, then apply it:
 
 ```text
 /plugin marketplace add robanderson/joust-engine
 /plugin install joust-engine@joust-engine
+/reload-plugins
 ```
 
-Once installed, the `@@JE` trigger and the `joust-engine` / `joust-bench` skills are available in your sessions; the bundled scripts under `bin/` are run with `node` / `bash` from the resolved plugin root. Confirm the `joust-engine` skill appears after installing. (To launch a tournament once installed, use the `@@JE` sigil, the `joust:` prose marker, or the [`/joust-engine:joust-engine` slash command](#the-slash-command-form) — all three feed the same parser.)
+What each line does:
+
+1. **`/plugin marketplace add robanderson/joust-engine`** — register this repo as a plugin marketplace (Claude Code accepts the GitHub `owner/repo` shorthand). The repo root holds `.claude-plugin/marketplace.json` (marketplace name `joust-engine`).
+2. **`/plugin install joust-engine@joust-engine`** — install the plugin. The form is `<plugin-name>@<marketplace-name>`; here both are `joust-engine` (the plugin manifest is `.claude-plugin/plugin.json`, name `joust-engine`, version `0.0.1`). It ships two skills (`joust-engine`, `joust-bench`) and ten agents.
+3. **`/reload-plugins`** — **apply it.** This is the step the install command doesn't do for you: the newly installed plugin's skills and agents only load once you reload (or restart the session). *(If you install interactively instead — see below — Claude Code prints "Run /reload-plugins to apply" for you.)*
+
+**Interactive alternative:** if you prefer to browse, run `/plugin` with **no arguments** after step 1 to open the marketplace, then install `joust-engine` through the menu. Either path ends the same way — at step 3, apply it with `/reload-plugins`.
+
+After install + reload, the `joust-engine` and `joust-bench` skills and the `@@JE` trigger are available in your sessions; the bundled scripts under `bin/` run via `node` / `bash` from the resolved plugin root. **Confirm the install:** check that the `joust-engine` skill appears (e.g. it's listed in the skills list, or the `@@JE` trigger is recognised when you type it). (To launch a tournament once installed, use the `@@JE` sigil, the `joust:` prose marker, or the [`/joust-engine:joust-engine` slash command](#the-slash-command-form) — all three feed the same parser.)
+
+> **You need a recent Claude Code with plugin support.** Anthropic auth alone — your session's own Claude login — is enough to start: Opus/Sonnet/Haiku attempts and the Opus judge need no extra keys. Optional per-provider keys (GLM / local / codex / minimax / grok) are listed in the table below and only matter if you want attempts on those providers.
 
 > **Enabling dynamic workflows.** The preferred backend runs on Claude Code's dynamic-workflow orchestration. Turn it on by upgrading effort to its maximum: run `/effort` and select **ultracode** (max = xhigh reasoning + dynamic workflow orchestration). With it on, the tournament fans out through the `Workflow` engine and is watchable live in `/workflows`. Without it, the skill automatically falls back to manual Task-tool + `glm` CLI dispatch — the same tournament, just not driven by the workflow engine.
 
@@ -354,7 +365,7 @@ Useful tips: run `--list` first to confirm (and price) the plan before the real 
 
 ## Repository layout
 
-A Claude Code plugin: a manifest, two skills, eight agents, the workflow engine, and the bin helpers. How the pieces fit:
+A Claude Code plugin: a manifest, two skills, ten agents, the workflow engine, and the bin helpers. How the pieces fit:
 
 ```text
 joust-engine/
