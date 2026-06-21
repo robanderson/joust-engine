@@ -865,6 +865,11 @@ function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, 
   return L.join('\n') + '\n'
 }
 
+// MIRROR: the block below is duplicated VERBATIM (plus `export`) in workflows/tournament-lib.mjs,
+// the importable test surface (process-improvement #6, item 5). The Workflow sandbox has no
+// `import`, so this file cannot consume the lib at runtime and must keep its own copy. A guard
+// in workflows/tournament.contributions.test.mjs fails if the two ever diverge — edit BOTH when
+// changing the algorithm.
 // ---- begin: contribution estimation (PURE; persistence is a separate thin step) ----
 // ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. Intentionally
 // forward-improvable. Algorithm: see proposal.md / the comment on computeContributions.
