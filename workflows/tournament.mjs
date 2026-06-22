@@ -327,7 +327,28 @@ function dispatchDropSummary(phaseTitle, drops, requested, survived) {
   return `JE-DISPATCH-WARNING [${phaseTitle}]: ${mine.length}/${requested} attempt(s) dropped — required agent type(s) NOT REGISTERED: ${types}. Effective field ${survived}/${requested}. The affected provider(s) did NOT run, silently shrinking N. Most likely the plugin was installed/updated AFTER this session started (agent types register only at session start) — restart the session, then re-run for the full field.`
 }
 
+// SECURITY (audit #5, finding #3): a model id can reach the shell as an UNQUOTED flag token
+// (local: `--model ${a.model}`; codex/grok fallbacks: `-m ${a.model}`). The allowlist maps
+// (CODEX_FLAG/GROK_FLAG) cover known display models, but the LOCAL path accepts the model id
+// VERBATIM (je-parse treats live local ids as accept-verbatim), so a hostile id like
+// `x; rm -rf /` or `--dangerously-skip-permissions` would flow unescaped into the runner command
+// / underlying CLI. We therefore VALIDATE the id against a strict allowlist charset BEFORE it is
+// ever interpolated into a flag, and FAIL CLOSED (drop the attempt) on any non-match — mirroring
+// the missing-runner skip pattern below rather than crashing the whole field.
+// The charset bans shell metacharacters/whitespace; the leading char is additionally restricted to
+// [A-Za-z0-9.] so a metachar-free-but-dash-leading id (e.g. `--dangerously-skip-permissions`)
+// cannot be smuggled in as an option to the underlying CLI.
+const SAFE_MODEL_ID = /^[A-Za-z0-9.][A-Za-z0-9._-]*$/
+function validModelId(m) { return typeof m === 'string' && SAFE_MODEL_ID.test(m) }
+
 function dispatch(a, ws, guidance, phaseTitle) {
+  // Any dispatch path that interpolates a.model into a runner flag must see a safe id. Reject up
+  // front (fail closed) so no malicious id can ever reach the shell as an unquoted flag token.
+  // (minimax pins its model via env and never interpolates a.model, so it is exempt.)
+  if (a.dispatch !== 'minimax' && !validModelId(a.model)) {
+    log(`attempt ${a.label} (${a.displayModel}) skipped: model id rejected — must match ${SAFE_MODEL_ID} (refusing to interpolate an unsafe id into a runner flag)`)
+    return null
+  }
   const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance, contextPath)
   const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle }
   let prompt
