@@ -37,9 +37,9 @@ It is invoked like the other `bin/` tools (a plain script run with `node` /
 | Token            | Meaning                                                            |
 |------------------|-------------------------------------------------------------------|
 | `all`            | every callable model across every provider (default)              |
-| `<provider>`     | every model of a provider: `anthropic` `glm` `local` `codex` `minimax` |
+| `<provider>`     | every model of a provider: `anthropic` `glm` `local` `codex` `minimax` `grok` |
 | `<provider>:<id>`| one model, e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`, `anthropic:opus` |
-| `<id>`           | a bare id matched against the catalogue (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, a local id) |
+| `<id>`           | a bare id matched against the catalogue (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, `grok-build`, a local id) |
 
 Other flags: `--profile light|heavy` (`--heavy`/`--light` shorthand; default
 `light`), `--list` (dry-run), `--timeout <secs>` (per-call backstop), `--help`.
@@ -69,6 +69,9 @@ all-models sweep (dogfood **D-0005**). The profile name is recorded on every row
   via `codex exec`, auth from `~/.codex/auth.json` (no `OPENAI_API_KEY`).
 - **MiniMax** — `minimax-m3` via `claude` pointed at `https://api.minimax.io/anthropic`,
   **Bearer** `ANTHROPIC_AUTH_TOKEN=$MINIMAX_API_KEY`, `ANTHROPIC_MODEL=MiniMax-M3`.
+- **Grok (xAI)** — `grok-build` / `grok-composer-2.5-fast` on a `-m` model axis via the
+  `grok` headless CLI; auth from a `grok.com` OAuth session (`~/.grok/auth.json`) or
+  `XAI_API_KEY` (no env key injected, mirroring codex's `~/.codex/auth.json`).
 
 All keys come from the **environment** (never sourcing rc files), exactly as the
 runners do. A provider whose key is unset is recorded as a failed entry and the
