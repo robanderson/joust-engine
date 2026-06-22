@@ -541,15 +541,26 @@ rm -rf "$W4"
 # X) #46 regression: je_run_with_timeout invoked inside command substitution $(...)
 #    must NOT block on an orphaned watchdog `sleep`. Pre-fix, the residual
 #    instant-command race orphaned the watchdog's `sleep`, which (inheriting fd 1)
-#    held the $() capture pipe open for the FULL timeout (~12%/call). 30 instant
-#    calls with a 10s per-call timeout: with the fix the batch is a few seconds; a
-#    single hang would add ~10s. Assert the batch finishes well under one timeout.
-xs=$(date +%s)
-for xi in $(seq 1 30); do xout="$( bash "$FLGIT" je_run_with_timeout 10 -- true 2>/dev/null )"; done
-xel=$(( $(date +%s) - xs ))
-[ "$xel" -lt 8 ] \
-  && ok "X: je_run_with_timeout in \$() never blocks on an orphaned watchdog sleep (30 calls in ${xel}s)" \
-  || bad "X: \$()-captured je_run_with_timeout blocked on an orphaned watchdog sleep (30 calls took ${xel}s; >=8 => a sleep held the pipe)"
+#    held the $() capture pipe open for the FULL timeout (~10s/call).
+#
+#    A fixed wall-time budget is flaky on loaded CI (process-spawn overhead varies),
+#    so measure DIFFERENTIALLY against the bug's own mechanism. The same 30 instant
+#    calls with output REDIRECTED (>/dev/null — no capture pipe an orphan can hold,
+#    so this path is immune to the bug) establish this runner's spawn-overhead
+#    baseline; the $()-captured batch then must not run a FULL timeout longer. With
+#    the fix the two are ~equal; a held pipe adds >= one whole timeout. Subtracting
+#    the baseline makes the check robust to a slow runner — both batches scale together.
+XTO=10
+xb_s=$(date +%s)
+for xi in $(seq 1 30); do bash "$FLGIT" je_run_with_timeout "$XTO" -- true >/dev/null 2>&1; done
+xbase=$(( $(date +%s) - xb_s ))
+xc_s=$(date +%s)
+for xi in $(seq 1 30); do xout="$( bash "$FLGIT" je_run_with_timeout "$XTO" -- true 2>/dev/null )"; done
+xcap=$(( $(date +%s) - xc_s ))
+xextra=$(( xcap - xbase ))
+[ "$xextra" -lt "$XTO" ] \
+  && ok "X: \$()-captured je_run_with_timeout adds no full-timeout stall vs baseline (base ${xbase}s, captured ${xcap}s)" \
+  || bad "X: \$()-captured je_run_with_timeout blocked on an orphaned watchdog sleep (captured ${xcap}s vs baseline ${xbase}s; +${xextra}s >= one ${XTO}s timeout => a sleep held the pipe)"
 
 # ---------------------------------------------------------------------------
 # Y) je_cleanup (disk reclaim): DRY-RUN by default, --apply to actually delete.
