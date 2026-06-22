@@ -76,14 +76,19 @@ check_evidence() {
   esac
   # PUBLIC repo: a blind-letter -> model association, or a mapping.json reference,
   # de-anonymises which candidate was which model. Refer to candidates as "blind B".
+  # The enumerated model names catch known providers; the mapping.json reference and
+  # the candidate->model JSON shape ALSO catch a *new* provider name we have not
+  # enumerated yet, so a fresh entrant can't be silently unblinded.
   if printf '%s' "$ev" | grep -Eiq \
-      'mapping\.json|blind[[:space:]]+[A-Z][[:space:]]*(=|->|:|is|was)[[:space:]]*(the[[:space:]]+)?(opus|sonnet|haiku|glm|codex|minimax|gpt|claude)|"candidate"[[:space:]]*:[[:space:]]*"[A-Z]"'; then
+      'mapping\.json|blind[[:space:]]+[A-Z][[:space:]]*(=|->|:|is|was)[[:space:]]*(the[[:space:]]+)?(opus|sonnet|haiku|glm|codex|minimax|gpt|claude)|"candidate"[[:space:]]*:[[:space:]]*"[A-Z]"|"(blind|candidate)"[[:space:]]*:[[:space:]]*"[A-Z]"[[:space:]]*,[[:space:]]*"(model|provider)"[[:space:]]*:|blind[[:space:]]+[A-Z][[:space:]]*(=|->)[[:space:]]*[A-Za-z][A-Za-z0-9._-]*[[:space:]]*\(model\)'; then
     echo "REFUSE: evidence appears to UNBLIND a candidate (blind-letter->model / mapping.json). Redact to 'blind B'." >&2
     return 4
   fi
-  # Obvious secrets/tokens.
+  # Obvious secrets/tokens. Every alternative is anchored on a distinctive fixed
+  # prefix followed by a bounded char class — no catastrophic backtracking. POSIX
+  # ERE (grep -E). -i case-folds, harmless for these distinctive prefixes.
   if printf '%s' "$ev" | grep -Eiq \
-      'sk-[A-Za-z0-9]{16,}|gh[ps]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|(api[_-]?key|secret|bearer|access[_-]?token)[[:space:]"'"'"':=]+[A-Za-z0-9._\-]{16,}'; then
+      'sk-[A-Za-z0-9]{16,}|gh[ps]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|(api[_-]?key|secret|bearer|access[_-]?token)[[:space:]"'"'"':=]+[A-Za-z0-9._\-]{16,}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[sr]k_live_[0-9A-Za-z]{16,}'; then
     echo "REFUSE: possible secret/token in evidence." >&2
     return 5
   fi
