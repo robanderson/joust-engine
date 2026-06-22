@@ -1,39 +1,54 @@
 // workflows/tournament.contributions.test.mjs
 // Unit tests for computeContributions() — the PURE per-model contribution estimator
-// added by issue #18. The function lives inside workflows/tournament.mjs (a top-level-
-// return sandbox script, not an importable ES module), so we extract the function block
-// from the shipped source rather than hand-copying it (the repo's only test precedent).
+// added by issue #18.
+//
+// The helpers are now IMPORTED directly from workflows/tournament-lib.mjs (a real,
+// importable ES module) instead of scraped out of workflows/tournament.mjs with brittle
+// string markers + eval (process-improvement #6, item 5). tournament.mjs is a top-level-
+// `return` Workflow-sandbox script — the sandbox has no `import`, so it cannot consume the
+// lib at runtime and keeps its own verbatim copy of the contribution block. The "source of
+// truth in two places" risk is closed by the SYNC GUARD test below, which asserts the two
+// blocks are byte-identical (the only thing that ever differs is the `export ` keyword the
+// importable copy adds).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import {
+  computeContributions,
+  CONTRIB_GUIDANCE_SHARE,
+} from './tournament-lib.mjs'
+
+assert.equal(typeof computeContributions, 'function', 'computeContributions must be a function')
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const SRC  = readFileSync(resolve(HERE, 'tournament.mjs'), 'utf8')
 
-// Extract the entire contribution block (helpers + constants + computeContributions)
-// between the two unique markers added in §2.1. Pure substring — no parser needed.
-const BEGIN = '// ---- begin: contribution estimation (PURE; persistence is a separate thin step) ----'
-const END   = '// ---- end: contribution estimation (PURE; persistence is a separate thin step) ----'
-const i = SRC.indexOf(BEGIN)
-const j = SRC.indexOf(END, i >= 0 ? i : 0)
-if (i < 0 || j < 0) throw new Error('contribution block markers not found in workflows/tournament.mjs')
-const block = SRC.slice(i, j)
-
-// Eval the block into a sandbox and lift the symbols we want to test.
-const sandbox = {}
-new Function('sandbox', `
-  with (sandbox) {
-    ${block}
-    sandbox.computeContributions   = computeContributions
-    sandbox.CONTRIB_RANK_DECAY     = CONTRIB_RANK_DECAY
-    sandbox.CONTRIB_WINNER_BONUS   = CONTRIB_WINNER_BONUS
-    sandbox.CONTRIB_GUIDANCE_SHARE = CONTRIB_GUIDANCE_SHARE
+// ----- single-source-of-truth guard -----
+// tournament.mjs cannot import the lib (Workflow sandbox: no `import`), so it holds a
+// verbatim copy of the contribution block. This test fails loudly if the two drift apart,
+// so the duplication can never silently rot.
+test('contribution block in tournament.mjs stays byte-identical to tournament-lib.mjs', () => {
+  const BEGIN = '// ---- begin: contribution estimation (PURE; persistence is a separate thin step) ----'
+  const END   = '// ---- end: contribution estimation (PURE; persistence is a separate thin step) ----'
+  const extract = (src) => {
+    // lastIndexOf(BEGIN): the lib's header comment also quotes the marker text; the real
+    // block is the LAST begin marker. Then the first END after it.
+    const i = src.lastIndexOf(BEGIN)
+    const j = src.indexOf(END, i >= 0 ? i : 0)
+    assert.ok(i >= 0 && j >= 0, 'contribution block markers must be present')
+    return src.slice(i + BEGIN.length, j).trim()
   }
-`)(sandbox)
-const { computeContributions, CONTRIB_GUIDANCE_SHARE } = sandbox
-assert.equal(typeof computeContributions, 'function', 'computeContributions must be a function')
+  const srcBlock = extract(readFileSync(resolve(HERE, 'tournament.mjs'), 'utf8'))
+  // Strip the `export ` keyword the importable copy adds; everything else must match exactly.
+  const libBlock = extract(readFileSync(resolve(HERE, 'tournament-lib.mjs'), 'utf8'))
+    .replace(/^export /gm, '')
+  assert.equal(
+    libBlock,
+    srcBlock,
+    'tournament-lib.mjs and the tournament.mjs contribution block have diverged — edit BOTH (sandbox has no import, so the copy is intentional)'
+  )
+})
 
 // ----- fixture builders -----
 const validMap = arr => arr.map((c, i) => ({
