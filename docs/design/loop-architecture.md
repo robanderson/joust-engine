@@ -49,10 +49,14 @@ each loop after the plan is judged, emitting the winning plan instead of code.
                 else ↓
 7. BUILD        Parallel implementation in worktrees, from the winning plan.
 8. TEST-GATE    A small fast model enters each worktree, runs lint + tests,
-                emits an objective PASS/FAIL. Verdict is carried into review.
+                emits an objective PASS/FAIL + structured verdict. Carried into
+                review; an APPROVE may not pass without a present, passing verdict.
 9. ELECT        Judge sees code + test verdict. Top-2/3 playoff: surviving agents
-                review each other's work and debate (bounded rounds, may include
-                1–2 improvement passes) until 2/3 agree; judge breaks deadlock.
+                deliberate SIMULTANEOUSLY against each other's pre-deliberation
+                positions (one bounded round, may include 1–2 improvement passes)
+                until 2/3 agree; judge breaks deadlock. A substantiated severity
+                veto forces NO_CONSENSUS rather than being outvoted. Tally + outcome
+                are computed in code, not by the writer.
    ── recovery ladder if ALL candidates fail ──
                 (a) re-BUILD same plan + failure feedback  (cheap, first resort)
                 (b) escalate: re-PLAN from step 3 with failure feedback
@@ -78,6 +82,31 @@ Throughout, the **leaderboard ledger** records outcomes keyed by
   not open new write paths.
 - **Fail-closed.** The output security gate (step 10) and the test-gate (step 8)
   halt the chain on a hit rather than proceeding.
+- **Execution-evidence-required quorum.** An election may not return APPROVE / a
+  winner on read-only opinion alone. The lens that actually ran the code (the
+  test-gate verdict) must be present and passing; a missing or dead execution
+  verdict downgrades the outcome to recover/BLOCK, never a silent APPROVE on a
+  shrunk panel. The threshold is over the *full* intended panel, not over whoever
+  survived — a dead reviewer is not an abstention that lowers the bar.
+- **Severity veto over majority.** A substantiated, high-confidence BLOCK that
+  carries concrete blocking issues (security or correctness) forces at least
+  NO_CONSENSUS and escalates to a human; it is NOT outvoted by simple majority.
+  Costs are asymmetric — a false APPROVE (ship the flaw) far outweighs a false
+  BLOCK (re-review) for security-relevant changes.
+- **Graders never touch the live tree.** Read-only review/judge lenses run against
+  an isolated worktree, export, or pinned refs — never the operator's working
+  checkout. Isolation is enforced by the harness (a separate worktree), not by a
+  prompt instruction telling the model to behave.
+- **Deterministic facts are computed, not model-judged.** Tallies, quorum/consensus
+  booleans, and the elected outcome are computed in code and *passed into* any
+  report writer. The model writes narrative only. Never let a clerk re-derive a
+  fact the engine already knows — it can silently contradict the computed value.
+- **One pinned revision for the whole panel.** Every lens/attempt judges the same
+  pinned commit SHA, never a moving branch ref, so verdicts are commensurable.
+- **Auditable deliberation.** Members revise once, against each other's
+  pre-deliberation positions (no sequential anchoring). Record each member's pre-
+  and post-deliberation vote; if deliberation flips the outcome (especially
+  BLOCK→APPROVE), surface it and prefer NO_CONSENSUS over a silently herded verdict.
 
 ---
 
@@ -124,3 +153,49 @@ Patterns deliberately NOT adopted: a unified/MCP provider adapter. Different
 harnesses (Claude Code, Open Code, Cursor CLI, Grok Build) need bespoke handling;
 fixed bash runners are a security boundary (the model cannot generate arbitrary
 code to execute), and MCP is dated relative to Claude dynamic workflows.
+
+---
+
+## 6. Learnings from a reference council workflow
+
+A dynamic-workflow "council" that reviews open PRs (3 role-specialized reviewers →
+one simultaneous deliberation round → 2/3 vote → clerk report) was run as a live
+probe of steps 8–9. It validated the shape and surfaced the invariants above. What
+to carry into the JE election (step 9) and test-gate (step 8):
+
+**Adopt as-is (the council got these right):**
+
+- **Role-specialized lenses, not clones.** Reviewers split by *purpose* — one that
+  builds/runs, one for security efficacy, one for regression/supply-chain — so each
+  catches a different failure class. Perspective diversity > redundant agreement.
+- **Structured verdict schema.** Each reviewer returns
+  `{ vote, confidence, rationale, blocking_issues[], nonblocking_notes[], checks_run[] }`.
+  `checks_run` (what was actually executed/read + the result) makes a verdict
+  auditable and resists "looks fine" hand-waving. JE's review/election outputs
+  should use the same shape; `blocking_issues` vs `nonblocking_notes` is exactly the
+  +/− distillation channel from step 4.
+- **Deliberation schema captures the shift.** The round-2 schema adds
+  `{ changed_from_round1, response_to_peers, final_rationale }` — the raw material
+  for the auditable-deliberation invariant.
+- **Verify, do not trust.** Author claims and pre-generated evidence files are fed
+  in explicitly labelled as claims to be re-checked, and the build lens re-runs the
+  scan itself rather than trusting a supplied scan file.
+- **`NO_CONSENSUS` is a first-class outcome**, and the elected position is computed
+  deterministically (`approve>=2 ? APPROVE : block>=2 ? BLOCK : NO_CONSENSUS`).
+
+**Fix before relying on it (became the new invariants in §3):**
+
+1. **Quorum ignored execution evidence.** `votes = r2.filter(Boolean)` with an
+   absolute `>=2` meant a dead build lens + two read-only APPROVEs could elect
+   APPROVE with nothing ever built. → execution-evidence-required quorum.
+2. **No severity veto.** A high-confidence security BLOCK could be outvoted 2-1 on a
+   security PR. → severity veto over majority.
+3. **Read-only lenses ran on the operator's live checkout** (`REPO=…/Dev/On2it`),
+   read-only by prompt only, with two PR councils sharing that tree concurrently. →
+   graders never touch the live tree (harness-enforced isolation).
+4. **`tally`/`consensus_met` were re-derived by the clerk LLM** alongside the
+   code-computed values, free to drift. → deterministic facts are computed, passed in.
+5. **Lenses judged different revisions** — the build lens used the pinned head SHA,
+   the read-only lenses diffed a moving `origin/<branch>`. → one pinned revision.
+6. **Election used only round-2**, so round-1 dissent could vanish into groupthink
+   even though the data was retained. → auditable deliberation (act on vote-flips).
