@@ -17,3 +17,8 @@ __pycache__/
 **/.runs/
 .bench/
 **/.bench/
+
+# Rebrand output — the generated "@@DE Development Engine" dev channel (bin/rebrand.mjs).
+# Gitignored so the canonical source stays byte-for-byte identical and the same commit
+# promotes to GitHub unchanged. Regenerate locally with: node bin/rebrand.mjs
+.dev-engine/
