@@ -1,11 +1,20 @@
 export const meta = {
   name: 'Joust Engine',
-  description: 'Multi-model best-of-N: N attempts judged blind by Opus; two-pass adds a guided round + final rank.',
+  description: 'Plan/Implement tournament: a wide, cheap PLAN phase (Plan Round 1 + Plan Round 2, plan-lens Opus council: feasibility/completeness/risk/security-by-design/simplicity) always runs; the optional IMPLEMENT phase (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate) seeds implementers with the winning plan verbatim and judges with the 5-lens code council (majority vote + security veto, code-tallied).',
   phases: [
+    // Plan phase (always). The internal phase titles stay 'Round 1'/'Review'/'Round 2'/'Final
+    // rank' for continuity with the engine's staging/worktree bookkeeping; they ARE the plan
+    // rounds — see the flow at the bottom of this file.
     { title: 'Round 1' },
     { title: 'Review' },
     { title: 'Round 2' },
     { title: 'Final rank' },
+    // Implement phase (only when args.implement). Round 4 is reached only if Round 3 produced
+    // no gate-passing candidate.
+    { title: 'Implement Round 3' },
+    { title: 'Implement Review' },
+    { title: 'Implement Round 4' },
+    { title: 'Implement Final rank' },
   ],
 }
 
@@ -29,11 +38,29 @@ export const meta = {
 // }
 // args may arrive as a real object or as a JSON-encoded string depending on the caller; normalise.
 const A = (typeof args === 'string') ? JSON.parse(args) : (args || {})
-const { task, mode, runDir, attempts } = A
+const { task, runDir, attempts } = A
 if (!Array.isArray(attempts) || attempts.length === 0) {
   return { error: 'no attempts provided', argsType: typeof args, keys: Object.keys(A || {}) }
 }
+// ---- Plan/Implement round split (2026-07-03) ----------------------------------------------
+// `attempts` seat the PLAN phase (Plan Round 1 + Plan Round 2). `implement` (default off) gates
+// the IMPLEMENT phase (Implement Round 3, + Round 4 only if R3 yields no gate-passing candidate).
+// `implementAttempts` seat the implement rounds (a small strong pool); default to the plan pool.
+// The plan phase ALWAYS runs the two-pass spine (Round 2 always) when we will implement, so the
+// winning plan is refined before any expensive implementation spend — hence mode is forced to
+// 'two' under `implement`. A plan-only run keeps its @@JE:N:M single/two semantics unchanged.
+const implement = A.implement === true
+const implementAttempts = (Array.isArray(A.implementAttempts) && A.implementAttempts.length) ? A.implementAttempts : attempts
+const mode = implement ? 'two' : A.mode
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
+
+// Judge council (issue #22). The default judge at BOTH decision points (Phase 3 review, Phase 5 final
+// rank) is a 5-lens DELIBERATING Opus council: 5 blind judges vote independently, tally is deterministic
+// CODE (never an LLM), a >50% majority on a non-vetoed candidate wins, the security lens can VETO with
+// evidence, and an unresolved split routes to NO_CONSENSUS (surface interactively / needs-human+HALT in a
+// grand loop). `judges: 1` is the LEGACY escape hatch — the single blind Opus judge, byte-for-byte today.
+// Council size is fixed at 5 (not user-tunable): any judges value other than 1 selects the council.
+const COUNCIL = Number(A.judges) !== 1
 
 // Run-purpose summary for the live /workflows heading (issue #38). meta.name/description is a static
 // PURE LITERAL (Workflow spec — it CANNOT be dynamic per-run), so the only runtime lever into the live
@@ -65,7 +92,13 @@ function priorLine(item) {
   return `- [${tag}] ${item.text}${why}`
 }
 
-function brief(nudge, ws, guidance, ctx) {
+// brief() frames one attempt. `kind` selects the phase framing:
+//   'plan'      — Plan Round 1/2: produce a PLAN artifact (a concrete, file-level change
+//                 proposal). Plans NEVER touch the repo, so this is always the scratch path.
+//   'implement' — Implement Round 3/4: apply the change. `seedPlanPath` (when set) seeds the
+//                 attempt with the WINNING PLAN verbatim — the deliberate exception to the
+//                 "never seed prior artifacts" rule (the plan IS the spec).
+function brief(nudge, ws, guidance, ctx, kind = 'implement', seedPlanPath = null) {
   let g = ''
   if (guidance) {
     // Render-side cap (the REAL enforcer; schema maxItems is only advisory for the structured-output judge).
@@ -76,13 +109,43 @@ function brief(nudge, ws, guidance, ctx) {
   const ctxLine = ctx
     ? `\nShared context for this task has ALREADY been gathered for you in one file: ${ctx}\nRead that single file at the start — it contains the source material you need. Do NOT re-read the underlying source files one by one (that work is already done).\n`
     : ''
+
+  // ---- PLAN phase (Plan Round 1/2): produce a PLAN artifact, never touch the repo. ----
+  if (kind === 'plan') {
+    return `You are producing a PLAN — a concrete, file-level change proposal for a task. You do NOT implement anything and you do NOT touch any real repository.
+
+Task to plan:
+${task}
+${g}${ctxLine}
+${nudge}
+
+Write ONE plan file, PLAN.md, in your workspace. A strong plan is:
+- CONCRETE and FILE-LEVEL: name each file to add / edit / delete, and say exactly what changes in each (functions, signatures, data shapes, config), enough that an implementer could execute it without guessing.
+- COMPLETE: cover every requirement, edge case, migration, test, and doc update the task implies — do not hand-wave the hard parts.
+- FEASIBLE: reference only real, reachable files/APIs/mechanisms; each step must follow from the last.
+- RISK-AWARE and SECURE-BY-DESIGN: name the execution risks (breaking changes, coupling, data/compat, ordering) and the security posture (least privilege, input validation, safe secrets/supply-chain), and how the plan mitigates them.
+- PROPORTIONATE: the smallest coherent change that fully solves the task — no gold-plating.
+
+Rules:
+- This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your plan.
+- Produce the PLAN ONLY. Do NOT write the implementation, do NOT edit real source files, do NOT run anything. A plan, not a patch.
+- Work in a SINGLE pass and then STOP. Your first version is final; do not rewrite or polish it.
+- Save PLAN.md into: ${ws} (create the directory if needed). To save a file, just write it; if a file-edit tool refuses because the file "must be read first", overwrite it directly with the shell (\`cat > FILE <<'EOF' ... EOF\`).
+- End PLAN.md with a 2 to 4 sentence note on your approach, tradeoffs, and known limitations.`
+  }
+
+  // ---- IMPLEMENT phase (Implement Round 3/4): the winning plan IS the spec. ----
+  const seedBlock = seedPlanPath
+    ? `\nAn APPROVED PLAN for this task has already been chosen by a review council. It is your specification — follow it. Read it in full at the start:\n${seedPlanPath}\nImplement THAT plan. Where the plan is concrete, follow it verbatim; where it leaves a small detail open, make the smallest reasonable choice consistent with it. Do NOT re-plan or second-guess the overall approach.\n`
+    : ''
+
   if (repoMode) {
     return `You are working INSIDE an existing git repository checked out at: ${ws}
 This is your own isolated branch off a pinned base commit. Apply your change DIRECTLY to the real files (edit/create/delete as needed) to accomplish the task. Do NOT write a "proposal" or a description of a change — make the change itself.
 
 Task:
 ${task}
-${g}${ctxLine}
+${g}${ctxLine}${seedBlock}
 ${nudge}
 
 Rules:
@@ -100,7 +163,7 @@ Rules:
 
 Task:
 ${task}
-${g}${ctxLine}
+${g}${ctxLine}${seedBlock}
 ${nudge}
 
 Rules:
@@ -165,6 +228,9 @@ const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.at
 // independent of local/minimax, so one long GLM leg doesn't force everyone's timeout up. For code-build
 // tournaments pass glmTimeoutSecs ~1800-2400. Defaults to attemptTimeout when unset (backward-compatible).
 const glmTimeoutSecs = Number(A.glmTimeoutSecs) > 0 ? Math.floor(Number(A.glmTimeoutSecs)) : attemptTimeout
+// MiniMax-M3 is slow on real code tasks — both M3 seats blew the shared 300s wall-clock on a medium run
+// (issue #30), so it gets its OWN wall-clock like GLM/codex. Defaults to attemptTimeout when unset.
+const minimaxTimeoutSecs = Number(A.minimaxTimeoutSecs) > 0 ? Math.floor(Number(A.minimaxTimeoutSecs)) : attemptTimeout
 // Codex exec is agentic with NO turn cap (no --max-turns flag), so the wall-clock timeout is its ONLY
 // per-attempt backstop and gets its own, roomier default. Override via args.codexTimeoutSecs.
 const codexTimeout = Number(A.codexTimeoutSecs) > 0 ? Math.floor(Number(A.codexTimeoutSecs)) : 600
@@ -233,7 +299,9 @@ const worktreePath = (roundName, label) => repoMode ? `${worktreeRoot}/${roundNa
 const engineFiles = ['_brief.txt', '_glm_run.log', '_local_run.log', '_codex_run.log', '_codex_last.txt', '_minimax_run.log', '_grok_run.log']
 const engineLogPath = (c, log) => {
   if (!repoMode || !log) return log ? `${c.ws}/${log}` : ''
-  const roundName = c.round === 2 ? 'round-2' : 'round-1'
+  // Implement rounds carry an explicit roundName ('impl-3'/'impl-4'); plan rounds fall back to
+  // the round number ('round-1'/'round-2') exactly as before.
+  const roundName = c.roundName || (c.round === 2 ? 'round-2' : 'round-1')
   return `${worktreeLogDir(roundName, c.label || c.blind)}/${log}`
 }
 
@@ -359,14 +427,16 @@ function interpolatesModelId(a) {
   }
 }
 
-function dispatch(a, ws, guidance, phaseTitle) {
+function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath = null) {
   // Any dispatch path that interpolates a.model into a runner flag must see a safe id. Reject up
   // front (fail closed) so no malicious id can ever reach the shell as an unquoted flag token.
   if (interpolatesModelId(a) && !validModelId(a.model)) {
     log(`attempt ${a.label} (${a.displayModel}) skipped: model id rejected — must match ${SAFE_MODEL_ID} (refusing to interpolate an unsafe id into a runner flag)`)
     return null
   }
-  const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance, contextPath)
+  // phaseKind selects the framing: 'plan' (Rounds 1–2, produce a PLAN artifact) or 'implement'
+  // (Rounds 3–4, apply the change, seeded with the winning plan verbatim via seedPlanPath).
+  const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance, contextPath, phaseKind, seedPlanPath)
   const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle }
   let prompt
   if (a.dispatch === 'glm') {
@@ -389,7 +459,7 @@ function dispatch(a, ws, guidance, phaseTitle) {
   } else if (a.dispatch === 'minimax') {
     opts.agentType = nsAgent(a.agentType) // joust-minimax (one generic agent; MiniMax exposes only MiniMax-M3)
     // No --model flag: the runner's ANTHROPIC_MODEL pins MiniMax-M3 (all aliases map to it).
-    prompt = RUNVERBATIM(runnerCmd(minimaxRunner, '', ws, b, minimaxMaxTurns), ws, '_minimax_run.log')
+    prompt = RUNVERBATIM(runnerCmd(minimaxRunner, '', ws, b, minimaxMaxTurns, minimaxTimeoutSecs), ws, '_minimax_run.log')
   } else if (a.dispatch === 'grok') {
     opts.agentType = nsAgent(a.agentType) // joust-grok (one generic agent for BOTH grok variants)
     const flag = GROK_FLAG[a.displayModel] || `-m ${a.model}` // grok-build | grok-composer-2.5-fast -> grok -m
@@ -717,6 +787,92 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
   ).catch(() => null)
 }
 
+// ---- begin: verdict integrity guard ----------------------------------------------------------
+// A real observed failure (EV-judge-placeholder.md): a structured-output judge returned literal
+// placeholder values for EVERY field ("test" as reasoning, "test" as every pros/cons entry) — schema-valid,
+// so reconcile()'s label-permutation repair happily accepted it and it drove a whole round: wrong winner,
+// meaningless round-2 guidance. This block is a PURE, deterministic, no-LLM-judges-the-judge guard against
+// that narrow shape, wired at EVERY judging choke-point so the exact bug cannot recur through any path:
+//   - reconcile()   — the legacy single-judge path (judges:1), both Phase 3 review and Phase 5 final rank.
+//   - askLens()     — every council lens verdict, round 1 AND every deliberation round (same call site).
+//   - councilTally()— the security veto's EVIDENCE substance (the highest-stakes exclusion path: a vacuous
+//                     but schema-valid UNSAFE flag can silently exclude the real winner).
+//   - synthesizeGuidance() and reconcile()'s guidance field — council and legacy guidance synthesis.
+// Thresholds are conservative and named so a future owner can retune them without hunting through the tally
+// logic: a real judge's shortest honest verdict clears them easily. Deliberately an AND of two independent
+// signals (thin reasoning AND near-duplicate pros/cons), not an OR — either alone is common in legitimate
+// output (a crisp one-line reasoning; two candidates that genuinely share one short con) and rejecting on
+// either alone would create a NEW false-halt failure mode (a wrongly-killed lens/judge can cascade into
+// NO_CONSENSUS, which is worse than letting one junk verdict through to be outvoted by its peers).
+const INTEGRITY = {
+  MIN_REASONING_CHARS: 8,       // "test" (4 chars) trips this; "Best overall pick." (19) clears it easily
+  MIN_ITEMS_FOR_DIVERSITY: 3,   // need >=3 pros/cons entries before "everything is identical" is meaningful
+  MAX_DISTINCT_RATIO: 0.34,     // <=1/3 distinct among >=3 entries => near-duplicate/placeholder shape
+  MIN_VETO_EVIDENCE_CHARS: 15,  // a standing high/critical veto needs real substance ("file + why")
+}
+const JUNK_TOKENS = new Set(['test', 'todo', 'tbd', 'tbc', 'wip', 'n/a', 'na', 'xxx', 'placeholder', 'foo', 'bar', 'asdf', 'lorem ipsum', '...', '-'])
+const trimStr = s => String(s == null ? '' : s).trim()
+
+// Returns a short reason string if `result` (the {candidates, ranking, ..., reasoning} shape shared by the
+// legacy judge and every council lens) looks like schema-valid junk, else null (pass).
+function verdictIntegrityIssue(result) {
+  if (!result || typeof result !== 'object') return null // callers already null-guard separately
+  const reasoning = trimStr(result.reasoning)
+  const reasoningThin = reasoning.length < INTEGRITY.MIN_REASONING_CHARS || JUNK_TOKENS.has(reasoning.toLowerCase())
+  const prose = []
+  for (const c of (result.candidates || [])) {
+    for (const p of (c.pros || [])) prose.push(trimStr(p))
+    for (const x of (c.cons || [])) prose.push(trimStr(x))
+  }
+  let degenerate = false, distinctN = 0
+  if (prose.length >= INTEGRITY.MIN_ITEMS_FOR_DIVERSITY) {
+    distinctN = new Set(prose.map(s => s.toLowerCase())).size
+    degenerate = (distinctN / prose.length) <= INTEGRITY.MAX_DISTINCT_RATIO
+  }
+  if (reasoningThin && degenerate) {
+    return `reasoning near-empty/placeholder (${JSON.stringify(reasoning.slice(0, 20))}) AND pros/cons collapse to ${distinctN} distinct value(s) across ${prose.length} entries — looks like schema-valid junk, not a real verdict`
+  }
+  return null
+}
+
+// checks_run is a REQUIRED array on every council lens verdict (the forced-evidence lever), but an EMPTY
+// array satisfies JSON-schema `required` (the key is merely present) while supplying zero evidence — close
+// that gap explicitly, in code, at the same choke-point. Pass undefined (legacy schema has no checks_run
+// field) to skip.
+function checksRunIssue(checksRun) {
+  if (checksRun === undefined) return null
+  if (!Array.isArray(checksRun) || checksRun.length === 0) return 'checks_run is empty — no evidence recorded for this vote (forced-evidence lever unmet)'
+  if (checksRun.every(c => trimStr(c).length < 4)) return 'every checks_run entry is empty/near-empty — no real evidence recorded'
+  return null
+}
+
+// Highest-stakes exclusion path: a security veto excludes a candidate regardless of votes, so a vacuous
+// but schema-valid UNSAFE evidence string must not stand. Conservative: only an empty, placeholder-token,
+// or near-empty string is rejected; any real sentence clears MIN_VETO_EVIDENCE_CHARS easily.
+function vetoEvidenceIssue(evidence) {
+  const e = trimStr(evidence)
+  if (!e) return 'veto evidence is empty'
+  if (JUNK_TOKENS.has(e.toLowerCase())) return `veto evidence is a placeholder token (${JSON.stringify(e)})`
+  if (e.length < INTEGRITY.MIN_VETO_EVIDENCE_CHARS) return `veto evidence too short (${e.length} chars) to substantiate a high/critical exclusion`
+  return null
+}
+
+// Guidance items ({text, conf, why}) get the same thin-content signal. Degenerate ONLY when EVERY item in
+// a non-empty list is thin — an empty list is legitimate (nothing salient to report this round), and one
+// weak item among several real ones is normal noise, not junk.
+function guidanceIntegrityIssue(g) {
+  if (!g || typeof g !== 'object') return null
+  const items = [...(Array.isArray(g.positives) ? g.positives : []), ...(Array.isArray(g.challenges) ? g.challenges : [])]
+  if (!items.length) return null
+  const thin = items.filter(it => {
+    const t = trimStr(it && it.text), w = trimStr(it && it.why)
+    return t.length < INTEGRITY.MIN_REASONING_CHARS || w.length < INTEGRITY.MIN_REASONING_CHARS || JUNK_TOKENS.has(t.toLowerCase())
+  })
+  if (thin.length === items.length) return `all ${items.length} guidance item(s) have near-empty/placeholder text or why — looks like schema-valid junk`
+  return null
+}
+// ---- end: verdict integrity guard ------------------------------------------------------------
+
 // #6 + #7: never silently carry the wrong artifact or trust an off-spec ranking — normalize the
 // judge's winner/ranking against the REAL candidate labels and repair to a full permutation.
 function reconcile(result, labels) {
@@ -724,6 +880,11 @@ function reconcile(result, labels) {
   // that as a clear, catchable error instead of a cryptic "null is not an object" — judge() retries once
   // then degrades to a clean __failed partial result rather than crashing the (fully-paid) run.
   if (!result || typeof result !== 'object') throw new Error('judge returned no structured result (null)')
+  // Integrity guard (EV-judge-placeholder.md): reject schema-valid junk (e.g. every field literally "test")
+  // BEFORE it is repaired into a plausible-looking shape — retried once by judge()'s existing loop, same
+  // path as the null-guard above, so a genuinely dead/junk judge still degrades to a clean __failed partial.
+  const integrityIssue = verdictIntegrityIssue(result) || (result.guidance ? guidanceIntegrityIssue(result.guidance) : null)
+  if (integrityIssue) throw new Error(`judge verdict failed integrity check: ${integrityIssue}`)
   const set = new Set(labels)
   const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
   let ranking = [...new Set((result.ranking || []).map(norm).filter(x => set.has(x)))]
@@ -738,7 +899,14 @@ const blindLabel = (list, rot) => list.map((_, i) => list[(i + rot) % list.lengt
 
 // #3: an Opus judge runs AFTER the maximum spend, so never let one judge error crash the whole paid
 // run — retry once, then return a failure marker the caller turns into a partial, inspectable result.
-async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTitle, label) {
+//
+// Council dispatch (issue #22): when COUNCIL is on (the default), judge() delegates to councilJudge() —
+// the 5-lens deliberating council — and returns the SAME shape the legacy single judge returns
+// (`{ candidates, ranking, winner, reasoning, guidance? }`), extended with `council` metadata and a
+// `no_consensus` flag the call sites route on. `judges: 1` skips this branch entirely, so the legacy
+// body below is byte-for-byte today's single blind Opus judge (schema is REVIEW_SCHEMA / RANK_SCHEMA).
+async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTitle, label, lenses = defaultLensesFor(phaseTitle)) {
+  if (COUNCIL) return councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitle, label, lenses)
   const prompt = judgePrompt(kind, blindList, guidanceWanted, poolPath)
   for (let i = 1; i <= 2; i++) {
     try {
@@ -748,6 +916,436 @@ async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTit
       if (i === 2) return { __failed: String(e).slice(0, 160) }
     }
   }
+}
+
+// ==== 5-judge deliberating council (issue #22) ==============================================
+// Replaces the single blind Opus judge with 5 blind Opus judges, one lens each. Round 1 is
+// independent (no peer visibility); if no >50% majority on a non-vetoed candidate, up to 3
+// bounded deliberation rounds follow (each judge sees peers' verbatim verdicts, may run 1-2
+// checks, revises). The tally and the veto are DETERMINISTIC CODE below — NO LLM ever aggregates
+// votes or "summarises the consensus". Still split after 3 deliberation rounds → NO_CONSENSUS.
+//
+// The council returns the SAME shape the legacy judge returns — { candidates, ranking, winner,
+// reasoning, guidance? } — extended with `council` metadata and a `no_consensus` flag. Call sites
+// route on `__failed` (all judges dead) and `no_consensus` (ran but could not resolve).
+// CODE lenses — judge an IMPLEMENTATION (rounds 3–4, and any plan-only legacy run). The
+// veto lens's key is 'security' (councilTally / the veto machinery key off that literal).
+const LENSES = [
+  { key: 'correctness', owns: 'does it actually work — run or trace the code, and cite the enrichment (verify/build/lint) exit codes when present', special: 'You are the evidence judge; ground every claim in something you ran or read.' },
+  { key: 'spec', owns: 'compliance and completeness — is EVERYTHING that was asked done, and are the stated constraints honoured', special: 'You catch the "works but solved the wrong task" failure.' },
+  { key: 'security', owns: 'vulnerabilities, injected execution, secret/credential exposure, supply-chain and build-config risk', special: 'You hold the council VETO.' },
+  { key: 'robustness', owns: 'edge cases, failure modes, boundaries, error handling', special: 'Probe what breaks it, not just the happy path.' },
+  { key: 'craft', owns: 'readability, structure, maintainability, efficiency', special: 'Judge whether someone else could own this in a year.' },
+]
+
+// PLAN lenses — judge a PLAN artifact (rounds 1–2: a concrete, file-level change proposal
+// that never touches the repo). Same council engine, a different lens table. The veto lens
+// keeps the internal key 'security' (so councilTally / the veto / the security-dead policy
+// work UNCHANGED) but is DISPLAYED as 'security-by-design' via `title`. lensPrompt renders
+// `title || key`; every logic path (schema selection, tally, safety) still keys off `key`.
+const PLAN_LENSES = [
+  { key: 'feasibility', owns: 'can this plan actually be built as written — are the named files, APIs, and mechanisms real and reachable, and does each step follow from the last', special: 'You are the reality judge; a plan that cannot be executed as written is worthless however elegant.' },
+  { key: 'completeness', owns: 'does the plan cover EVERYTHING the task asked — every requirement, edge case, migration, test, and doc update, with no silent gaps', special: 'You catch the "plans the easy 80%, hand-waves the hard 20%" failure.' },
+  { key: 'risk', owns: 'what could go wrong on execution — hidden coupling, breaking changes, data/compat hazards, rollout/ordering risk, and whether the plan names and mitigates them', special: 'Probe the failure modes the plan glosses over, not just the happy path.' },
+  { key: 'security', title: 'security-by-design', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold the council VETO: veto a plan that designs in a real, evidenced security hazard.' },
+  { key: 'simplicity', owns: 'simplicity and proportionality — is the plan the smallest coherent change that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the plan is proportionate to the task; reward the simplest approach that is still complete.' },
+]
+
+// Lens profiles the council can run under. Default = code lenses (unchanged behaviour).
+const LENS_PROFILES = { code: LENSES, plan: PLAN_LENSES }
+
+// Which lens table a judging point uses, chosen by its phase title so the judge() CALL SITES stay
+// byte-for-byte (no per-call lens arg needed): the PLAN phase ('Review' = Plan Round 1 review,
+// 'Final rank' = Plan Final rank) uses the plan lenses; everything else (the implement rounds and
+// any legacy point) uses the code lenses.
+function defaultLensesFor(phaseTitle) {
+  return (phaseTitle === 'Review' || phaseTitle === 'Final rank') ? PLAN_LENSES : LENSES
+}
+
+// Per-lens structured-output schemas. checks_run is REQUIRED on every verdict (the forced-evidence lever).
+const LENS_R1_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    candidates: CANDS,
+    ranking: { type: 'array', items: { type: 'string' } },
+    vote: { type: 'string' },
+    reasoning: { type: 'string' },
+    checks_run: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['candidates', 'ranking', 'vote', 'reasoning', 'checks_run'],
+}
+const SAFETY_ITEM = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    label: { type: 'string' },
+    safety: { type: 'string', enum: ['SAFE', 'UNSAFE'] },
+    severity: { type: 'string', enum: ['high', 'critical'] }, // present only when UNSAFE
+    evidence: { type: 'string' },                              // file + why; required (in prose) for a standing veto
+  },
+  required: ['label', 'safety'],
+}
+const SECURITY_R1_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    ...LENS_R1_SCHEMA.properties,
+    safety: { type: 'array', items: SAFETY_ITEM },
+  },
+  required: [...LENS_R1_SCHEMA.required, 'safety'],
+}
+// Deliberation rounds add the cross-talk fields (response_to_peers + the truthful changed flags).
+const DELIB_EXTRA = {
+  response_to_peers: { type: 'string' },
+  changed_this_round: { type: 'boolean' },
+  changed_from_round1: { type: 'boolean' },
+}
+const DELIB_EXTRA_REQ = ['response_to_peers', 'changed_this_round', 'changed_from_round1']
+const LENS_DELIB_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { ...LENS_R1_SCHEMA.properties, ...DELIB_EXTRA },
+  required: [...LENS_R1_SCHEMA.required, ...DELIB_EXTRA_REQ],
+}
+const SECURITY_DELIB_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { ...SECURITY_R1_SCHEMA.properties, ...DELIB_EXTRA },
+  required: [...SECURITY_R1_SCHEMA.required, ...DELIB_EXTRA_REQ],
+}
+// Guidance is distilled by a SEPARATE synthesis call (not a decision-maker) with the same cap/schema/rules.
+const GUIDANCE_SYNTH_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    positives: { type: 'array', maxItems: GUIDANCE_CAP, items: GUIDANCE_ITEM },
+    challenges: { type: 'array', maxItems: GUIDANCE_CAP, items: GUIDANCE_ITEM },
+  },
+  required: ['positives', 'challenges'],
+}
+
+// Per-judge reconcile: normalise vote/ranking/safety labels to the real blind-label set (mirrors reconcile()).
+function reconcileLens(v, labels) {
+  const set = new Set(labels)
+  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
+  let ranking = [...new Set((v.ranking || []).map(norm).filter(x => set.has(x)))]
+  for (const l of labels) if (!ranking.includes(l)) ranking.push(l)
+  let vote = norm(v.vote)
+  if (!set.has(vote)) vote = ranking[0]
+  const out = { ...v, vote, ranking }
+  if (Array.isArray(v.safety)) {
+    out.safety = v.safety.map(s => ({ ...s, label: norm(s && s.label) })).filter(s => set.has(s.label))
+  }
+  return out
+}
+
+// One lens judge: opus, retry once (like judge()), reconcile. Returns { lens, ...verdict } or null (dead).
+async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot) {
+  const labels = blindList.map(c => c.blind)
+  const prompt = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot)
+  const schema = lens.key === 'security'
+    ? (roundNum === 1 ? SECURITY_R1_SCHEMA : SECURITY_DELIB_SCHEMA)
+    : (roundNum === 1 ? LENS_R1_SCHEMA : LENS_DELIB_SCHEMA)
+  for (let i = 1; i <= 2; i++) {
+    try {
+      const raw = await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label })
+      if (!raw || typeof raw !== 'object') throw new Error('lens judge returned no structured result (null)')
+      // Integrity guard (same choke-point as reconcile(), see EV-judge-placeholder.md): covers BOTH round 1
+      // and every deliberation round, since askLens() is the single call site for all of them.
+      const integrityIssue = verdictIntegrityIssue(raw) || checksRunIssue(raw.checks_run)
+      if (integrityIssue) throw new Error(`council lens verdict failed integrity check: ${integrityIssue}`)
+      return { lens: lens.key, ...reconcileLens(raw, labels) }
+    } catch (e) {
+      log(`council ${label} (${lens.key}) attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
+      if (i === 2) return null // dead lens — council recomputes majority over the living
+    }
+  }
+}
+
+// Each judge's candidate LISTING is rotated differently (position-bias control). The shared _pool.md
+// order is fixed (advisory caveat), but the dirs listing + the "consider in this order" hint rotate.
+function lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) {
+  const n = blindList.length
+  const rotated = blindList.map((_, i) => blindList[(i + rot) % n])
+  const dirs = rotated.map(c => `  Candidate ${c.blind}: ${c.ws}/`).join('\n')
+  const letters = rotated.map(c => c.blind).join(', ')
+  const securityExtra = lens.key === 'security'
+    ? `\n\nYou hold the council's SECURITY VETO. For EVERY candidate also return a \`safety\` entry: {label, safety: "SAFE" | "UNSAFE", severity ("high"|"critical", UNSAFE only), evidence (file + concrete why, UNSAFE only)}. Flag UNSAFE only with EVIDENCE you can point to — a real vulnerability, injected-execution path, secret/credential exposure, or supply-chain/build-config risk. A standing UNSAFE flag (high|critical, with evidence) EXCLUDES that candidate from winning regardless of votes, so do not flag on suspicion alone — but if you are unsure whether something is exploitable, flag it and cite why (fail-closed).`
+    : ''
+  const delib = roundNum > 1
+    ? `\n\nThis is DELIBERATION round ${roundNum - 1} of at most 3. Your peers' latest full verdicts (blind, letters only) are below as verbatim JSON. Read them, address the disagreements in \`response_to_peers\` (convince them or be convinced — converge on the CORRECT call, do not hold a position out of stubbornness), and you MAY run 1-2 targeted checks to settle a factual dispute. Then emit your REVISED verdict and set \`changed_this_round\` / \`changed_from_round1\` truthfully.${lens.key === 'security' ? ' A peer may rebut your veto with evidence; if it genuinely refutes the flag, WITHDRAW it (drop that UNSAFE entry). A flag you still believe stands and keeps excluding the candidate.' : ''}\n\nPEER VERDICTS (JSON, verbatim):\n${peerBlock}`
+    : ''
+  return `You are a blind judge on a 5-member review COUNCIL. Your lens is **${lens.title || lens.key}**: ${lens.owns}. ${lens.special}
+You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you, through YOUR lens (the other four lenses cover the rest). Apply the shared scoring method: judge the real artifact not any self-summary; score against the task's STATED runtime (treat reliance on a capability the task did not establish as a risk, and treat an unfamiliar but constraint-honouring mechanism as correct unless you can name a concrete way it fails); cite specifics (a line or behaviour, never a vibe).
+
+Task that every candidate was given:
+${task}
+
+All candidate deliverables are concatenated, blind-labelled, in ONE file — read it ONCE (each candidate's section is headed "===== Candidate <letter> ====="):
+${poolPath}
+
+If (and only if) a candidate is runnable code you want to execute to judge the real output, its individual files are in its own directory (run with a sensible timeout). Consider the candidates in this order — ${letters}:
+${dirs}
+Do not read any other files.
+
+Return the structured object for YOUR lens: per-candidate pros/cons (through this lens), the full ranking (best first, by candidate letter), your single first-place \`vote\` (one candidate letter), \`reasoning\`, and \`checks_run\` — the commands you ran or files you read, each with its key result (forced evidence; never leave it empty).${securityExtra}${delib}
+
+You are ONE independent voice. Do NOT tally, aggregate, average, or "reach consensus" yourself, and do NOT name an overall council winner — the winner is computed deterministically in code from all five votes plus the veto. Just cast the single most honest first-place vote your lens supports.`
+}
+
+// DETERMINISTIC tally — plain code, run after every round. Majority = strictly >50% of LIVING judges'
+// first-place votes on a candidate the security lens has NOT flagged UNSAFE (high|critical, with evidence).
+function councilTally(verdicts) {
+  const living = verdicts.length
+  const votes = {}
+  for (const v of verdicts) votes[v.vote] = (votes[v.vote] || 0) + 1
+  const secV = verdicts.find(v => v.lens === 'security')
+  const vetoedSet = new Set()
+  if (secV && Array.isArray(secV.safety)) {
+    for (const s of secV.safety) {
+      if (s && s.safety === 'UNSAFE' && (s.severity === 'high' || s.severity === 'critical')) {
+        // Highest-stakes exclusion path: don't let a vacuous-but-schema-valid evidence string stand as a
+        // veto (EV-judge-placeholder.md class of failure). A rejected veto does NOT kill the security
+        // lens's other votes/ranking — only this one flag is disregarded, so a real veto on another
+        // candidate, or the lens's first-place vote, are unaffected.
+        const evIssue = vetoEvidenceIssue(s.evidence)
+        if (evIssue) log(`council veto on Candidate ${s.label} REJECTED (not standing): ${evIssue} — a vacuous veto must not exclude a real candidate`)
+        else vetoedSet.add(s.label)
+      }
+    }
+  }
+  const threshold = living / 2 // strict >50%
+  let winner = null
+  const order = Object.keys(votes).sort((a, b) => (votes[b] - votes[a]) || a.localeCompare(b))
+  for (const c of order) { if (votes[c] > threshold && !vetoedSet.has(c)) { winner = c; break } }
+  return { living, votes, vetoedSet, vetoed: [...vetoedSet], threshold, winner }
+}
+
+// A compact, blind (letters-only) peer block handed to each judge during deliberation.
+function councilPeerBlock(peers) {
+  const compact = peers.map(v => ({
+    lens: v.lens, vote: v.vote, ranking: v.ranking, reasoning: v.reasoning,
+    candidates: (v.candidates || []).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })),
+    checks_run: v.checks_run || [],
+    ...(v.lens === 'security' && Array.isArray(v.safety) ? { safety: v.safety } : {}),
+  }))
+  return JSON.stringify(compact, null, 2)
+}
+
+// Consolidated ranking (bookkeeping for downstream consumers, e.g. 7-FALLBACK's ranked #2) — winner first,
+// then remaining by (first-place votes desc, average rank across final verdicts asc, blind label asc). This
+// is NOT a consensus override: the winner slot is only ever filled by a majority non-vetoed winner (else null).
+function consolidatedRanking(verdicts, labels, winner) {
+  const firstVotes = {}, rankSum = {}, rankCount = {}
+  for (const l of labels) { firstVotes[l] = 0; rankSum[l] = 0; rankCount[l] = 0 }
+  for (const v of verdicts) {
+    if (firstVotes[v.vote] != null) firstVotes[v.vote]++
+    ;(v.ranking || []).forEach((l, idx) => { if (rankCount[l] != null) { rankSum[l] += idx + 1; rankCount[l]++ } })
+  }
+  const avgRank = l => rankCount[l] ? rankSum[l] / rankCount[l] : labels.length + 1
+  const rest = labels.filter(l => l !== winner)
+  rest.sort((a, b) => (firstVotes[b] - firstVotes[a]) || (avgRank(a) - avgRank(b)) || a.localeCompare(b))
+  return winner ? [winner, ...rest] : rest
+}
+
+// Merge the 5 lenses' pros/cons per candidate into the legacy { label, pros, cons } shape verdictToMd reads.
+function mergeCandidates(verdicts, labels) {
+  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
+  return labels.map(l => {
+    const pros = [], cons = []
+    for (const v of verdicts) {
+      const c = (v.candidates || []).find(x => norm(x.label) === l)
+      if (!c) continue
+      for (const p of (c.pros || [])) pros.push(`[${v.lens}] ${p}`)
+      for (const x of (c.cons || [])) cons.push(`[${v.lens}] ${x}`)
+    }
+    return { label: l, pros, cons }
+  })
+}
+
+// Per-round persisted record: living lenses, votes, veto, winner, and each judge's blind verdict.
+function roundRecord(round, verdicts, t) {
+  return {
+    round,
+    living: verdicts.map(v => v.lens),
+    votes: { ...t.votes },
+    vetoed: t.vetoed,
+    winner: t.winner,
+    verdicts: verdicts.map(v => ({
+      lens: v.lens,
+      vote: v.vote,
+      ranking: v.ranking,
+      reasoning: v.reasoning || '',
+      checks_run: Array.isArray(v.checks_run) ? v.checks_run : [],
+      pros_cons: (v.candidates || []).map(c => ({ label: c.label, pros: c.pros || [], cons: c.cons || [] })),
+      changed_this_round: v.changed_this_round === true,
+      changed_from_round1: v.changed_from_round1 === true,
+      response_to_peers: v.response_to_peers || '',
+      ...(v.lens === 'security' && Array.isArray(v.safety) ? { safety: v.safety } : {}),
+    })),
+  }
+}
+
+// Assemble the legacy-shaped result + council metadata. reasoning is CODE-generated (no LLM aggregation).
+function buildCouncilResult({ winner, verdicts, roundsLog, labels, no_consensus, humanReason, lenses = LENSES }) {
+  const ranking = consolidatedRanking(verdicts, labels, winner)
+  const candidates = mergeCandidates(verdicts, labels)
+  const t = roundsLog.length ? roundsLog[roundsLog.length - 1] : { votes: {}, living: 0, vetoed: [] }
+  const reasoning = no_consensus
+    ? `NO_CONSENSUS after ${roundsLog.length} council round(s): ${humanReason}. The deterministic tally never resolved to a >50% non-vetoed majority; routed to human review (a winner is NEVER synthesised or merged by an LLM).`
+    : `Council majority: Candidate ${winner} took ${t.votes[winner] || 0}/${t.living} first-place votes (>50%) after ${roundsLog.length} round(s)` +
+      `${t.vetoed.length ? `; security veto standing on ${t.vetoed.join(', ')}` : '; no standing security veto'}.`
+  const council = {
+    lenses: lenses.map(l => l.title || l.key),
+    rounds_used: roundsLog.length,
+    rounds: roundsLog,
+    vote_evolution: roundsLog.map(r => ({ round: r.round, votes: r.votes, vetoed: r.vetoed, winner: r.winner, living: r.living })),
+    veto_events: t.vetoed,
+    final_living: t.living,
+    no_consensus: !!no_consensus,
+    ...(no_consensus ? { human_reason: humanReason } : {}),
+  }
+  return { candidates, ranking, winner: no_consensus ? null : winner, reasoning, council, no_consensus: !!no_consensus }
+}
+
+// A SEPARATE synthesis call — explicitly NOT a decision-maker and NOT a vote-aggregator. It distils generic
+// round-2 guidance from the council's final verdicts under the same GUIDANCE_CAP, schema and blind rules as
+// the legacy single-judge guidance. It never picks or changes a winner.
+async function synthesizeGuidance(verdicts, phaseTitle, label) {
+  const block = JSON.stringify(verdicts.map(v => ({
+    lens: v.lens, reasoning: v.reasoning,
+    candidates: (v.candidates || []).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })),
+  })), null, 2)
+  const prompt = `You are a guidance SYNTHESISER, not a judge and NOT a decision-maker. You are given the blind council judges' FINAL verdicts on one task (letters only; you do not know which model is which and must not speculate). Do NOT pick a winner, do NOT rank candidates, do NOT tally or merge votes — that is done elsewhere in code. Your ONLY job is to distil FALLIBLE PRIORS for a fresh, independent second round of attempts.
+
+Task the candidates were given:
+${task}
+
+Produce two short generic lists, NO candidate-specific code, NO model identities, and NO counts (never "seen in 2 of 3" — describe the reason in words):
+- positives: generic patterns/choices that helped anywhere this round.
+- challenges: generic pitfalls/weaknesses/constraint-violations seen anywhere this round.
+For EACH item give: text (a generic principle, never an implementation lift — drop it if it only makes sense as one exact piece of code); conf — "strong" ONLY if the same pattern held up REPEATEDLY across distinct attempts, otherwise "tentative"; and why, one short generic clause naming the reason for the tier. Keep each list to at most ${GUIDANCE_CAP} items — fewer, sharper, corroborated items beat a long list.
+
+The council's final verdicts (JSON, verbatim):
+${block}
+
+Return only the two guidance lists (each item: text, conf, why).`
+  for (let i = 1; i <= 2; i++) {
+    try {
+      const g = await agent(prompt, { model: 'opus', schema: GUIDANCE_SYNTH_SCHEMA, phase: phaseTitle, label })
+      if (g && typeof g === 'object' && Array.isArray(g.positives) && Array.isArray(g.challenges)) {
+        // Integrity guard (same choke-point family as reconcile()/askLens()): reject schema-valid junk
+        // guidance (e.g. every item literally {text:"a", why:"b"}) before it steers a fresh round-2.
+        const integrityIssue = guidanceIntegrityIssue(g)
+        if (integrityIssue) throw new Error(`guidance synthesis failed integrity check: ${integrityIssue}`)
+        return g
+      }
+      throw new Error('guidance synthesis returned a malformed result')
+    } catch (e) {
+      log(`council guidance synthesis attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
+      if (i === 2) return { positives: [], challenges: [] } // never crash a fully-paid run for missing guidance
+    }
+  }
+}
+
+// The orchestrator judge() delegates to. Independent round 1 → bounded deliberation → deterministic tally.
+async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitle, label, lenses = LENSES) {
+  const labels = blindList.map(c => c.blind)
+  const roundsLog = []
+
+  // Round 1 — 5 independent verdicts, no peer visibility. Each lens gets a differently-rotated listing.
+  const r1raw = await parallel(lenses.map((lens, i) => () =>
+    askLens(lens, blindList, poolPath, phaseTitle, `${label}-${lens.key}-r1`, 1, null, i)))
+  let verdicts = r1raw.filter(Boolean)
+  if (!verdicts.length) {
+    log(`council ${label}: ALL 5 lenses died in round 1 — degrading to a __failed partial (caller lands a partial run).`)
+    return { __failed: 'all council judges failed in round 1' }
+  }
+
+  // Security-judge death policy: repoMode = fail-closed (unresolvable veto → NO_CONSENSUS/needs-human);
+  // isolated run = proceed, but LOUD warning that veto coverage was lost.
+  const securityDeadHalt = () => {
+    const tt = councilTally(verdicts)
+    roundsLog.push(roundRecord(roundsLog.length + 1, verdicts, tt))
+    return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
+      humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' })
+  }
+  if (!verdicts.some(v => v.lens === 'security')) {
+    if (repoMode) {
+      log(`council ${label}: SECURITY lens dead in repoMode — veto coverage unresolvable; failing closed to NO_CONSENSUS (needs-human + HALT).`)
+      return securityDeadHalt()
+    }
+    log(`JE-COUNCIL-WARNING [${phaseTitle}]: security lens dead — veto coverage LOST for this isolated run; the council proceeds WITHOUT a security veto.`)
+  }
+
+  let t = councilTally(verdicts)
+  roundsLog.push(roundRecord(1, verdicts, t))
+  let winner = t.winner
+  const allVetoed = () => labels.length > 0 && labels.every(l => t.vetoedSet.has(l))
+
+  // Bounded deliberation: max 3 rounds. Stop early on a majority or when every candidate is vetoed.
+  for (let d = 1; d <= 3 && winner == null && !allVetoed(); d++) {
+    const roundNum = d + 1
+    const prev = verdicts
+    const delibRaw = await parallel(prev.map(pv => () => {
+      const lens = lenses.find(l => l.key === pv.lens)
+      const rot = lenses.findIndex(l => l.key === pv.lens)
+      const peerBlock = councilPeerBlock(prev.filter(v => v.lens !== pv.lens))
+      return askLens(lens, blindList, poolPath, phaseTitle, `${label}-${pv.lens}-r${roundNum}`, roundNum, peerBlock, rot)
+    }))
+    const next = delibRaw.filter(Boolean)
+    if (!next.length) { log(`council ${label}: all living lenses died in deliberation round ${d}; ending deliberation on the prior round's verdicts.`); break }
+    verdicts = next
+    if (!verdicts.some(v => v.lens === 'security') && repoMode) {
+      log(`council ${label}: SECURITY lens lost during deliberation in repoMode — failing closed to NO_CONSENSUS (needs-human + HALT).`)
+      return securityDeadHalt()
+    }
+    t = councilTally(verdicts)
+    roundsLog.push(roundRecord(roundNum, verdicts, t))
+    winner = t.winner
+  }
+
+  if (winner != null) {
+    const result = buildCouncilResult({ winner, verdicts, roundsLog, labels, lenses, no_consensus: false })
+    if (guidanceWanted) result.guidance = await synthesizeGuidance(verdicts, phaseTitle, `${label}-guidance`)
+    return result
+  }
+  // Still split after the bounded deliberation (or every candidate vetoed) → NO_CONSENSUS. Never resolved
+  // by Borda or a meta-judge; routed to human review by the call site.
+  const reason = allVetoed() ? 'all candidates were vetoed UNSAFE by the security lens' : 'no candidate reached a >50% majority after 3 deliberation rounds'
+  log(`council ${label}: NO_CONSENSUS — ${reason}.`)
+  return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: reason })
+}
+
+// Render the council's deliberation for the verdict.md report (per-round tally + per-judge verdicts + vetoes).
+function councilToMd(council) {
+  if (!council) return ''
+  const L = ['## Council deliberation', '',
+    `**Lenses:** ${(council.lenses || []).join(', ')}  •  **Rounds used:** ${council.rounds_used}  •  **Living at final tally:** ${council.final_living}`,
+    council.no_consensus ? `**Result:** NO_CONSENSUS${council.human_reason ? ` — ${council.human_reason}` : ''}` : '', '']
+  L.push('### Vote evolution', '', '| Round | Votes (candidate:count) | Veto | Round winner |', '|---|---|---|---|')
+  for (const r of (council.vote_evolution || [])) {
+    const votes = Object.keys(r.votes || {}).sort().map(k => `${k}:${r.votes[k]}`).join(', ') || '_(none)_'
+    L.push(`| ${r.round} | ${votes} | ${(r.vetoed || []).join(', ') || '—'} | ${r.winner || '—'} |`)
+  }
+  L.push('')
+  for (const r of (council.rounds || [])) {
+    L.push(`### Round ${r.round} verdicts`, '')
+    for (const v of (r.verdicts || [])) {
+      L.push(`**${v.lens}** — vote Candidate ${v.vote}; ranking ${(v.ranking || []).map(x => `Candidate ${x}`).join(' > ')}${v.changed_this_round ? ' _(changed this round)_' : ''}`)
+      if (v.reasoning) L.push(`- ${v.reasoning}`)
+      for (const s of (v.safety || [])) if (s.safety === 'UNSAFE') L.push(`- VETO Candidate ${s.label} (${s.severity || '?'}): ${s.evidence || '_(no evidence)_'}`)
+      if (v.response_to_peers) L.push(`- to peers: ${v.response_to_peers}`)
+      L.push('')
+    }
+  }
+  return L.join('\n') + '\n'
+}
+
+// Compact council line for the run SUMMARY (blind-safe: letters only, no model identity). The full
+// per-judge deliberation lives in verdict.md (councilToMd); the summary shows just the outcome shape.
+function councilTallyMd(council) {
+  if (!council) return ''
+  const last = (council.vote_evolution || [])[(council.vote_evolution || []).length - 1]
+  const votes = last ? (Object.keys(last.votes || {}).sort().map(k => `${k}:${last.votes[k]}`).join(', ') || 'none') : 'none'
+  const veto = last && last.vetoed && last.vetoed.length ? ` • veto: ${last.vetoed.join(', ')}` : ''
+  const outcome = council.no_consensus ? `NO_CONSENSUS (${council.human_reason || 'unresolved split'})` : 'majority reached'
+  return `**Council:** ${council.rounds_used} round(s), ${council.final_living} judge(s) at final tally • final votes ${votes}${veto} • ${outcome}`
 }
 
 // ---- durable persistence (sandbox has NO node:fs/import/process — write via haiku+Bash, like buildContext) ----
@@ -804,7 +1402,9 @@ const blindFail = r => r ? 'excluded (did not pass validation)' : r
 
 // verdict object (blind, letters only): { candidates:[{label,pros,cons}], ranking, winner, reasoning, guidance? }
 function verdictToMd(v, title) {
-  const L = [`# ${title}`, '', `**Winner:** Candidate ${v.winner}`, '',
+  // Council NO_CONSENSUS carries winner:null — render it as a HALT banner, never a fake "Candidate ".
+  const winnerLine = (v.no_consensus || !v.winner) ? '**Winner:** NO CONSENSUS (routed to human review)' : `**Winner:** Candidate ${v.winner}`
+  const L = [`# ${title}`, '', winnerLine, '',
     `**Ranking (best first):** ${(v.ranking || []).map(r => `Candidate ${r}`).join(' > ')}`, '',
     '## Reasoning', '', v.reasoning || '_(none given)_', '', '## Per-candidate', '']
   for (const c of (v.candidates || [])) {
@@ -816,6 +1416,8 @@ function verdictToMd(v, title) {
     if (!(c.cons || []).length) L.push('- _(none)_')
     L.push('')
   }
+  // Council metadata (per-round tally + per-judge verdicts + veto events). Absent on the legacy judges:1 path.
+  if (v.council) L.push(councilToMd(v.council))
   return L.join('\n') + '\n'
 }
 
@@ -853,9 +1455,11 @@ function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, 
       const m = (r1mapping || []).find(x => x.candidate === letter)
       return unblind && m ? `Candidate ${letter} (${m.model})` : `Candidate ${letter}`
     }
+    const r1winnerLine = (r1review.no_consensus || !r1review.winner) ? 'NO CONSENSUS (routed to human review)' : r1join(r1review.winner)
     L.push(mode === 'two' ? '## Round-1 review verdict' : '## Verdict', '',
-      `**${mode === 'two' ? 'Round-1 ' : ''}Winner:** ${r1join(r1review.winner)}`, '',
+      `**${mode === 'two' ? 'Round-1 ' : ''}Winner:** ${r1winnerLine}`, '',
       `**Ranking:** ${(r1review.ranking || []).map(r1join).join(' > ')}`, '')
+    if (r1review.council) L.push(councilTallyMd(r1review.council), '')
   }
   if (mode === 'two' && finalMapping) {
     L.push('## Final candidates', '',
@@ -873,10 +1477,12 @@ function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, 
         return unblind && m ? `Candidate ${letter} (${m.model})` : `Candidate ${letter}`
       }
       const wm = finalMapping.find(x => x.candidate === finalRank.winner)
-      L.push('## Overall winner', '', `**Winner:** ${fjoin(finalRank.winner)}`)
+      const overallLine = (finalRank.no_consensus || !finalRank.winner) ? 'NO CONSENSUS (routed to human review)' : fjoin(finalRank.winner)
+      L.push('## Overall winner', '', `**Winner:** ${overallLine}`)
       if (wm) L.push(`**Came from round:** ${wm.round}`)
       else if (winnerRound != null) L.push(`**Came from round:** ${winnerRound}`)
       L.push('', `**Final ranking:** ${(finalRank.ranking || []).map(fjoin).join(' > ')}`, '')
+      if (finalRank.council) L.push(councilTallyMd(finalRank.council), '')
     }
   }
   return L.join('\n') + '\n'
@@ -985,6 +1591,89 @@ function largestRemainderRound(combined, share) {
 }
 // ---- end: contribution estimation (PURE; persistence is a separate thin step) ----
 
+// ================= IMPLEMENT PHASE (Rounds 3–4) — only with args.implement =====================
+// The plan phase (Rounds 1–2, above) resolves a WINNING PLAN. When implement is on, that plan is
+// bundled verbatim and handed to a small strong implement pool. Round 3 always runs; Round 4 runs
+// ONLY if Round 3 produced no gate-passing candidate. Judged by the 5-lens CODE council.
+
+// Bundle the winning plan's staged deliverable(s) into ONE seed file the implementers read.
+async function bundlePlan(planWs, seedPath) {
+  const dir = seedPath.slice(0, seedPath.lastIndexOf('/'))
+  const cmd = `mkdir -p ${q(dir)} && { echo "===== APPROVED PLAN (implement this verbatim) ====="; find ${q(planWs)} -type f 2>/dev/null | sort | while IFS= read -r f; do printf '\\n----- %s -----\\n' "$f"; cat "$f" 2>/dev/null; done; } > ${q(seedPath)} && wc -c ${q(seedPath)}`
+  log(`Bundling winning plan → ${seedPath}`)
+  await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
+    { model: 'haiku', phase: 'Implement Round 3', label: 'seed-plan' }).catch(() => null)
+}
+
+// A round's gate: an adoptable candidate exists iff the CODE council reached a non-vetoed majority
+// winner (not __failed / not NO_CONSENSUS) that is a VALID candidate. In repoMode the verify/build/
+// lint (and, at the driver level, the security audit) evidence is folded into that council via the
+// enriched blind pool — so this reuses the grand-loop gate(candidate) spirit (verify AND audit).
+function implGatePassed(r) {
+  const rv = r && r.review
+  if (!rv || rv.__failed) return { pass: false, reason: 'no code-council verdict', winner: null }
+  if (rv.no_consensus || !rv.winner) return { pass: false, reason: 'code council NO_CONSENSUS / all vetoed', winner: null }
+  const w = (r.blind || []).find(c => c.blind === rv.winner)
+  if (!w) return { pass: false, reason: 'council winner not among valid candidates', winner: null }
+  return { pass: true, reason: 'code-council majority on a valid, non-vetoed candidate', winner: rv.winner }
+}
+
+// Run ONE implement round: dispatch the implement pool seeded with the plan, stage, enrich, and
+// judge with the CODE lenses. `wantGuidance` distils round-3 → round-4 priors (round 3 only).
+async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance, reviewDir, wantGuidance) {
+  const list = implementAttempts.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : `${runDir}/${roundName}/${a.label}` }))
+  await buildWorktrees(roundName, list)
+  const doneRaw = (await parallel(list.map(a => () => dispatch(a, a.ws, guidance, phaseTitle, 'implement', seedPlanPath)))).filter(Boolean)
+  const done = doneRaw.map(c => ({ ...c, roundName }))
+  { const w = dispatchDropSummary(phaseTitle, dispatchDrops, list.length, done.length); if (w) log(w) }
+  await snapshotWorktrees(roundName, done)
+  if (!done.length) return { blind: [], mapping: [], review: { __failed: 'no implement attempts survived dispatch' } }
+  const staged = await stageAndValidate(blindLabel(done, rot), reviewDir, phaseTitle)
+  const blind = staged.filter(c => c.valid)
+  const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
+  if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables' } }
+  if (repoMode) await enrichBlindPool(blind, reviewDir, phaseTitle)
+  const review = await judge('code reviewer', blind, wantGuidance, `${reviewDir}/_pool.md`,
+    wantGuidance ? REVIEW_SCHEMA : RANK_SCHEMA, phaseTitle, `${roundName}-review`, LENSES)
+  return { blind, mapping, review }
+}
+
+// The implement phase driver. Round 3 always; Round 4 ONLY on a failed R3 gate (guided by R3 review).
+async function implementPhase(seedPlanPath) {
+  phase('Implement Round 3')
+  log(`Implement Round 3: ${implementAttempts.length} implementer(s) seeded with the winning plan (${implementAttempts.map(a => a.displayModel).join(', ')})`)
+  const r3 = await implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
+  await persist([
+    ...(r3.review && !r3.review.__failed ? [{ path: `${runDir}/review-impl-3/verdict.md`, content: verdictToMd(r3.review, 'Implement Round 3 verdict') }] : []),
+    ...(r3.review && r3.review.council ? [{ path: `${runDir}/review-impl-3/council.json`, content: json(r3.review.council) }] : []),
+  ], 'Implement Round 3')
+  const g3 = implGatePassed(r3)
+  if (g3.pass) {
+    return { rounds: 3, round3: { mapping: r3.mapping, review: r3.review }, winner: g3.winner, winnerRound: 3, no_consensus: false, needs_human: false }
+  }
+  // R4 exists ONLY as the guided retry: R3 produced no gate-passing candidate (verify fail /
+  // council NO_CONSENSUS / all vetoed). A plan-phase NO_CONSENSUS never reaches here — it was
+  // surfaced before any implement spend.
+  log(`Implement Round 3 gate NOT passed (${g3.reason}); escalating to Implement Round 4 (guided retry).`)
+  phase('Implement Round 4')
+  const guidance = (r3.review && r3.review.guidance) || null
+  const r4 = await implementRound('impl-4', 'Implement Round 4', 4, seedPlanPath, guidance, `${runDir}/review-impl-4`, false)
+  await persist([
+    ...(r4.review && !r4.review.__failed ? [{ path: `${runDir}/review-impl-4/verdict.md`, content: verdictToMd(r4.review, 'Implement Round 4 verdict') }] : []),
+    ...(r4.review && r4.review.council ? [{ path: `${runDir}/review-impl-4/council.json`, content: json(r4.review.council) }] : []),
+  ], 'Implement Round 4')
+  const g4 = implGatePassed(r4)
+  return {
+    rounds: 4,
+    round3: { mapping: r3.mapping, review: r3.review },
+    round4: { mapping: r4.mapping, review: r4.review },
+    winner: g4.pass ? g4.winner : null,
+    winnerRound: g4.pass ? 4 : null,
+    no_consensus: !!(r4.review && r4.review.no_consensus),
+    needs_human: !g4.pass, // R4 also failed the gate → needs-human (existing contract)
+  }
+}
+
 // ---- Round 1 ----
 phase('Round 1')
 log(`▶ ${deriveSummary()}`) // issue #38: run-purpose summary as the first narrator line (above the progress tree)
@@ -1019,6 +1708,8 @@ if (!blind1.length) {
 
 if (repoMode) await enrichBlindPool(blind1, `${runDir}/review-1`, 'Review')
 
+// Plan Round 1 review — judged by the PLAN-lens council (feasibility/completeness/risk/
+// security-by-design/simplicity), selected by phaseTitle inside judge(). Plans never touch the repo.
 const review = await judge('reviewer', blind1, mode === 'two', `${runDir}/review-1/_pool.md`,
   mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, 'Review', 'review')
 if (review.__failed) {
@@ -1031,11 +1722,29 @@ if (review.__failed) {
   return { mode, n: N, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
 }
 
+if (review.no_consensus) {
+  // P1b (council): the council ran but could NOT reach a >50% non-vetoed majority. NO_CONSENSUS is
+  // terminal — never silently resolved by Borda/meta-judge and never carried into round 2. Persist the
+  // full split (per-judge verdicts + vote evolution + veto events) so an interactive run can surface it
+  // and a grand loop routes this loop to needs-human + HALT (winner:null in mapping.json is the signal).
+  log(`Review: council NO_CONSENSUS — ${review.reasoning}`)
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: null, no_consensus: true, ...(mode === 'two' ? { winner: null } : {}) }) },
+    { path: `${runDir}/review-1/verdict.json`, content: json(review) },
+    { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict (NO CONSENSUS)') },
+    { path: `${runDir}/review-1/council.json`, content: json(review.council) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+  ], 'Review')
+  return { mode, n: N, round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
+}
+
 // P2: round-1 review is valid — incremental write BEFORE any round-2 dispatch (crash-survival linchpin)
 await persist([
   { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner }) },
   { path: `${runDir}/review-1/verdict.json`, content: json(review) },
   { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict') },
+  ...(review.council ? [{ path: `${runDir}/review-1/council.json`, content: json(review.council) }] : []),
   ...(review.guidance ? [{ path: `${runDir}/review-1/guidance.md`, content: guidanceToMd(review.guidance) }] : []),
 ], 'Review')
 
@@ -1091,6 +1800,7 @@ if (!blindF.length) {
 
 if (repoMode) await enrichBlindPool(blindF, `${runDir}/review-final`, 'Final rank')
 
+// Plan Final rank — the winning PLAN, judged by the same PLAN-lens council (by phaseTitle).
 const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-final/_pool.md`, RANK_SCHEMA, 'Final rank', 'final-rank')
 if (finalRank.__failed) {
   // P5: final-rank judge failed — same payload as P4 (no finalRank to render)
@@ -1100,6 +1810,22 @@ if (finalRank.__failed) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
   return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+}
+
+if (finalRank.no_consensus) {
+  // P5b (council): the final-rank council could not reach a >50% non-vetoed majority. Terminal — winner
+  // stays null (never synthesised). Persist the split; a grand loop reads winner:null / no_consensus:true
+  // and routes to needs-human + HALT (see SKILL Phase 7 / 7-FALLBACK).
+  log(`Final rank: council NO_CONSENSUS — ${finalRank.reasoning}`)
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, no_consensus: true }) },
+    { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+    { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict (NO CONSENSUS)') },
+    { path: `${runDir}/review-final/council.json`, content: json(finalRank.council) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
+  ], 'Final rank')
+  return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
 }
 
 // #7: resolve winnerRound against the VALID finalist set; omit the field if unresolved (no literal "undefined")
@@ -1115,10 +1841,38 @@ await persist([
   { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, carriedOverWinner }) },
   { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
   { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict') },
+  ...(finalRank.council ? [{ path: `${runDir}/review-final/council.json`, content: json(finalRank.council) }] : []),
   { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
   { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
   { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, contributions }) },
 ], 'Final rank')
+
+// ===== IMPLEMENT PHASE hook — only with args.implement. =====================================
+// Reached only on a RESOLVED winning plan: a plan-phase NO_CONSENSUS / __failed / no-valid-pool
+// already returned above, BEFORE any implement spend (the design's hard invariant). The winning
+// plan is bundled verbatim and drives Implement Round 3 (+ Round 4 only on a failed R3 gate).
+if (implement) {
+  const planWinner = blindF.find(c => c.blind === finalRank.winner) || champ
+  const seedPlanPath = `${runDir}/_winning-plan/plan.md`
+  await bundlePlan(planWinner.ws, seedPlanPath)
+  const impl = await implementPhase(seedPlanPath)
+  await persist([
+    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...impl }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, implement: true, round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
+  ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+  return {
+    mode, n: N, implement: true,
+    plan: {
+      round1: { mapping: r1mapping, review },
+      guidance: review.guidance,
+      final: { mapping: finalMapping, rank: finalRank, ...(winnerEntry ? { winnerRound: winnerEntry.round } : {}) },
+      winner: finalRank.winner,
+    },
+    implementPhase: impl,
+    contributions,
+  }
+}
+
 return {
   mode, n: N,
   round1: { mapping: r1mapping, review },
