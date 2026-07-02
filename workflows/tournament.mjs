@@ -341,11 +341,28 @@ function dispatchDropSummary(phaseTitle, drops, requested, survived) {
 const SAFE_MODEL_ID = /^[A-Za-z0-9.][A-Za-z0-9._-]*$/
 function validModelId(m) { return typeof m === 'string' && SAFE_MODEL_ID.test(m) }
 
+// Does this attempt's dispatch path actually interpolate a.model into a shell flag? Only then
+// must a.model exist and be safe. Per the documented ARGS shape, glm attempts carry NO `model`
+// at all (GLM_FLAG is keyed by displayModel), and codex/grok interpolate a.model only as the
+// `-m ${a.model}` FALLBACK when displayModel is not in their flag map — so requiring a valid
+// a.model unconditionally (the original audit-#5 guard) dropped every documented glm attempt at
+// dispatch (validModelId(undefined) === false), silently zeroing the glm field. local always
+// interpolates (`--model ${a.model}`); minimax never does (env-pinned); anthropic passes a.model
+// to agent() opts (no shell) but always has one, so it stays validated as cheap defense.
+function interpolatesModelId(a) {
+  switch (a.dispatch) {
+    case 'glm': return false
+    case 'minimax': return false
+    case 'codex': return !CODEX_FLAG[a.displayModel]
+    case 'grok': return !GROK_FLAG[a.displayModel]
+    default: return true // local (always --model ${a.model}) + native anthropic (agent opts)
+  }
+}
+
 function dispatch(a, ws, guidance, phaseTitle) {
   // Any dispatch path that interpolates a.model into a runner flag must see a safe id. Reject up
   // front (fail closed) so no malicious id can ever reach the shell as an unquoted flag token.
-  // (minimax pins its model via env and never interpolates a.model, so it is exempt.)
-  if (a.dispatch !== 'minimax' && !validModelId(a.model)) {
+  if (interpolatesModelId(a) && !validModelId(a.model)) {
     log(`attempt ${a.label} (${a.displayModel}) skipped: model id rejected — must match ${SAFE_MODEL_ID} (refusing to interpolate an unsafe id into a runner flag)`)
     return null
   }
