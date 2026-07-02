@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# OPT-IN convenience hook. Enable once with:  git config core.hooksPath .githooks
+# Regenerates the gitignored @@DE "Development Engine" dev channel after a pull/merge
+# so it tracks canonical. Fast (--no-test); CI + a manual `node bin/rebrand.mjs` do the
+# full self-verify. Never blocks the git operation (always exits 0).
+set -uo pipefail
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -f "$root/bin/rebrand.mjs" ] || exit 0
+command -v node >/dev/null 2>&1 || exit 0
+echo "[rebrand hook] regenerating .dev-engine/  (then: /plugin marketplace update development-engine && /plugin update development-engine)"
+node "$root/bin/rebrand.mjs" --no-test || echo "[rebrand hook] WARN: rebrand failed; .dev-engine may be stale (run 'node bin/rebrand.mjs' to see why)"
+exit 0

@@ -1,0 +1,37 @@
+name: rebrand check (@@DE dev channel)
+
+# PR validation gate (stage-2 heavy tier, Gitea). Regenerates the "@@DE Development Engine"
+# dev channel to a temp dir, runs its self-verify (the generated tree's own tests), and
+# asserts the working tree stays clean — so a broken/leaky rebrand fails the PR instead of
+# rotting silently. On PUSH the publish-dev-marketplace workflow already self-verifies before
+# shipping, so this runs on pull_request only to avoid a duplicate rebrand. Lives in .gitea/
+# so GitHub never runs it.
+on:
+  pull_request:
+
+jobs:
+  rebrand:
+    runs-on: ubuntu-latest          # the gitea-act-runner label
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Configure git identity (je-git.test.sh creates temp repos & commits)
+        run: |
+          git config --global user.name  "ci-rebrand"
+          git config --global user.email "ci-rebrand@git.1hut.com"
+          git config --global init.defaultBranch main
+      - name: Generate + self-verify the dev-channel rebrand
+        run: node bin/rebrand.mjs --out /tmp/de-check
+      - name: Assert canonical source is untouched (SHA-promotion safety)
+        run: |
+          set -euo pipefail
+          # The transform writes only to --out (/tmp), never into the repo. If the working
+          # tree is dirty, the rebrand leaked into source and would corrupt the GitHub PR.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::rebrand dirtied the working tree — it must write only to --out"
+            git status --porcelain
+            exit 1
+          fi
+          echo "canonical source clean ✓"
