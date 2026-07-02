@@ -728,6 +728,92 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
   ).catch(() => null)
 }
 
+// ---- begin: verdict integrity guard ----------------------------------------------------------
+// A real observed failure (EV-judge-placeholder.md): a structured-output judge returned literal
+// placeholder values for EVERY field ("test" as reasoning, "test" as every pros/cons entry) — schema-valid,
+// so reconcile()'s label-permutation repair happily accepted it and it drove a whole round: wrong winner,
+// meaningless round-2 guidance. This block is a PURE, deterministic, no-LLM-judges-the-judge guard against
+// that narrow shape, wired at EVERY judging choke-point so the exact bug cannot recur through any path:
+//   - reconcile()   — the legacy single-judge path (judges:1), both Phase 3 review and Phase 5 final rank.
+//   - askLens()     — every council lens verdict, round 1 AND every deliberation round (same call site).
+//   - councilTally()— the security veto's EVIDENCE substance (the highest-stakes exclusion path: a vacuous
+//                     but schema-valid UNSAFE flag can silently exclude the real winner).
+//   - synthesizeGuidance() and reconcile()'s guidance field — council and legacy guidance synthesis.
+// Thresholds are conservative and named so a future owner can retune them without hunting through the tally
+// logic: a real judge's shortest honest verdict clears them easily. Deliberately an AND of two independent
+// signals (thin reasoning AND near-duplicate pros/cons), not an OR — either alone is common in legitimate
+// output (a crisp one-line reasoning; two candidates that genuinely share one short con) and rejecting on
+// either alone would create a NEW false-halt failure mode (a wrongly-killed lens/judge can cascade into
+// NO_CONSENSUS, which is worse than letting one junk verdict through to be outvoted by its peers).
+const INTEGRITY = {
+  MIN_REASONING_CHARS: 8,       // "test" (4 chars) trips this; "Best overall pick." (19) clears it easily
+  MIN_ITEMS_FOR_DIVERSITY: 3,   // need >=3 pros/cons entries before "everything is identical" is meaningful
+  MAX_DISTINCT_RATIO: 0.34,     // <=1/3 distinct among >=3 entries => near-duplicate/placeholder shape
+  MIN_VETO_EVIDENCE_CHARS: 15,  // a standing high/critical veto needs real substance ("file + why")
+}
+const JUNK_TOKENS = new Set(['test', 'todo', 'tbd', 'tbc', 'wip', 'n/a', 'na', 'xxx', 'placeholder', 'foo', 'bar', 'asdf', 'lorem ipsum', '...', '-'])
+const trimStr = s => String(s == null ? '' : s).trim()
+
+// Returns a short reason string if `result` (the {candidates, ranking, ..., reasoning} shape shared by the
+// legacy judge and every council lens) looks like schema-valid junk, else null (pass).
+function verdictIntegrityIssue(result) {
+  if (!result || typeof result !== 'object') return null // callers already null-guard separately
+  const reasoning = trimStr(result.reasoning)
+  const reasoningThin = reasoning.length < INTEGRITY.MIN_REASONING_CHARS || JUNK_TOKENS.has(reasoning.toLowerCase())
+  const prose = []
+  for (const c of (result.candidates || [])) {
+    for (const p of (c.pros || [])) prose.push(trimStr(p))
+    for (const x of (c.cons || [])) prose.push(trimStr(x))
+  }
+  let degenerate = false, distinctN = 0
+  if (prose.length >= INTEGRITY.MIN_ITEMS_FOR_DIVERSITY) {
+    distinctN = new Set(prose.map(s => s.toLowerCase())).size
+    degenerate = (distinctN / prose.length) <= INTEGRITY.MAX_DISTINCT_RATIO
+  }
+  if (reasoningThin && degenerate) {
+    return `reasoning near-empty/placeholder (${JSON.stringify(reasoning.slice(0, 20))}) AND pros/cons collapse to ${distinctN} distinct value(s) across ${prose.length} entries — looks like schema-valid junk, not a real verdict`
+  }
+  return null
+}
+
+// checks_run is a REQUIRED array on every council lens verdict (the forced-evidence lever), but an EMPTY
+// array satisfies JSON-schema `required` (the key is merely present) while supplying zero evidence — close
+// that gap explicitly, in code, at the same choke-point. Pass undefined (legacy schema has no checks_run
+// field) to skip.
+function checksRunIssue(checksRun) {
+  if (checksRun === undefined) return null
+  if (!Array.isArray(checksRun) || checksRun.length === 0) return 'checks_run is empty — no evidence recorded for this vote (forced-evidence lever unmet)'
+  if (checksRun.every(c => trimStr(c).length < 4)) return 'every checks_run entry is empty/near-empty — no real evidence recorded'
+  return null
+}
+
+// Highest-stakes exclusion path: a security veto excludes a candidate regardless of votes, so a vacuous
+// but schema-valid UNSAFE evidence string must not stand. Conservative: only an empty, placeholder-token,
+// or near-empty string is rejected; any real sentence clears MIN_VETO_EVIDENCE_CHARS easily.
+function vetoEvidenceIssue(evidence) {
+  const e = trimStr(evidence)
+  if (!e) return 'veto evidence is empty'
+  if (JUNK_TOKENS.has(e.toLowerCase())) return `veto evidence is a placeholder token (${JSON.stringify(e)})`
+  if (e.length < INTEGRITY.MIN_VETO_EVIDENCE_CHARS) return `veto evidence too short (${e.length} chars) to substantiate a high/critical exclusion`
+  return null
+}
+
+// Guidance items ({text, conf, why}) get the same thin-content signal. Degenerate ONLY when EVERY item in
+// a non-empty list is thin — an empty list is legitimate (nothing salient to report this round), and one
+// weak item among several real ones is normal noise, not junk.
+function guidanceIntegrityIssue(g) {
+  if (!g || typeof g !== 'object') return null
+  const items = [...(Array.isArray(g.positives) ? g.positives : []), ...(Array.isArray(g.challenges) ? g.challenges : [])]
+  if (!items.length) return null
+  const thin = items.filter(it => {
+    const t = trimStr(it && it.text), w = trimStr(it && it.why)
+    return t.length < INTEGRITY.MIN_REASONING_CHARS || w.length < INTEGRITY.MIN_REASONING_CHARS || JUNK_TOKENS.has(t.toLowerCase())
+  })
+  if (thin.length === items.length) return `all ${items.length} guidance item(s) have near-empty/placeholder text or why — looks like schema-valid junk`
+  return null
+}
+// ---- end: verdict integrity guard ------------------------------------------------------------
+
 // #6 + #7: never silently carry the wrong artifact or trust an off-spec ranking — normalize the
 // judge's winner/ranking against the REAL candidate labels and repair to a full permutation.
 function reconcile(result, labels) {
@@ -735,6 +821,11 @@ function reconcile(result, labels) {
   // that as a clear, catchable error instead of a cryptic "null is not an object" — judge() retries once
   // then degrades to a clean __failed partial result rather than crashing the (fully-paid) run.
   if (!result || typeof result !== 'object') throw new Error('judge returned no structured result (null)')
+  // Integrity guard (EV-judge-placeholder.md): reject schema-valid junk (e.g. every field literally "test")
+  // BEFORE it is repaired into a plausible-looking shape — retried once by judge()'s existing loop, same
+  // path as the null-guard above, so a genuinely dead/junk judge still degrades to a clean __failed partial.
+  const integrityIssue = verdictIntegrityIssue(result) || (result.guidance ? guidanceIntegrityIssue(result.guidance) : null)
+  if (integrityIssue) throw new Error(`judge verdict failed integrity check: ${integrityIssue}`)
   const set = new Set(labels)
   const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
   let ranking = [...new Set((result.ranking || []).map(norm).filter(x => set.has(x)))]
@@ -869,6 +960,10 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
     try {
       const raw = await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label })
       if (!raw || typeof raw !== 'object') throw new Error('lens judge returned no structured result (null)')
+      // Integrity guard (same choke-point as reconcile(), see EV-judge-placeholder.md): covers BOTH round 1
+      // and every deliberation round, since askLens() is the single call site for all of them.
+      const integrityIssue = verdictIntegrityIssue(raw) || checksRunIssue(raw.checks_run)
+      if (integrityIssue) throw new Error(`council lens verdict failed integrity check: ${integrityIssue}`)
       return { lens: lens.key, ...reconcileLens(raw, labels) }
     } catch (e) {
       log(`council ${label} (${lens.key}) attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
@@ -918,8 +1013,14 @@ function councilTally(verdicts) {
   const vetoedSet = new Set()
   if (secV && Array.isArray(secV.safety)) {
     for (const s of secV.safety) {
-      if (s && s.safety === 'UNSAFE' && (s.severity === 'high' || s.severity === 'critical') && s.evidence && String(s.evidence).trim()) {
-        vetoedSet.add(s.label)
+      if (s && s.safety === 'UNSAFE' && (s.severity === 'high' || s.severity === 'critical')) {
+        // Highest-stakes exclusion path: don't let a vacuous-but-schema-valid evidence string stand as a
+        // veto (EV-judge-placeholder.md class of failure). A rejected veto does NOT kill the security
+        // lens's other votes/ranking — only this one flag is disregarded, so a real veto on another
+        // candidate, or the lens's first-place vote, are unaffected.
+        const evIssue = vetoEvidenceIssue(s.evidence)
+        if (evIssue) log(`council veto on Candidate ${s.label} REJECTED (not standing): ${evIssue} — a vacuous veto must not exclude a real candidate`)
+        else vetoedSet.add(s.label)
       }
     }
   }
@@ -1042,7 +1143,13 @@ Return only the two guidance lists (each item: text, conf, why).`
   for (let i = 1; i <= 2; i++) {
     try {
       const g = await agent(prompt, { model: 'opus', schema: GUIDANCE_SYNTH_SCHEMA, phase: phaseTitle, label })
-      if (g && typeof g === 'object' && Array.isArray(g.positives) && Array.isArray(g.challenges)) return g
+      if (g && typeof g === 'object' && Array.isArray(g.positives) && Array.isArray(g.challenges)) {
+        // Integrity guard (same choke-point family as reconcile()/askLens()): reject schema-valid junk
+        // guidance (e.g. every item literally {text:"a", why:"b"}) before it steers a fresh round-2.
+        const integrityIssue = guidanceIntegrityIssue(g)
+        if (integrityIssue) throw new Error(`guidance synthesis failed integrity check: ${integrityIssue}`)
+        return g
+      }
       throw new Error('guidance synthesis returned a malformed result')
     } catch (e) {
       log(`council guidance synthesis attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)

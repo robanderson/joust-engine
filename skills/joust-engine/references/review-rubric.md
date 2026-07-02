@@ -4,6 +4,8 @@ Instructions for the Opus judging at both decision points: the Phase 3 review (b
 
 Every judge — a lone judge or any council lens — applies the **shared scoring method** below. It is the constant that keeps scoring honest and comparable across attempts and rounds.
 
+**A code-level integrity guard runs on every verdict, in every path** (the legacy judge, every council lens in round 1 and every deliberation round, guidance synthesis, and the security veto's evidence). It is not a style opinion — it only catches the narrow, observed failure shape of **schema-valid junk**: a verdict whose `reasoning` is near-empty or a placeholder token (e.g. "test") *and* whose pros/cons collapse to one duplicated value across candidates. A verdict tripping it is retried once (same path as a dead/errored judge); still junk on retry, the judge/lens is dropped and the run proceeds without it (a council recomputes its majority over the living; the legacy path degrades to a clean failure). This never rejects a genuinely terse-but-real verdict — the guard requires *both* signals together, and any real sentence clears the thresholds easily. `checks_run` is checked the same way: an empty array is rejected even though it satisfies the schema, closing the gap where the forced-evidence lever could be met with zero real evidence. See `workflows/tournament.mjs` (`verdictIntegrityIssue` / `checksRunIssue` / `vetoEvidenceIssue` / `guidanceIntegrityIssue`) for the exact, named thresholds.
+
 ## Shared scoring method
 
 1. **Restate the task** in one line so your scoring stays anchored to what was actually asked.
@@ -32,7 +34,7 @@ Every verdict — round 1 and every deliberation round — must include **`check
 
 Vote with no visibility into your peers. Return: per-candidate pros/cons (through your lens), the full ranking, your first-place `vote`, `reasoning`, and `checks_run`.
 
-**Security lens additionally** returns a `safety` entry per candidate: `{label, safety: SAFE | UNSAFE, severity: high|critical (UNSAFE only), evidence: file + concrete why (UNSAFE only)}`. Flag `UNSAFE` only with **evidence you can point to** — a real vulnerability, an injected-execution path, a secret/credential exposure, or a supply-chain/build-config risk. A standing `UNSAFE` flag (high|critical, with evidence) **excludes that candidate from winning regardless of votes**, so do not flag on suspicion alone — but when you are unsure whether something is exploitable, flag it and cite why (fail-closed).
+**Security lens additionally** returns a `safety` entry per candidate: `{label, safety: SAFE | UNSAFE, severity: high|critical (UNSAFE only), evidence: file + concrete why (UNSAFE only)}`. Flag `UNSAFE` only with **evidence you can point to** — a real vulnerability, an injected-execution path, a secret/credential exposure, or a supply-chain/build-config risk. A standing `UNSAFE` flag (high|critical, with evidence) **excludes that candidate from winning regardless of votes**, so do not flag on suspicion alone — but when you are unsure whether something is exploitable, flag it and cite why (fail-closed). Because a veto can silently exclude the real winner, the tally code additionally requires the `evidence` string to be substantive (not empty, not a placeholder token, not a bare word or two) — a schema-valid-but-vacuous `evidence` string does **not** make the veto stand; write a real "file + why" every time.
 
 ### Deliberation — bounded, at most 3 rounds
 
