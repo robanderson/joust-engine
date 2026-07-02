@@ -1,8 +1,8 @@
 # Review and ranking rubric
 
-Instructions for the Opus passes: the Phase 3 reviewer (both modes) and the Phase 5 final ranker (two pass only). In each, you receive candidate solutions to one task, labelled Candidate A, B, C, and so on. You do not know which model produced which, and should not speculate; judge the work in front of you.
+Instructions for the Opus judging at both decision points: the Phase 3 review (both modes) and the Phase 5 final rank (two pass only). Judging is a **5-lens deliberating council** (the default) or, with `judges: 1`, a **single blind Opus judge** (legacy). In every case you receive candidate solutions to one task, labelled Candidate A, B, C, and so on. You do not know which model produced which, and should not speculate; judge the work in front of you.
 
-**Mode note for the Phase 3 reviewer.** In **single pass**, do only Job 1 below (judge, rank, name the winner) — that winner is the final result, so skip Job 2. In **two pass**, do both Job 1 and Job 2 (distil guidance for round two).
+Every judge — a lone judge or any council lens — applies the **shared scoring method** below. It is the constant that keeps scoring honest and comparable across attempts and rounds.
 
 ## Shared scoring method
 
@@ -12,13 +12,49 @@ Instructions for the Opus passes: the Phase 3 reviewer (both modes) and the Phas
 4. **Cite specifics.** "Candidate B crashes on a repeated guess because it does not dedupe input" beats "Candidate B is buggy." Point to the line or behaviour.
 5. **Score against the task's stated runtime — never an environment you cannot see.** Judge each candidate against the constraints and capabilities the task actually establishes, not what *looks* idiomatic. Treat reliance on a capability the task did **not** establish is available as a *risk*, not a strength; and treat an unfamiliar mechanism that honours the stated constraints as *correct*, not a violation, unless you can point to a concrete way it fails. Do not penalise a candidate merely for being unusual, nor reward another merely for using a familiar-looking API. (Concretely, for tasks about this engine's own dynamic-workflow scripts: those scripts run in a sandbox with **no** `node:fs`, `require`, `import()`, or `process` — `Date.now()`/`Math.random()` throw — so the *only* way such a script writes files is via a cheap helper agent running a shell command. A plan that writes through that agent is honouring the real constraint; a plan that calls `node:fs` directly would not run.)
 
-## Phase 3: reviewer
+## The council (default)
 
-In single pass you do Job 1 only. In two pass you do both jobs.
+Five blind Opus judges, **one lens each**. Each lens owns a slice of the judgement; together they cover the whole. You are handed exactly one lens — judge through it, trust the other four to cover the rest, and still apply the shared scoring method above.
 
-### Job 1: judge and pick a winner (both modes)
+| Lens | You own | Special |
+|---|---|---|
+| **correctness** | does it actually work — run or trace the code; cite the enrichment (verify/build/lint) exit codes when present | you are the evidence judge |
+| **spec** | compliance & completeness — is *everything* asked done, and are the stated constraints honoured | you catch "works but solved the wrong task" |
+| **security** | vulnerabilities, injected execution, secret/credential exposure, supply-chain & build-config risk | you hold the **veto** |
+| **robustness** | edge cases, failure modes, boundaries, error handling | probe what breaks it |
+| **craft** | readability, structure, maintainability, efficiency | judge whether someone else could own it in a year |
 
-Produce:
+Every verdict — round 1 and every deliberation round — must include **`checks_run`**: the commands you ran / files you read, each with its key result. This is a forced-evidence lever; never leave it empty. Cast a single first-place **`vote`** (one candidate letter) and give a full **`ranking`**.
+
+**You never tally.** Do NOT count votes, average rankings, "reach consensus", or name an overall council winner. The winner is computed **deterministically in code** from all five votes plus the veto. Your only job is to cast the most honest vote your lens supports and to argue it well.
+
+### Round 1 — independent
+
+Vote with no visibility into your peers. Return: per-candidate pros/cons (through your lens), the full ranking, your first-place `vote`, `reasoning`, and `checks_run`.
+
+**Security lens additionally** returns a `safety` entry per candidate: `{label, safety: SAFE | UNSAFE, severity: high|critical (UNSAFE only), evidence: file + concrete why (UNSAFE only)}`. Flag `UNSAFE` only with **evidence you can point to** — a real vulnerability, an injected-execution path, a secret/credential exposure, or a supply-chain/build-config risk. A standing `UNSAFE` flag (high|critical, with evidence) **excludes that candidate from winning regardless of votes**, so do not flag on suspicion alone — but when you are unsure whether something is exploitable, flag it and cite why (fail-closed).
+
+### Deliberation — bounded, at most 3 rounds
+
+The deterministic tally runs after every round. If no candidate has a **>50% majority** of the living judges' first-place votes on a **non-vetoed** candidate, a deliberation round runs. In it:
+
+- You see **all peers' latest full verdicts** (verbatim JSON, blind — letters only).
+- Address the disagreements in **`response_to_peers`**: convince your peers or be convinced. Converge on the *correct* call — do not hold a position out of stubbornness, and do not cave to a majority you believe is wrong. Set `changed_this_round` / `changed_from_round1` truthfully.
+- You **may run 1-2 targeted checks** to settle a factual dispute (record them in `checks_run`).
+- **Veto rebuttal:** a peer may rebut a security veto with evidence. If it genuinely refutes the flag, the security judge **withdraws** it (drops the `UNSAFE` entry); a flag still believed **stands** and keeps excluding the candidate at the final tally.
+
+After **3** deliberation rounds still split (no majority, or the only would-be winner is vetoed, or *every* candidate is vetoed) → **NO_CONSENSUS**. This is never silently resolved by Borda, averaging, or a meta-judge: the run surfaces the full split (interactive) or routes the loop to needs-human + HALT (grand loop).
+
+### Tally & veto rules (deterministic, run in code — described here for context only)
+
+- **Majority** = strictly **>50%** of the *living* judges' first-place votes (3 of 5 when all alive; recomputed against the living count if a judge dies).
+- **Veto filter:** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from the security judge cannot win, whatever its vote count.
+- Majority on a non-vetoed candidate → that candidate wins. All candidates vetoed, or still no majority after 3 deliberation rounds → NO_CONSENSUS.
+- The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override; the winner slot is only ever filled by a majority non-vetoed winner.
+
+## Single blind judge (`judges: 1`, legacy)
+
+With `judges: 1` there is one blind Opus judge that does the whole job itself — judge, rank, name the winner (and in two pass, distil guidance). Produce the report shape below directly. This is the pre-council behaviour, kept for parity and cheap runs.
 
 ```
 # Review                 (single pass)  /  # Round 1 review  (two pass)
@@ -41,11 +77,11 @@ Cons:
 Candidate <X>. <Two or three sentences of reasoning, including the deciding factor.>
 ```
 
-In single pass, stop here — this winner is the final result.
+## Guidance for round two (two pass only)
 
-### Job 2 (two pass only): distil guidance for round two
+In two pass, guidance for the next round is distilled by a **separate synthesis step** (in council mode a dedicated synthesiser reads the five final verdicts; with `judges: 1` the lone judge does it as a second job). The synthesiser is **not a decision-maker**: it never picks a winner, ranks candidates, or merges votes — it only distils fallible priors. The rules are unchanged from the single-judge era:
 
-Read across **all** candidates, winners and losers alike, and produce two short lists that will steer the next round. Phrase them generically as patterns and principles. Do **not** quote or paraphrase any candidate's specific code; round two must be guided, not seeded.
+Read across **all** candidates, winners and losers alike, and produce two short lists that steer the next round. Phrase them generically as patterns and principles. Do **not** quote or paraphrase any candidate's specific code; round two must be guided, not seeded.
 
 ```
 ## Guidance for round 2
@@ -74,32 +110,10 @@ Challenges to avoid (at most 5):
 ...
 ```
 
-Keep each list to **at most five** corroborated, sharp items — fewer is better than a long list, which over-anchors the next round. A positive describes a principle ("validate and normalise user input before using it"), never an implementation lift ("copy Candidate C's input loop") — if an item only makes sense as one exact piece of code, it is too specific to be guidance; drop it. A challenge names a concrete, generic failure mode ("do not let a repeated guess decrement the remaining lives"). Remember the next round's attempts are independent and differently-minded: your job is to **raise the floor** (steer them off real pitfalls, surface genuinely good ideas), not to make them all converge on one blessed approach — so reserve `strong` for what truly earned it.
+Keep each list to **at most five** corroborated, sharp items — fewer is better than a long list, which over-anchors the next round. A positive describes a principle ("validate and normalise user input before using it"), never an implementation lift ("copy Candidate C's input loop") — if an item only makes sense as one exact piece of code, it is too specific to be guidance; drop it. A challenge names a concrete, generic failure mode ("do not let a repeated guess decrement the remaining lives"). Remember the next round's attempts are independent and differently-minded: the job is to **raise the floor** (steer them off real pitfalls, surface genuinely good ideas), not to make them all converge on one blessed approach — so reserve `strong` for what truly earned it.
 
-## Phase 5: final ranker (two pass only)
+## Phase 5: final rank (two pass only)
 
-You receive the final pool: N fresh round two attempts plus one carried-over winner from round one, all blind-labelled together. Rank them on the merits using the shared scoring method. Do not try to guess which one is the carryover; it competes like any other.
+The final pool is N fresh round-two attempts plus one carried-over winner from round one, all blind-labelled together. The council (or the lone judge) ranks them on the merits using the shared scoring method, with the **same tally, veto, deliberation, and NO_CONSENSUS rules** as Phase 3. Do not try to guess which one is the carryover; it competes like any other. A carried-over champion competes blind on the merits — it produced no worse work for not having seen the guidance, and a genuinely better guided round-two attempt should win.
 
-```
-# Final ranking
-
-Task: <one line restatement>
-
-## Candidate A
-Pros:
-- ...
-Cons:
-- ...
-
-(... one block per candidate ...)
-
-## Ranking
-1. Candidate <X>
-2. Candidate <Y>
-...
-
-## Overall winner
-Candidate <X>. <Two or three sentences of reasoning, including the deciding factor over the runner-up.>
-```
-
-Be fair and specific in every pass. The point of Joust Engine is an honest comparison; in two pass the second round's guidance has a real chance to improve on the first, and in either mode a cheaper-looking solution that is actually better should win on the merits.
+Be fair and specific in every pass. The point of Joust Engine is an honest comparison; in two pass the second round's guidance has a real chance to improve on the first, and in either mode a cheaper-looking solution that is actually better should win on the merits. The council does not exist to manufacture agreement — an honest NO_CONSENSUS that reaches a human beats a rubber-stamped winner.

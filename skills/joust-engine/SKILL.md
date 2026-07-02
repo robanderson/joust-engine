@@ -186,9 +186,10 @@ Before spending tokens, show the plan and get a go-ahead:
 
 - The task, quoted exactly.
 - N, the model per attempt, and **which mode** this is (single pass: one round then a final review; two pass: round one, then a guided round two, then a final rank).
-- A cost note scaled to the mode:
-  - **Single pass:** roughly N independent attempts plus one Opus review.
-  - **Two pass:** roughly 2N independent attempts plus two Opus passes (the round one review and the final rank), so token use is about double single pass. Recommend a small N on the first run to gauge usage.
+- A cost note scaled to the mode. **Each judging point is a 5-lens Opus council** (five judges vote independently, then up to 3 bounded deliberation rounds if they don't reach a >50% majority), so a "judging point" is ~5–20 Opus calls, not one:
+  - **Single pass:** roughly N independent attempts plus one Opus **council** review (5 judges × 1–4 rounds).
+  - **Two pass:** roughly 2N independent attempts plus two Opus **councils** (the round-one review and the final rank) plus one small guidance-synthesis call, so judging cost is materially higher than the pre-council single judge. Recommend a small N on the first run to gauge usage.
+  - **Legacy single judge:** pass `judges: 1` in the workflow args to fall back to one blind Opus judge per point (the pre-council cost) — the council is the default.
 - **The task size and its limit profile** (from Phase 1c): the chosen `short`/`medium`/`long`, whether it came from a manual override or your estimate, and the resulting per-attempt caps. The user can correct the size here before any tokens are spent.
 
 On confirmation, dispatch the whole tournament. **Two dispatch backends exist — prefer dynamic workflows:**
@@ -206,18 +207,25 @@ Apply a fresh diversity draw for each round (Phase 1b). The essential rules hold
 
 If many concurrent requests hit provider rate ceilings, run in smaller parallel batches rather than all at once. (Mixed Anthropic+GLM rounds spread load across two providers, which helps.)
 
-## Phase 3: Blind Opus review
+## Phase 3: Blind Opus council review
 
-Spin up one **review agent on Opus**. Hand it every first-round work product, labelled Candidate A, B, C, and so on, **without revealing which model produced which**. Following `references/review-rubric.md`, it scores each candidate, lists concrete pros and cons, ranks them, and names the winner with reasoning.
+The workflow judges the first round with a **5-lens deliberating Opus council** (the default) — five blind Opus judges, one lens each (**correctness, spec, security, robustness, craft**), following `references/review-rubric.md`. Every judge is blind (candidate letters only, never model identities). The engine does all of this for you inside `workflows/tournament.mjs`; the summary here is so you can explain it and read the result:
+
+1. **Round 1 — independent.** Five parallel verdicts, no peer visibility: per-candidate pros/cons through each lens, a full ranking, a first-place vote, `checks_run` evidence, and (security lens) per-candidate `safety` flags.
+2. **Deterministic tally in code** (never an LLM): a **>50% majority** of the living judges' first-place votes on a candidate the security lens has **not** vetoed wins.
+3. **Bounded deliberation** (max 3 rounds): if there's no majority, judges see each other's verbatim verdicts, may run 1–2 checks, and revise until a majority forms or the rounds run out.
+4. **NO_CONSENSUS** if still split (or every candidate is vetoed): the run does **not** invent a winner. The workflow returns `no_consensus: true` with `winner: null`; surface the full split to the user (per-judge verdicts + vote evolution, persisted in `review-1/council.json` and `verdict.md`). In a grand loop this routes the loop to needs-human + HALT (Phase 7).
 
 **Then the modes diverge:**
 
-- **Single pass:** Phase 3's named winner **is the result**. Skip Phases 4 and 5 and go straight to Phase 6 to report. (You do not need the round-two guidance lists; the reviewer can omit them in single-pass mode.)
-- **Two pass:** the reviewer does the **second job** as well — distil guidance for round two. Across all candidates (not just the winner), produce two short lists phrased generically, with no candidate-specific code:
+- **Single pass:** the council's majority winner **is the result**. Skip Phases 4 and 5 and go straight to Phase 6 to report. (No round-two guidance is produced in single pass.)
+- **Two pass:** a **separate synthesis step** (explicitly *not* a decision-maker — it never picks a winner or merges votes) distils guidance for round two from the five final verdicts, across all candidates, phrased generically with no candidate-specific code:
   - **Positives to consider:** patterns and choices that worked well anywhere in round one.
   - **Challenges to avoid:** pitfalls, bugs, and weaknesses seen anywhere in round one.
 
-  Then **save** the round one winner's work product (the carried-over champion for the final pool) and **discard** the other round one artifacts, keeping only the distilled guidance — not the losing code. Continue to Phase 4.
+  The engine then **saves** the council-winning round-one work product (the carried-over champion for the final pool) and **discards** the other round-one artifacts, keeping only the distilled guidance — not the losing code. Continue to Phase 4.
+
+**Legacy single judge.** Passing `judges: 1` in the workflow args restores the pre-council behaviour — one blind Opus judge does the whole job (judge, rank, name the winner, and in two pass distil guidance). Council size is otherwise fixed at 5.
 
 ## Phase 4 (two pass only): Run round 2 with the guidance
 
@@ -229,7 +237,7 @@ Do **not** give round two agents any prior code or the winner's artifact. They g
 
 ## Phase 5 (two pass only): Final ranking
 
-Build the final pool: the **N fresh round two attempts plus the saved round one winner** (N + 1 candidates). Re-label the whole pool blind (Candidate A, B, C, ...) in a fixed order, keep a private mapping for the report, and spin up one **Opus ranker**. It scores every candidate against the same rubric (`references/review-rubric.md`), lists pros and cons for each, ranks them, and names the overall winner. The carried-over champion competes blind on the merits like everything else: it produced no worse work for not having seen the guidance, and if a guided round two attempt is genuinely better, it should win.
+Build the final pool: the **N fresh round two attempts plus the saved round one winner** (N + 1 candidates), re-labelled blind. The **same 5-lens Opus council** ranks it, with the **same tally, veto, deliberation, and NO_CONSENSUS rules** as Phase 3 (`references/review-rubric.md`): five blind judges, code-tallied >50% majority, security veto, up to 3 deliberation rounds, and a NO_CONSENSUS halt if unresolved (`review-final/council.json`). The carried-over champion competes blind on the merits like everything else: it produced no worse work for not having seen the guidance, and if a guided round-two attempt is genuinely better, it should win. (`judges: 1` uses a single blind Opus ranker instead.)
 
 ## Phase 6: Report back (both modes)
 
@@ -264,6 +272,8 @@ that the audit ran; the driver owns this sequencing invariant.
 2. **Idempotency / DONE marker.** `bash <plugin-root>/bin/je-git.sh done_marker "<runDir>" <k>` — rc 0 means this loop already completed (its PR exists); **skip it**. Also run `bash <plugin-root>/bin/je-git.sh je_detect_orphan_branch <k>`: if it prints an `JE-<k>-*` branch but the DONE marker is absent, a prior run died mid-loop — **STOP and tell the human to inspect/delete that branch** (detect-and-stop; never auto-resume a half-applied implementer step).
 3. **Branch off base (FAN).** `BR=$(bash <plugin-root>/bin/je-git.sh je_branch <k>)` then `git switch "<base>" && git switch -c "$BR"`. (STACK variant: branch off loop k-1's branch instead.) The `JE-` name is used as-is and OVERRIDES any configured branch-prefix rule for loop branches only.
 4. **Run the tournament (UNCHANGED engine) via the Workflow tool.** Invoke `workflows/tournament.mjs` exactly as in Phase 2, with `runDir: "<runDir>/loop-<k>"` and the task **augmented with the cross-loop ledger** (see below). It returns the structured mapping/ranking; **pick the winning candidate's deliverable path** (its proposal artifact) from `final.mapping`/`round1.mapping`. The proposal must be a concrete, file-level change description (Phase 2 already briefs attempts to produce that).
+
+   **Council NO_CONSENSUS → needs-human + HALT (fail-closed).** The judging council may return **NO_CONSENSUS** — the workflow result has `no_consensus: true` (and the relevant `winner`/`winner1` is `null` in `mapping.json`). This is NOT a winner you may implement: there is none, and the design forbids ever synthesising or auto-picking one. When the tournament for loop `k` returns `no_consensus`, do **NOT** proceed to steps 5–9. Instead open a draft `needs-human` PR that surfaces the split (compose the body from `loop-<k>/review-*/council.json` — per-judge final verdicts + vote evolution + any veto events — via `open_pr_needs_human`), then **HALT the whole chain** (the same fail-closed HALT contract as a verify failure; STACK always halts). Never merge, never fall through to a lower-ranked candidate here — an unresolved council is exactly the case a human must adjudicate.
 5. **Implement the winner via the Task tool.** Spawn `Task` with agent `joust-engine:joust-implementer` (model Opus), cwd = `repoRoot`, passing `{ proposal: <winnerProposalPath>, repoRoot: <base repo root>, branch: "$BR", base: "<base>" }`. It makes the smallest coherent change on `$BR`, leaves changes **UNSTAGED**, and returns a 3-6 line summary (its `JE-NOTES.md` captures any ambiguity). Keep that summary as `WINNER_SUMMARY`.
 
    **Repo-anchored mode (P2 adoption — replaces the implementer hop).** When the tournament ran in repo-anchored mode (`repoMode:true`), the winning attempt's worktree branch `jewt/<runId>/<round>/<winnerLabel>` **already contains the exact, P3-gated commit** — that commit IS the implementation. Do **NOT** spawn the `joust-implementer`, and do **NOT** re-derive code from a text proposal: there is none, and re-deriving would lose the "validated ref == merged ref" property. Instead, after `7-FALLBACK` has selected the adopted candidate `<winnerLabel>`, adopt its branch directly:
@@ -341,20 +351,20 @@ already in good shape, say so explicitly rather than inventing a marginal change
 | Phase 1b | diversity injection (default on) | diversity injection (default on) |
 | Phase 1c | size limits: override (`short`/`medium`/`long`) else estimate | same |
 | Phase 2 | confirm + run N attempts | confirm + run N attempts |
-| Phase 3 | blind Opus review → rank → winner = result | blind Opus review → rank + distil guidance; save winner, discard rest |
+| Phase 3 | blind 5-lens Opus council → code-tallied >50% majority → winner = result | same council → majority winner + separate guidance synthesis; save winner, discard rest |
 | Phase 4 | — | N fresh attempts given task + guidance, no prior code |
-| Phase 5 | — | final pool = N round-2 + 1 saved winner; blind Opus rank |
+| Phase 5 | — | final pool = N round-2 + 1 saved winner; same blind Opus council ranks |
 | Phase 6 | report | report (+ guidance used, winner's round) |
 | Phase 7 | — (Z=1: not used) | grand-loop driver (Z>=2): preflight → authorize (re-type Z) → per loop: STOP-check → branch off base → tournament → implement → verify → commit/push → PR → ledger; finally switch back to base |
 
 - Trigger: sigil `@@JE[:N][:M[:Z]]` (e.g. `@@JE:5`, `@@JE:7:2`, bare `@@JE`) or prose `joust:N[:M[:Z]]`. N optional — inferable from a prose model spec (`2 opus, 2 glm 5.2, 1 codex high` → N=5, `[opus,opus,glm-5.2,glm-5.2,codex-high]`) or the Top Mixed preset (`top mixed` + N → even split over opus/glm-5.2/codex-high). M = passes (omit/1 single, 2 two). Z = grand loops (Z=1/omitted = today's isolated tournament; Z>=2 = unattended chain — per loop: tournament → implement winner on a new JE-<loop>-<random7> branch (Opus implementer) → fail-closed verify → one PR (draft+needs-human on failure, then HALT), never auto-merged; Z capped at Z_MAX=5, Z>5 refused). JE- branch naming is used as-is and OVERRIDES any configured branch-prefix rule for loop branches only. All git/gh lives in bin/je-git.sh; tournament.mjs is unchanged; there is no nested workflow. Bare `@@JE` → interactive gate. Case-insensitive, optional spaces; text before the marker is the task. Phase 0 runs `bin/je-parse.mjs` for all of this.
 - Dispatch: prefer the bundled `Workflow` script `workflows/tournament.mjs` (live in `/workflows`); Anthropic attempts native, GLM/Local/Codex/MiniMax/Grok attempts via the `joust-glm-*` / `joust-local` / `joust-codex` / `joust-minimax` / `joust-grok` wrapper agents. Fallback: Task tool + `glm` CLI. See `references/orchestration.md`.
 - N is per round, an integer of 2 or more. Confirm volume at N ≥ 8 (single pass) or N ≥ 6 (two pass).
-- Phase 1 model question: ten options (Top Mixed, Specify Mix, Opus, Sonnet, Haiku, GLM→submenu, Local→live submenu, Codex→effort submenu, MiniMax, Grok→variant submenu); a Phase-0 prose spec or Top Mixed keyword answers it and the menu is skipped; N defaults 6, passes default 2. GLM drills down to one of glm-5.2/glm-5.1/glm-4.7/glm-4.5-air; Local lists `omlx-models` live (dynamic); Codex is gpt-5.5 with a reasoning-effort submenu (codex-low/medium/high/xhigh); Grok drills down to grok-build/grok-composer-2.5-fast; Specify Mix loops per attempt over Anthropic + GLM + local + codex + minimax-m3 + grok ids; in two pass the assignment applies to both rounds. Anthropic attempts dispatch via the Task tool, GLM via the `glm`→z.ai runner, Local via the `omlx`→on-device runner, Codex via the `codex exec` runner, MiniMax via the `bin/minimax-run.sh` runner, Grok via the `grok`→xAI runner. Reviewer/ranker are always Anthropic Opus.
+- Phase 1 model question: ten options (Top Mixed, Specify Mix, Opus, Sonnet, Haiku, GLM→submenu, Local→live submenu, Codex→effort submenu, MiniMax, Grok→variant submenu); a Phase-0 prose spec or Top Mixed keyword answers it and the menu is skipped; N defaults 6, passes default 2. GLM drills down to one of glm-5.2/glm-5.1/glm-4.7/glm-4.5-air; Local lists `omlx-models` live (dynamic); Codex is gpt-5.5 with a reasoning-effort submenu (codex-low/medium/high/xhigh); Grok drills down to grok-build/grok-composer-2.5-fast; Specify Mix loops per attempt over Anthropic + GLM + local + codex + minimax-m3 + grok ids; in two pass the assignment applies to both rounds. Anthropic attempts dispatch via the Task tool, GLM via the `glm`→z.ai runner, Local via the `omlx`→on-device runner, Codex via the `codex exec` runner, MiniMax via the `bin/minimax-run.sh` runner, Grok via the `grok`→xAI runner. Reviewer/ranker are always Anthropic Opus (a 5-lens council by default; `judges: 1` = single blind Opus judge).
 - Diversity injection (default on): each attempt draws a distinct framing so siblings do not converge. Pool A approach nudges by default (blind-safe); Pool B objective lenses opt-in. Without replacement, seeded, logged. See `references/diversity-injection.md`.
 - Dynamic limits (Phase 1c): per-attempt turn caps + wall-clock timeouts scale to task size (`short`/`medium`/`long`). The parser's `size` field is a manual override (marker-adjacent `@@JE:5 long`); otherwise the orchestrator estimates. Resolve the numbers with `bin/je-parse.mjs --size <label>` (one source of truth: `SIZE_PROFILES`) and pass them into the Phase 2 workflow args (`attemptMaxTurns`, `localMaxTurns`, `minimaxMaxTurns`, `grokMaxTurns`, `attemptTimeoutSecs`, `glmTimeoutSecs`, `codexTimeoutSecs`, `grokTimeoutSecs`). They flow to the runners as `JE_MAX_TURNS`/`JE_TIMEOUT_SECS`; native Anthropic attempts are uncapped.
 - Round attempts: N parallel, isolated, identical brief plus one diversity modifier, no cross-talk.
-- Review/rank (Opus, blind): pros and cons per candidate, rank, name winner. In two pass also distil positives-to-consider and challenges-to-avoid, save the winner, discard the other artifacts.
+- Review/rank (Opus, blind) is a **5-lens deliberating council** by default: five judges (correctness, spec, security, robustness, craft) vote independently, a **>50% majority** is tallied in **code** (never an LLM), the **security lens can veto** with evidence, up to **3** bounded deliberation rounds, and an unresolved split → **NO_CONSENSUS** (surface interactively / grand-loop needs-human + HALT; never a synthesised winner). Two-pass guidance is a separate synthesis step (not a decision-maker). Per-judge verdicts, per-round tally, and veto events are persisted (`review-*/council.json`, `verdict.md`, summaries). `judges: 1` = the legacy single blind Opus judge (byte-for-byte prior behaviour); council size is otherwise fixed at 5.
 - Dispatch mechanics and the round two brief template: `references/orchestration.md`.
 - Scoring and distillation rubric: `references/review-rubric.md`.
 - Grand loops (Z>=2): Phase 0b front-loads ONE autonomy authorization (re-type Z) covering all loops; a `<runDir>/STOP` file is the between-loops kill switch; FAN topology (independent PRs off base) + a cross-loop ledger by default, STACK opt-in (forces halt-on-failure); fail-closed auto-detected verify; per-loop DONE markers for idempotency; non-implementable tasks are offered Z=1 instead. See Phase 7 and `references/orchestration.md`.
