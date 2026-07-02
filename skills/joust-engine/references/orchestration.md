@@ -13,7 +13,7 @@ The Phase 1 selection maps to these. There are two families with two different d
 | Choice  | Alias    | API model string     | Role                        |
 |---------|----------|----------------------|-----------------------------|
 | Opus    | `opus`   | `claude-opus-4-8`    | attempt, review, or rank    |
-| Sonnet  | `sonnet` | `claude-sonnet-4-6`  | attempt                     |
+| Sonnet  | `sonnet` | `claude-sonnet-5`    | attempt                     |
 | Haiku   | `haiku`  | `claude-haiku-4-5`   | attempt                     |
 
 **GLM models (z.ai)** — dispatched by shelling out to the `glm` CLI (see "Dispatching GLM attempts" below). `glm` is the `claude` CLI pointed at z.ai's Anthropic-compatible endpoint; it is selected through `glm`'s `--model` flag, which is **not** the same as a GLM model name. Use this exact mapping:
@@ -121,7 +121,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 ```
 
 - When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
-- **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 codex-high, 1 glm-5.2` (M=5). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
+- **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
 - **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`). The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`).
 
 **Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `joust-engine:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):

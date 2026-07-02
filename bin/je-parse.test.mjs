@@ -560,10 +560,10 @@ parseCase('P/I default plan-only', 'do abc @@JE:5',
 // --- marker-adjacent 'implement' keyword enables the implement rounds ---
 parseCase('P/I implement keyword after marker', 'refactor the auth module @@JE:5 implement',
   { task: 'refactor the auth module', n: 5, implement: true,
-    implementAssignment: ['opus', 'opus', 'codex-high', 'codex-high', 'glm-5.2'] }, { noErrors: true });
+    implementAssignment: IMPLEMENT_DEFAULT_POOL }, { noErrors: true });
 parseCase('P/I implement keyword after marker + comma + task', '@@JE implement, add a retry helper',
   { task: 'add a retry helper', implement: true, needsGate: true,
-    implementAssignment: ['opus', 'opus', 'codex-high', 'codex-high', 'glm-5.2'] }, { noErrors: true });
+    implementAssignment: IMPLEMENT_DEFAULT_POOL }, { noErrors: true });
 parseCase('P/I implement keyword before marker', 'optimise the loop implement @@JE:4',
   { task: 'optimise the loop', n: 4, implement: true }, { noErrors: true });
 
@@ -633,7 +633,10 @@ unit('extractPhaseSpecs implement-only', (() => {
 })());
 unit('extractPhaseSpecs none -> null', extractPhaseSpecs('build a parser') === null);
 unit('PLAN_DEFAULT_POOL sums to 10', PLAN_DEFAULT_POOL.length === 10);
-unit('IMPLEMENT_DEFAULT_POOL sums to 5', IMPLEMENT_DEFAULT_POOL.length === 5);
+unit('IMPLEMENT_DEFAULT_POOL sums to 6', IMPLEMENT_DEFAULT_POOL.length === 6);
+unit('IMPLEMENT_DEFAULT_POOL has >=2 opus and >=2 sonnet',
+  IMPLEMENT_DEFAULT_POOL.filter(m => m === 'opus').length >= 2 &&
+  IMPLEMENT_DEFAULT_POOL.filter(m => m === 'sonnet').length >= 2);
 
 // ===========================================================================
 // report.
