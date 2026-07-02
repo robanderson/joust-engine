@@ -109,6 +109,21 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 }
 ```
 
+**Plan/Implement args (2026-07-03 round split).** The tournament is a **Plan phase** (Plan Round 1 + Plan Round 2, always — plans are cheap to produce/judge) plus an optional **Implement phase** (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate). `attempts` seat the plan rounds; two extra args seat the implement rounds:
+
+```
+  implement: true,                        // optional (default false). Enables Implement Round 3 (+ 4).
+                                          // The parser sets it from the `implement` keyword or a
+                                          // non-empty `Implement:` phase spec.
+  implementAttempts: [ ... ],             // optional: the implement-phase pool (SAME per-attempt shape
+                                          // as `attempts`; a small strong pool). Defaults to `attempts`
+                                          // when omitted. From je-parse's `implementAssignment`.
+```
+
+- When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
+- **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 codex-high, 1 glm-5.2` (M=5). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
+- **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`). The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`).
+
 **Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `joust-engine:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):
 
 | GLM model | agentType |

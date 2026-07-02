@@ -11,7 +11,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { parse, normaliseModel, topMixedAssignment, expandSpec, sizeProfile, SIZE_PROFILES, Z_MAX, N_MAX } from './je-parse.mjs';
+import { parse, normaliseModel, topMixedAssignment, expandSpec, extractPhaseSpecs, sizeProfile, SIZE_PROFILES, PLAN_DEFAULT_POOL, IMPLEMENT_DEFAULT_POOL, Z_MAX, N_MAX } from './je-parse.mjs';
 
 const JE_PARSE_CLI = fileURLToPath(new URL('./je-parse.mjs', import.meta.url));
 
@@ -543,6 +543,97 @@ unit('SIZE_PROFILES monotonic short<=medium<=long', (() => {
   const bad = spawnSync(process.execPath, [JE_PARSE_CLI, '--size', 'huge'], { encoding: 'utf8' });
   unit('CLI --size huge exit 1', bad.status === 1);
 }
+
+// ===========================================================================
+// PLAN/IMPLEMENT ROUND SPLIT — phase-scoped specs + implement flag. NEW.
+// ===========================================================================
+
+// --- default: no implement signal -> implement false, implementAssignment null ---
+parseCase('P/I default plan-only', 'do abc @@JE:5',
+  { n: 5, implement: false, implementAssignment: null }, { noErrors: true });
+// planAssignment mirrors assignment (null here — explicit N, no spec).
+{
+  const r = parse('do abc @@JE:5');
+  unit('P/I plan-only planAssignment mirrors assignment', r.planAssignment === null && r.assignment === null);
+}
+
+// --- marker-adjacent 'implement' keyword enables the implement rounds ---
+parseCase('P/I implement keyword after marker', 'refactor the auth module @@JE:5 implement',
+  { task: 'refactor the auth module', n: 5, implement: true,
+    implementAssignment: ['opus', 'opus', 'codex-high', 'codex-high', 'glm-5.2'] }, { noErrors: true });
+parseCase('P/I implement keyword after marker + comma + task', '@@JE implement, add a retry helper',
+  { task: 'add a retry helper', implement: true, needsGate: true,
+    implementAssignment: ['opus', 'opus', 'codex-high', 'codex-high', 'glm-5.2'] }, { noErrors: true });
+parseCase('P/I implement keyword before marker', 'optimise the loop implement @@JE:4',
+  { task: 'optimise the loop', n: 4, implement: true }, { noErrors: true });
+
+// --- false-positive guard: 'implement' in the task body is NOT the directive ---
+parseCase('P/I "implement a parser" body untouched', '@@JE:3 implement a CSV parser',
+  { task: 'implement a CSV parser', n: 3, implement: false, implementAssignment: null }, { noErrors: true });
+parseCase('P/I mid-task "implement" untouched', 'we need to implement caching @@JE:3',
+  { task: 'we need to implement caching', n: 3, implement: false }, { noErrors: true });
+
+// --- phase-scoped specs: Plan pool drives N/assignment; Implement pool separate ---
+parseCase('P/I both phase specs', '@@JE Plan: 2 opus, 2 sonnet, 2 codex high, Implement: 2 opus, 2 codex high, build a parser',
+  { task: 'build a parser', n: 6, implement: true,
+    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'codex-high'],
+    planAssignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'codex-high'],
+    implementAssignment: ['opus', 'opus', 'codex-high', 'codex-high'] }, { noErrors: true });
+
+// --- Implement: label alone enables implement + defaults the Plan pool ---
+parseCase('P/I implement label alone -> plan default pool', '@@JE Implement: 1 glm 5.2, fix the bug',
+  { task: 'fix the bug', n: 10, implement: true,
+    assignment: PLAN_DEFAULT_POOL, planAssignment: PLAN_DEFAULT_POOL,
+    implementAssignment: ['glm-5.2'] }, { noErrors: true });
+
+// --- Plan: label alone (no implement) -> implement stays off, uses plan pool ---
+parseCase('P/I plan label alone, no implement', '@@JE Plan: 3 opus, tidy the config',
+  { task: 'tidy the config', n: 3, implement: false,
+    assignment: ['opus', 'opus', 'opus'], implementAssignment: null }, { noErrors: true });
+
+// --- Plan pool omitted entirely, only implement keyword -> plan default pool ---
+parseCase('P/I implement keyword, no plan spec -> defaults',
+  '@@JE implement, migrate the store',
+  { task: 'migrate the store', implement: true, needsGate: true,
+    implementAssignment: IMPLEMENT_DEFAULT_POOL }, { noErrors: true });
+
+// --- explicit sigil N agreeing with the plan sum is fine ---
+parseCase('P/I sigil N agrees with plan sum', '@@JE:6 Plan: 3 opus, 3 sonnet, Implement: 2 opus, do X',
+  { task: 'do X', n: 6, implement: true,
+    assignment: ['opus', 'opus', 'opus', 'sonnet', 'sonnet', 'sonnet'],
+    implementAssignment: ['opus', 'opus'] }, { noErrors: true });
+
+// --- sigil N disagreeing with the plan sum -> conflict (n nulled) ---
+parseCase('P/I sigil N vs plan sum conflict', '@@JE:4 Plan: 3 opus, 3 sonnet, Implement: 2 opus, do X',
+  { n: null, assignment: null }, { hasConflict: { markerN: 4, specN: 6 } });
+
+// --- unknown token in a phase spec is rejected loudly ---
+parseCase('P/I unknown token in Plan spec', '@@JE Plan: 2 opus, 1 gpt4, Implement: 2 opus, do X',
+  { n: null, assignment: null }, { errorIncludes: 'Unrecognised model token' });
+parseCase('P/I unknown token in Implement spec', '@@JE Plan: 2 opus, Implement: 1 gpt5, do X',
+  { assignment: null }, { errorIncludes: 'Unrecognised model token' });
+
+// --- phase-spec pool over N_MAX rejected safely ---
+parseCase('P/I plan pool over ceiling', '@@JE Plan: 20 opus, Implement: 2 opus, do X',
+  { n: null, assignment: null }, { errorIncludes: 'exceeds the tournament-size ceiling' });
+
+// --- implement + Z>=2 (grand loops) coexist ---
+parseCase('P/I implement with grand loops', 'harden the API @@JE:5:1:2 implement',
+  { task: 'harden the API', n: 5, z: 2, implement: true, repoMode: true }, { noErrors: true });
+
+// --- unit: extractPhaseSpecs slices the two segments correctly ---
+unit('extractPhaseSpecs both', (() => {
+  const ps = extractPhaseSpecs('Plan: 2 opus, 1 sonnet, Implement: 2 codex high');
+  return ps && eq(ps.plan.assignment, ['opus', 'opus', 'sonnet']) &&
+    eq(ps.implement.assignment, ['codex-high', 'codex-high']);
+})());
+unit('extractPhaseSpecs implement-only', (() => {
+  const ps = extractPhaseSpecs('Implement: 1 glm 5.2');
+  return ps && ps.plan === null && eq(ps.implement.assignment, ['glm-5.2']);
+})());
+unit('extractPhaseSpecs none -> null', extractPhaseSpecs('build a parser') === null);
+unit('PLAN_DEFAULT_POOL sums to 10', PLAN_DEFAULT_POOL.length === 10);
+unit('IMPLEMENT_DEFAULT_POOL sums to 5', IMPLEMENT_DEFAULT_POOL.length === 5);
 
 // ===========================================================================
 // report.

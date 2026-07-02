@@ -30,7 +30,7 @@ Do not hand-parse the sigil. In Phase 0, run the bundled parser ONCE and act on 
 node <plugin-root>/bin/je-parse.mjs "<the raw user message, verbatim>"
 ```
 
-It returns `{ task, n, mode, z, assignment, size, preset?, conflict?, errors?, needsGate? }`. The grammar it implements:
+It returns `{ task, n, mode, z, assignment, size, implement, planAssignment, implementAssignment, preset?, conflict?, errors?, needsGate? }`. The grammar it implements:
 
 - **Sigil** `@@JE[:N][:M[:Z]]` (case-insensitive, optional spaces around colons). N optional (int ≥ 2). M optional, default 1 (1 = single, 2 = two pass; any other value → error). **Z optional, default 1 (int in [1..5]). `Z=1` (or omitted) = today's isolated tournament, byte-identical. `Z>=2` = grand-loop mode (Phase 0b authorization + Phase 7 driver). `Z>Z_MAX=5` is a hard error (the parser refuses it and echoes the offending Z; tell the user to split into batches).** `@@JE:5` and `@@JE:5:2` parse exactly as before.
 - **Positional skips are forbidden:** `@@JE:5::3` is invalid; to set Z with a default M, write `@@JE:5:1:3`.
@@ -38,6 +38,11 @@ It returns `{ task, n, mode, z, assignment, size, preset?, conflict?, errors?, n
 - **Prose model spec** (may replace explicit N): a comma- or `and`-separated list of `<count> <model>` items anywhere in the message. Sum of counts = N; the items expand to the per-attempt assignment. The spec text is stripped from the task. An ordinary `<digit> <noun>` in the task (e.g. "fix 3 bugs") is NOT a spec.
 - **Top Mixed preset:** `top mixed` (also `top-mix` / `top mix`) plus an N (from the sigil, or a leading count like `6 top mixed`) → allocate N across `[opus, glm-5.2, codex-high]` as evenly as possible (remainder priority opus > glm-5.2 > codex-high; N=2 → opus+glm-5.2).
 - **Task-size override** (dynamic limits): a marker-adjacent `short` / `medium` / `long` (e.g. `@@JE:5 long`, `@@JE short, <task>`, `tidy up long @@JE:4`) sets `size` to force the per-attempt turn + timeout limits. Recognised only next to the marker and stripped from the task (the AFTER form needs a comma/semicolon/end right after it), so an ordinary size word in the task body is untouched. When absent, `size` is `null` and Phase 1c estimates it.
+- **Plan/Implement round split.** The tournament is a wide **Plan phase** (Plan Round 1 + Plan Round 2, always — attempts produce PLAN artifacts judged by the plan-lens council) plus an optional narrow **Implement phase** (Implement Round 3, plus Round 4 only if R3 has no gate-passing candidate — implementers seeded with the winning plan verbatim, judged by the code-lens council). The parser exposes:
+  - `implement` (bool) — turns on rounds 3–4. Set by a **marker-adjacent `implement` keyword** (`refactor the auth @@JE:5 implement`, `@@JE implement, <task>`; recognised only next to the marker and stripped, so `implement a parser` in the task body is untouched) **or** a non-empty `Implement:` phase spec.
+  - **Phase-scoped prose specs** — `Plan: 2 opus, 2 sonnet, 2 codex high, Implement: 2 opus, 2 codex high` set a distinct pool per phase (each segment uses the ordinary spec grammar; the plan sum is N, the implement sum seats the implementers). An omitted pool falls back to the defaults: plan `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `2 opus, 2 codex-high, 1 glm-5.2` (M=5).
+  - `planAssignment` (= `assignment`, the plan pool) and `implementAssignment` (the implement pool, `null` when `implement` is off). Pass `implement` and `implementAssignment` (as `implementAttempts`) straight through to the Phase 2 workflow args.
+  - **A plan-phase NO_CONSENSUS is surfaced to you BEFORE any implement spend** (the workflow returns before Round 3): show the full split and stop for a human decision — never let implementation run without a consensus plan.
 
 **Act on the JSON, in this order:**
 
@@ -46,6 +51,7 @@ It returns `{ task, n, mode, z, assignment, size, preset?, conflict?, errors?, n
 3. **`needsGate: true` → run the Phase 1 gate.** This is bare `@@JE` (no N, no spec), or Top Mixed with no N anywhere. Go to Phase 1.
 4. **Otherwise (`n` set):** the invocation is complete. If `assignment` is set (a prose spec or Top Mixed already answered the model question), **skip the Phase 1 menu** and use that assignment directly — it *is* a Mixed assignment. If `assignment` is null but `n` is set (explicit N, no spec), run the Phase 1 gate as today.
 5. **`z >= 2` and no error/conflict → grand-loop mode.** After resolving N/assignment/mode as above, do NOT start a normal tournament. Instead: (a) run the **non-implementable-task check** below; (b) go to **Phase 0b** (the one front-loaded autonomy authorization); (c) then run **Phase 7** (the grand-loop driver). For `z == 1` everything proceeds exactly as today (Phases 1–6).
+6. **`implement: true` → run the Implement phase after the Plan phase.** Pass `implement: true` and `implementAttempts` (from `implementAssignment`, or the implement default pool) to the Phase 2 workflow. The engine runs the plan phase first (always), and only on a **resolved winning plan** proceeds to Implement Round 3 (+ Round 4 if R3 has no gate-passing candidate). If the plan phase returns `no_consensus`, surface the split and stop — implementation never runs without a consensus plan. If Round 4 also fails the gate, the result carries `needs_human: true` (existing contract).
 
 **Task** = the parser's `task` (everything before the marker, with the spec text and Top Mixed keyword stripped and any trailing separator colon removed). Every attempt in every round receives this identical task.
 

@@ -26,6 +26,22 @@ Five blind Opus judges, **one lens each**. Each lens owns a slice of the judgeme
 | **robustness** | edge cases, failure modes, boundaries, error handling | probe what breaks it |
 | **craft** | readability, structure, maintainability, efficiency | judge whether someone else could own it in a year |
 
+### Two lens tables: plan vs code
+
+The tournament runs in two phases and the council uses a **different lens table for each** (same engine — same deterministic tally, veto, bounded deliberation, and NO_CONSENSUS rules; only the five lenses change). The engine selects the table by judging point: the **Plan phase** (Plan Round 1 review + Plan Final rank) uses the **plan lenses**; the **Implement phase** (Implement Round 3/4) uses the **code lenses** above.
+
+**Plan council** — judges a PLAN artifact (a concrete, file-level change proposal that never touches the repo):
+
+| Lens | You own | Special |
+|---|---|---|
+| **feasibility** | can this plan be built as written — are the named files, APIs, and mechanisms real and reachable, and does each step follow from the last | the reality judge; an unbuildable plan is worthless however elegant |
+| **completeness** | does the plan cover *everything* asked — every requirement, edge case, migration, test, doc — with no silent gaps | you catch "plans the easy 80%, hand-waves the hard 20%" |
+| **risk** | execution hazards — hidden coupling, breaking changes, data/compat, rollout/ordering — and whether the plan names and mitigates them | probe the failure modes the plan glosses over |
+| **security-by-design** | least privilege, input validation, safe secret handling, safe execution/supply-chain posture — or a designed-in vulnerability | you hold the **veto** (evidence-backed, as for code) |
+| **simplicity** | simplicity and proportionality — is this the smallest coherent change that still fully solves the task, or is it over-engineered | reward the simplest complete approach; penalise gold-plating |
+
+The **security-by-design** lens holds the same evidence-backed veto as the code security lens: a standing `UNSAFE` (high|critical + real "file + why") flag excludes that plan from winning. Everything else in this document — the shared scoring method, `checks_run`, the deterministic >50% tally, bounded deliberation, and the NO_CONSENSUS halt — applies identically to both councils. **A plan-phase NO_CONSENSUS surfaces to the orchestrator BEFORE any implement spend** (a genuinely contested design is a human decision, not something to silently implement).
+
 Every verdict — round 1 and every deliberation round — must include **`checks_run`**: the commands you ran / files you read, each with its key result. This is a forced-evidence lever; never leave it empty. Cast a single first-place **`vote`** (one candidate letter) and give a full **`ranking`**.
 
 **You never tally.** Do NOT count votes, average rankings, "reach consensus", or name an overall council winner. The winner is computed **deterministically in code** from all five votes plus the veto. Your only job is to cast the most honest vote your lens supports and to argue it well.
