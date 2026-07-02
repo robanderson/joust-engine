@@ -37,6 +37,8 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Rebrand + self-verify (fails the publish if the transform is incoherent)
+        env:
+          DEV_BUILD_NUMBER: ${{ github.run_number }}   # sequential -> published version 0.0.1-dev.<N>
         run: node bin/rebrand.mjs --out /tmp/dev-marketplace
 
       - name: Publish generated tree -> claude/joust-engine-dev (force)
