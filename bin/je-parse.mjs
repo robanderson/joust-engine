@@ -211,6 +211,7 @@ const SIZE_BEFORE_RX = /\b(short|medium|long)\b[\s:,-]*$/i;
 //   glmTimeoutSecs  : GLM-only wall-clock (GLM via z.ai is slow on heavy code)
 //   codexTimeoutSecs: Codex-only wall-clock (codex has NO turn cap -> wall clock only)
 //   grokTimeoutSecs : Grok-only wall-clock
+//   minimaxTimeoutSecs : MiniMax-only wall-clock (M3 is slow on real code; issue #30)
 // ---------------------------------------------------------------------------
 const SIZE_PROFILES = {
   short: {
@@ -222,6 +223,7 @@ const SIZE_PROFILES = {
     glmTimeoutSecs: 600,
     codexTimeoutSecs: 300,
     grokTimeoutSecs: 300,
+    minimaxTimeoutSecs: 300,
   },
   medium: { // == today's engine defaults (with a roomier GLM wall-clock, which is slow)
     attemptMaxTurns: 30,
@@ -232,6 +234,7 @@ const SIZE_PROFILES = {
     glmTimeoutSecs: 1200,
     codexTimeoutSecs: 600,
     grokTimeoutSecs: 600,
+    minimaxTimeoutSecs: 900, // issue #30: both M3 seats blew the shared 300s on a real medium task
   },
   long: {
     attemptMaxTurns: 50,
@@ -242,6 +245,7 @@ const SIZE_PROFILES = {
     glmTimeoutSecs: 2400,
     codexTimeoutSecs: 1200,
     grokTimeoutSecs: 1200,
+    minimaxTimeoutSecs: 1800,
   },
 };
 

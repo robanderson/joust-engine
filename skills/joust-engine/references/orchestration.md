@@ -66,8 +66,9 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   localMaxTurns: 20,                      // LOCAL iteration cap; engine fallback 20
   minimaxMaxTurns: 30,                    // MiniMax iteration cap; engine fallback = attemptMaxTurns
   grokMaxTurns: 30,                       // Grok iteration cap; engine fallback = attemptMaxTurns (grok has BOTH guards)
-  attemptTimeoutSecs: 300,               // wall-clock backstop (local/minimax/GLM base); engine fallback 300
+  attemptTimeoutSecs: 300,               // wall-clock backstop (local/base); engine fallback 300
   glmTimeoutSecs: 2400,                  // GLM-only wall-clock (GLM is slow on heavy code); engine fallback = attemptTimeoutSecs
+  minimaxTimeoutSecs: 900,               // MiniMax-only wall-clock (M3 is slow on real code — issue #30); engine fallback = attemptTimeoutSecs
   codexTimeoutSecs: 600,                 // wall-clock backstop for Codex; engine fallback 600 (codex has no turn cap)
   grokTimeoutSecs: 600,                  // wall-clock backstop for Grok; engine fallback 600 (grok ALSO honours grokMaxTurns)
   grokWebSearch: false,                  // optional — true enables grok web search (default false = hermetic, like the other providers)
@@ -149,8 +150,9 @@ Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns th
 | `localMaxTurns` | 12 | 20 | 35 |
 | `minimaxMaxTurns` | 15 | 30 | 50 |
 | `grokMaxTurns` | 15 | 30 | 50 |
-| `attemptTimeoutSecs` (local/MiniMax/base) | 180 | 300 | 600 |
+| `attemptTimeoutSecs` (local/base) | 180 | 300 | 600 |
 | `glmTimeoutSecs` | 600 | 1200 | 2400 |
+| `minimaxTimeoutSecs` | 300 | 900 | 1800 |
 | `codexTimeoutSecs` | 300 | 600 | 1200 |
 | `grokTimeoutSecs` | 300 | 600 | 1200 |
 

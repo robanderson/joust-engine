@@ -173,6 +173,9 @@ const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.at
 // independent of local/minimax, so one long GLM leg doesn't force everyone's timeout up. For code-build
 // tournaments pass glmTimeoutSecs ~1800-2400. Defaults to attemptTimeout when unset (backward-compatible).
 const glmTimeoutSecs = Number(A.glmTimeoutSecs) > 0 ? Math.floor(Number(A.glmTimeoutSecs)) : attemptTimeout
+// MiniMax-M3 is slow on real code tasks — both M3 seats blew the shared 300s wall-clock on a medium run
+// (issue #30), so it gets its OWN wall-clock like GLM/codex. Defaults to attemptTimeout when unset.
+const minimaxTimeoutSecs = Number(A.minimaxTimeoutSecs) > 0 ? Math.floor(Number(A.minimaxTimeoutSecs)) : attemptTimeout
 // Codex exec is agentic with NO turn cap (no --max-turns flag), so the wall-clock timeout is its ONLY
 // per-attempt backstop and gets its own, roomier default. Override via args.codexTimeoutSecs.
 const codexTimeout = Number(A.codexTimeoutSecs) > 0 ? Math.floor(Number(A.codexTimeoutSecs)) : 600
@@ -397,7 +400,7 @@ function dispatch(a, ws, guidance, phaseTitle) {
   } else if (a.dispatch === 'minimax') {
     opts.agentType = nsAgent(a.agentType) // joust-minimax (one generic agent; MiniMax exposes only MiniMax-M3)
     // No --model flag: the runner's ANTHROPIC_MODEL pins MiniMax-M3 (all aliases map to it).
-    prompt = RUNVERBATIM(runnerCmd(minimaxRunner, '', ws, b, minimaxMaxTurns), ws, '_minimax_run.log')
+    prompt = RUNVERBATIM(runnerCmd(minimaxRunner, '', ws, b, minimaxMaxTurns, minimaxTimeoutSecs), ws, '_minimax_run.log')
   } else if (a.dispatch === 'grok') {
     opts.agentType = nsAgent(a.agentType) // joust-grok (one generic agent for BOTH grok variants)
     const flag = GROK_FLAG[a.displayModel] || `-m ${a.model}` // grok-build | grok-composer-2.5-fast -> grok -m

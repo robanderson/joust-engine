@@ -514,11 +514,12 @@ unit('sizeProfile short keys', (() => {
 unit('sizeProfile medium == engine defaults spirit', (() => {
   const p = sizeProfile('MEDIUM'); // case-insensitive
   return p && p.size === 'medium' && p.attemptMaxTurns === 30 && p.localMaxTurns === 20 &&
-    p.attemptTimeoutSecs === 300 && p.codexTimeoutSecs === 600;
+    p.attemptTimeoutSecs === 300 && p.codexTimeoutSecs === 600 && p.minimaxTimeoutSecs === 900;
 })());
 unit('sizeProfile long loosens guards', (() => {
   const p = sizeProfile('long');
-  return p && p.attemptMaxTurns === 50 && p.glmTimeoutSecs === 2400 && p.codexTimeoutSecs === 1200;
+  return p && p.attemptMaxTurns === 50 && p.glmTimeoutSecs === 2400 && p.codexTimeoutSecs === 1200 &&
+    p.minimaxTimeoutSecs === 1800;
 })());
 unit('sizeProfile unknown -> null', sizeProfile('huge') === null);
 // every profile must define the SAME complete key set the engine reads.

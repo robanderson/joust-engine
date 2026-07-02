@@ -6,6 +6,8 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Changed
 
+- **MiniMax gets its own wall-clock** (`minimaxTimeoutSecs`: short 300s / medium 900s / long 1800s) in `SIZE_PROFILES` and the engine (fallback = `attemptTimeoutSecs`, so unset behaves as before). Both MiniMax-M3 seats in a real medium-profile run timed out at the shared 300s and saved no deliverable (issue #30); M3 needs GLM-style headroom on real code tasks.
+
 - **Judging is now a 5-lens deliberating Opus council** (issue #22), replacing the single blind Opus judge at BOTH decision points (Phase 3 review and Phase 5 final rank).
   - Five blind Opus judges, one lens each — **correctness, spec, security, robustness, craft** — vote independently in round 1 (no peer visibility), each returning per-candidate pros/cons, a full ranking, a first-place vote, and a required `checks_run[]` evidence list.
   - **Deterministic tally in code** (never an LLM): a **>50% majority** of the living judges' first-place votes on a non-vetoed candidate wins.
