@@ -174,12 +174,12 @@ check('(worktree-root) default worktreeRoot does not resolve under .claude/',
   (() => { const m = SRC.match(/A\.worktreeRoot \|\| `([^`]+)`/); return !!m && !m[1].includes('.claude') })())
 check('(worktree-root) worktreePath is rooted at worktreeRoot and repoMode-gated',
   SRC.includes('const worktreePath = (roundName, label) => repoMode ? `${worktreeRoot}/${roundName}/${label}` : null'))
-check('(worktree-root) round-1 attempt ws uses worktreePath in repoMode',
-  SRC.includes("ws: repoMode ? worktreePath('round-1', a.label) : `${runDir}/round-1/${a.label}`"))
-check('(worktree-root) round-2 attempt ws uses worktreePath in repoMode',
-  SRC.includes("ws: repoMode ? worktreePath('round-2', a.label) : `${runDir}/round-2/${a.label}`"))
-check('(worktree-root) repoMode:false keeps legacy round-1 ws literal under runDir',
-  SRC.includes('`${runDir}/round-1/${a.label}`'))
+check('(worktree-root) round-1 attempt ws uses worktreePath in repoMode, scratchPath otherwise',
+  SRC.includes("ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label)"))
+check('(worktree-root) round-2 attempt ws uses worktreePath in repoMode, scratchPath otherwise',
+  SRC.includes("ws: repoMode ? worktreePath('round-2', a.label) : scratchPath('round-2', a.label)"))
+check('(worktree-root) repoMode:true worktreePath is untouched by the issue #34 workspace-root fix',
+  SRC.includes('const worktreePath = (roundName, label) => repoMode ? `${worktreeRoot}/${roundName}/${label}` : null'))
 
 console.log(failed ? `\n${failed} check(s) FAILED` : '\nAll checks passed')
 process.exit(failed ? 1 : 0)

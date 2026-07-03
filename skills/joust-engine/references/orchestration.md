@@ -52,6 +52,17 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   task: "<exact task text>",
   mode: "single" | "two",
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
+  workspaceRoot: "<absolute base dir>",  // optional: base dir for SELF-CONTAINED candidate
+                                          // workspaces (repoMode:false). Default (omit) =
+                                          // /tmp/je-workspaces/<run-id> — deliberately OUTSIDE
+                                          // the plugin cache / ~/.claude/, which nested
+                                          // claude-CLI runners (glm/minimax/codex/grok) treat
+                                          // as sensitive and refuse to write under (issue #34).
+                                          // Pass workspaceRoot: runDir to reproduce the
+                                          // pre-fix layout verbatim. Mirrors repoMode's
+                                          // worktreeRoot (issue #44); staging/review dirs,
+                                          // _engine-logs, the context bundle, and every
+                                          // persisted artifact stay under runDir either way.
   contextFiles: ["<path>", ...],         // optional: known input files all workers need (see below)
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
@@ -184,26 +195,42 @@ If dynamic workflows are unavailable, use the manual Task-tool + `glm`/`omlx`-CL
 
 ## Run layout
 
-One run directory, with separate round folders and isolated per-candidate workspaces. Isolation is not optional: parallel agents writing to a shared path produce race conditions and overwritten files.
+Two roots, not one. `runDir` holds round bookkeeping, staged/blind review pools, and every
+persisted artifact (mapping.json, SUMMARY*.md, review-*/, contributions.json). Each
+candidate's raw, unstaged WORKSPACE lives under a separate `workspaceRoot` — by default
+`/tmp/je-workspaces/<run-id>` (issue #34: `runDir` sits inside the plugin cache / user config
+dir, a path nested claude-CLI runners — glm/minimax/codex/grok — refuse to write under, so a
+completed runner attempt could burn its whole turn budget fighting write denials and save
+nothing). Pass `workspaceRoot: runDir` to reproduce the pre-fix single-tree layout. Isolation
+is not optional either way: parallel agents writing to a shared path produce race conditions
+and overwritten files.
 
 ```
-<plugin-root>/
-└── <run-id>/
-    ├── round-1/
-    │   ├── candidate-1/        # round 1 attempt workspaces
-    │   ├── candidate-2/
-    │   ├── ...
-    │   └── candidate-N/
-    ├── review-1/               # Phase 3 Opus reviewer workspace + report (+ guidance in two pass)
-    ├── winner/                 # (two pass) the saved round 1 winner artifact
-    ├── round-2/                # (two pass) round 2 attempt workspaces
-    │   ├── candidate-1/
-    │   ├── ...
-    │   └── candidate-N/
-    └── final-rank/             # (two pass) final Opus ranker workspace + report
+<runDir>                                  (default <plugin-root>/.runs/<run-id>)
+├── round-1/                              # round 1 candidate workspaces (repoMode:true only —
+│   ├── candidate-1/                      #   worktree checkouts under worktreeRoot instead;
+│   └── ...                               #   repoMode:false has NO round-1/ here, see below)
+├── review-1/                             # Phase 3 Opus reviewer workspace + report (+ guidance)
+├── winner/                               # (two pass) the saved round 1 winner artifact
+├── round-2/                              # (repoMode:true only, mirrors round-1/ above)
+├── final-rank/                           # (two pass) final Opus ranker workspace + report
+└── _context/                             # shared context bundle, if contextFiles was passed
+
+<workspaceRoot>                           (default /tmp/je-workspaces/<run-id>, repoMode:false only)
+├── round-1/
+│   ├── candidate-1/                      # round 1 attempt workspaces
+│   ├── candidate-2/
+│   ├── ...
+│   └── candidate-N/
+└── round-2/                              # (two pass) round 2 attempt workspaces
+    ├── candidate-1/
+    ├── ...
+    └── candidate-N/
 ```
 
-Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the result.
+Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the
+result. `repoMode:true` uses `worktreeRoot` (default `/tmp/je-worktrees/<run-id>`) for the
+same reason and in the same shape — see the repo-anchored-mode notes below.
 
 ## Dispatching the attempts
 

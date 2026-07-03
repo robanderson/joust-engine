@@ -16,6 +16,18 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 - **MiniMax gets its own wall-clock** (`minimaxTimeoutSecs`: short 300s / medium 900s / long 1800s) in `SIZE_PROFILES` and the engine (fallback = `attemptTimeoutSecs`, so unset behaves as before). Both MiniMax-M3 seats in a real medium-profile run timed out at the shared 300s and saved no deliverable (issue #30); M3 needs GLM-style headroom on real code tasks.
 
+- **Self-contained candidate workspaces relocated outside the plugin cache** (issue #34,
+  mirrors the #44 `worktreeRoot` fix). `repoMode:false` candidate workspaces (native
+  Anthropic and every runner-based attempt) now default to `/tmp/je-workspaces/<run-id>/...`
+  instead of `<runDir>/round-*/candidate-*` — `runDir` lives inside the user config dir /
+  plugin cache, a path nested claude-CLI runners (glm/minimax/codex/grok) treat as sensitive
+  and refuse to write under, so a completed runner attempt could burn its whole turn budget
+  fighting write denials and save zero files. Configurable via the new `workspaceRoot` arg
+  (`workspaceRoot: runDir` reproduces the pre-fix layout exactly). Staging/review dirs,
+  `_engine-logs`, the shared context bundle, and every persisted artifact (`mapping.json`,
+  `SUMMARY*.md`, `review-*/`, etc.) are unaffected — they were always written from `runDir`
+  literals, never from the candidate workspace path. `repoMode:true` is untouched.
+
 - **Judging is now a 5-lens deliberating Opus council** (issue #22), replacing the single blind Opus judge at BOTH decision points (Phase 3 review and Phase 5 final rank).
   - Five blind Opus judges, one lens each — **correctness, spec, security, robustness, craft** — vote independently in round 1 (no peer visibility), each returning per-candidate pros/cons, a full ranking, a first-place vote, and a required `checks_run[]` evidence list.
   - **Deterministic tally in code** (never an LLM): a **>50% majority** of the living judges' first-place votes on a non-vetoed candidate wins.
