@@ -126,7 +126,9 @@ const PLAN_DEFAULT_POOL = [
   'opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'codex-high',
   'glm-5.2', 'glm-5.2', 'minimax-m3', 'minimax-m3',
 ];
-const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'codex-high', 'codex-high', 'glm-5.2'];
+// 2026-07-03: sonnet joined the implement pool (Sonnet 5 = newer base, better value; Rob wants
+// opus >= 2 AND sonnet >= 2), trading one codex-high seat to keep M lean.
+const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'glm-5.2'];
 
 // Recognised model token alternatives for the SPEC scan. These match the
 // HEAD of an item (after the count); the normaliser then validates exactly.

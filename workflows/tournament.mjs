@@ -296,6 +296,26 @@ const worktreeMetaDir = `${runDir}/_worktrees`
 // null (unused; the legacy scratch-dir path is byte-for-byte unchanged).
 const worktreeRoot = repoMode ? (A.worktreeRoot || `/tmp/je-worktrees/${safeRunId}`) : null
 const worktreePath = (roundName, label) => repoMode ? `${worktreeRoot}/${roundName}/${label}` : null
+// issue #34: self-contained candidate WORKSPACES (repoMode:false) also default under runDir
+// today — which sits inside the user config dir / plugin cache, a path nested claude-CLI
+// runners (glm/minimax/codex/grok) treat as SENSITIVE and refuse to write under, so a
+// completed runner attempt can burn its whole turn budget fighting write denials and save
+// nothing (issue #34: MiniMax ran to exit=0 and saved zero files; GLM hit "Reached max turns
+// (50)" both rounds). Mirrors the #44 worktreeRoot fix exactly: a configurable root, default
+// OUTSIDE ~/.claude/, no process.env read (module scope has no node:process, so it cannot
+// read TMPDIR — the SKILL/caller may pass ${TMPDIR:-/tmp}/je-workspaces/<runId>). Applies to
+// EVERY self-contained candidate workspace (native Anthropic included too, so there is one
+// uniform non-repoMode path rather than a per-dispatch special case) — ONLY the workspace
+// moves; staging/review dirs, _engine-logs, the context bundle, and every persisted run
+// artifact (mapping.json, SUMMARY*.md, review-*/, contributions.json, implement.json,
+// _winning-plan/) stay under runDir exactly as today, because they are all written from
+// literal `${runDir}/...}` paths, never from `ws`. stageAndValidate's `cp -R ${q(c.ws)}/. ...`
+// always reads from c.ws, so blind staging keeps copying from wherever the workspace now
+// lives with no further change. Configurable via args.workspaceRoot; pass
+// `workspaceRoot: runDir` to reproduce the pre-fix layout verbatim (explicit legacy escape
+// hatch, same pattern as `judges: 1`).
+const workspaceRoot = A.workspaceRoot || `/tmp/je-workspaces/${safeRunId}`
+const scratchPath = (roundName, label) => `${workspaceRoot}/${roundName}/${label}`
 const engineFiles = ['_brief.txt', '_glm_run.log', '_local_run.log', '_codex_run.log', '_codex_last.txt', '_minimax_run.log', '_grok_run.log']
 const engineLogPath = (c, log) => {
   if (!repoMode || !log) return log ? `${c.ws}/${log}` : ''
@@ -1621,7 +1641,7 @@ function implGatePassed(r) {
 // Run ONE implement round: dispatch the implement pool seeded with the plan, stage, enrich, and
 // judge with the CODE lenses. `wantGuidance` distils round-3 → round-4 priors (round 3 only).
 async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance, reviewDir, wantGuidance) {
-  const list = implementAttempts.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : `${runDir}/${roundName}/${a.label}` }))
+  const list = implementAttempts.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
   await buildWorktrees(roundName, list)
   const doneRaw = (await parallel(list.map(a => () => dispatch(a, a.ws, guidance, phaseTitle, 'implement', seedPlanPath)))).filter(Boolean)
   const done = doneRaw.map(c => ({ ...c, roundName }))
@@ -1678,7 +1698,7 @@ async function implementPhase(seedPlanPath) {
 phase('Round 1')
 log(`▶ ${deriveSummary()}`) // issue #38: run-purpose summary as the first narrator line (above the progress tree)
 await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
-const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : `${runDir}/round-1/${a.label}` }))
+const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label) }))
 await buildWorktrees('round-1', r1Worktrees) // repoMode-only no-op otherwise
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
 const r1 = (await parallel(r1Worktrees.map(a => () => dispatch(a, a.ws, null, 'Round 1')))).filter(Boolean)
@@ -1765,7 +1785,7 @@ if (!winner1) log(`round-1 winner "${review.winner}" not among valid candidates;
 const champ = winner1 || blind1[0]
 phase('Round 2')
 log(`Round 2: ${attempts.length} guided attempts; carrying over round-1 winner (${champ.displayModel})`)
-const r2Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-2', a.label) : `${runDir}/round-2/${a.label}` }))
+const r2Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-2', a.label) : scratchPath('round-2', a.label) }))
 await buildWorktrees('round-2', r2Worktrees) // repoMode-only no-op otherwise
 const r2 = (await parallel(r2Worktrees.map(a => () => dispatch(a, a.ws, review.guidance, 'Round 2')))).filter(Boolean)
 { const w = dispatchDropSummary('Round 2', dispatchDrops, r2Worktrees.length, r2.length); if (w) log(w) } // #45

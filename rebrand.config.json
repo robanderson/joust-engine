@@ -23,6 +23,7 @@
     ["jewt", "dewt"],
     ["je-scratch", "de-scratch"],
     ["je-worktrees", "de-worktrees"],
+    ["je-workspaces", "de-workspaces"],
     ["JE_", "DE_"]
   ],
   "renameDirs": [

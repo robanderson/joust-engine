@@ -13,7 +13,7 @@ The Phase 1 selection maps to these. There are two families with two different d
 | Choice  | Alias    | API model string     | Role                        |
 |---------|----------|----------------------|-----------------------------|
 | Opus    | `opus`   | `claude-opus-4-8`    | attempt, review, or rank    |
-| Sonnet  | `sonnet` | `claude-sonnet-4-6`  | attempt                     |
+| Sonnet  | `sonnet` | `claude-sonnet-5`    | attempt                     |
 | Haiku   | `haiku`  | `claude-haiku-4-5`   | attempt                     |
 
 **GLM models (z.ai)** — dispatched by shelling out to the `glm` CLI (see "Dispatching GLM attempts" below). `glm` is the `claude` CLI pointed at z.ai's Anthropic-compatible endpoint; it is selected through `glm`'s `--model` flag, which is **not** the same as a GLM model name. Use this exact mapping:
@@ -52,6 +52,17 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   task: "<exact task text>",
   mode: "single" | "two",
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
+  workspaceRoot: "<absolute base dir>",  // optional: base dir for SELF-CONTAINED candidate
+                                          // workspaces (repoMode:false). Default (omit) =
+                                          // /tmp/je-workspaces/<run-id> — deliberately OUTSIDE
+                                          // the plugin cache / ~/.claude/, which nested
+                                          // claude-CLI runners (glm/minimax/codex/grok) treat
+                                          // as sensitive and refuse to write under (issue #34).
+                                          // Pass workspaceRoot: runDir to reproduce the
+                                          // pre-fix layout verbatim. Mirrors repoMode's
+                                          // worktreeRoot (issue #44); staging/review dirs,
+                                          // _engine-logs, the context bundle, and every
+                                          // persisted artifact stay under runDir either way.
   contextFiles: ["<path>", ...],         // optional: known input files all workers need (see below)
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
@@ -121,7 +132,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 ```
 
 - When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
-- **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 codex-high, 1 glm-5.2` (M=5). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
+- **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
 - **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`). The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`).
 
 **Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `joust-engine:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):
@@ -184,26 +195,42 @@ If dynamic workflows are unavailable, use the manual Task-tool + `glm`/`omlx`-CL
 
 ## Run layout
 
-One run directory, with separate round folders and isolated per-candidate workspaces. Isolation is not optional: parallel agents writing to a shared path produce race conditions and overwritten files.
+Two roots, not one. `runDir` holds round bookkeeping, staged/blind review pools, and every
+persisted artifact (mapping.json, SUMMARY*.md, review-*/, contributions.json). Each
+candidate's raw, unstaged WORKSPACE lives under a separate `workspaceRoot` — by default
+`/tmp/je-workspaces/<run-id>` (issue #34: `runDir` sits inside the plugin cache / user config
+dir, a path nested claude-CLI runners — glm/minimax/codex/grok — refuse to write under, so a
+completed runner attempt could burn its whole turn budget fighting write denials and save
+nothing). Pass `workspaceRoot: runDir` to reproduce the pre-fix single-tree layout. Isolation
+is not optional either way: parallel agents writing to a shared path produce race conditions
+and overwritten files.
 
 ```
-<plugin-root>/
-└── <run-id>/
-    ├── round-1/
-    │   ├── candidate-1/        # round 1 attempt workspaces
-    │   ├── candidate-2/
-    │   ├── ...
-    │   └── candidate-N/
-    ├── review-1/               # Phase 3 Opus reviewer workspace + report (+ guidance in two pass)
-    ├── winner/                 # (two pass) the saved round 1 winner artifact
-    ├── round-2/                # (two pass) round 2 attempt workspaces
-    │   ├── candidate-1/
-    │   ├── ...
-    │   └── candidate-N/
-    └── final-rank/             # (two pass) final Opus ranker workspace + report
+<runDir>                                  (default <plugin-root>/.runs/<run-id>)
+├── round-1/                              # round 1 candidate workspaces (repoMode:true only —
+│   ├── candidate-1/                      #   worktree checkouts under worktreeRoot instead;
+│   └── ...                               #   repoMode:false has NO round-1/ here, see below)
+├── review-1/                             # Phase 3 Opus reviewer workspace + report (+ guidance)
+├── winner/                               # (two pass) the saved round 1 winner artifact
+├── round-2/                              # (repoMode:true only, mirrors round-1/ above)
+├── final-rank/                           # (two pass) final Opus ranker workspace + report
+└── _context/                             # shared context bundle, if contextFiles was passed
+
+<workspaceRoot>                           (default /tmp/je-workspaces/<run-id>, repoMode:false only)
+├── round-1/
+│   ├── candidate-1/                      # round 1 attempt workspaces
+│   ├── candidate-2/
+│   ├── ...
+│   └── candidate-N/
+└── round-2/                              # (two pass) round 2 attempt workspaces
+    ├── candidate-1/
+    ├── ...
+    └── candidate-N/
 ```
 
-Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the result.
+Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the
+result. `repoMode:true` uses `worktreeRoot` (default `/tmp/je-worktrees/<run-id>`) for the
+same reason and in the same shape — see the repo-anchored-mode notes below.
 
 ## Dispatching the attempts
 

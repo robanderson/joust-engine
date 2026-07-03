@@ -17,7 +17,7 @@ judge (plans), a small strong pool where they are expensive (code). Flatten
 |---|---|---|---|
 | 1 | **Plan Round 1** | always | 2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax (N=10) |
 | 2 | **Plan Round 2** | always (two-pass spine: guidance from R1 review) | same pool, fresh diversity draw |
-| 3 | **Implement Round 3** | only with the `implement` flag | 2 opus, 2 codex-high, 1 glm-5.2 (M=5) |
+| 3 | **Implement Round 3** | only with the `implement` flag | 2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2 (M=6; sonnet >= 2 since Sonnet 5, 2026-07-03) |
 | 4 | **Implement Round 4** | **conditional**: only if R3 produces NO candidate passing the gates (verify fail / council NO_CONSENSUS / all vetoed) | same implement pool, guided by R3 review |
 
 - Plan rounds produce PLAN artifacts (concrete file-level change proposals). Judged by a

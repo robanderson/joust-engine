@@ -4,6 +4,10 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- **GLM runner retries timeout-class transient API errors** (issue #31). `bin/glm-run.sh`'s transient-marker matcher previously matched only `529`/`429`/`5xx`/`overloaded`, so a generic `API Error: The operation timed out.` from the z.ai endpoint killed a parallel glm-5.2 seat on first occurrence even with `retries=3` configured. The matcher now also matches `API Error: …(timed out|timeout)` on the CLI's stable `API Error:` prefix, retrying with the same bounded exponential backoff + jitter. Anchoring to the prefix keeps genuine task output, refusals, and auth text (even auth on the `API Error:` line) from self-tripping a retry, and the runner's own wall-clock SIGALRM (rc 124) still never retries. An engine-level same-provider stagger in `workflows/tournament.mjs` was evaluated and **declined** — the existing startup jitter plus this retry already address the root cause, and a stagger would mutate the shared all-provider dispatch path. `bin/glm-run.test.sh` extended with timeout-retry, wall-clock-no-retry, prefixed-auth-no-retry, and persistent-timeout-cap cases.
+
 ### Changed
 
 - **Tournament split into a Plan phase and an optional Implement phase** (2026-07-03 design), replacing the flat single/two-pass structure with a cheap-wide-plan → narrow-strong-implement pipeline.
@@ -15,6 +19,18 @@ All notable changes to the **joust-engine** plugin are documented here.
   - The council engine is shared: one deterministic tally / veto / bounded-deliberation / NO_CONSENSUS path, two lens tables (`LENS_PROFILES.plan` vs `LENS_PROFILES.code`), selected per judging point by phase.
 
 - **MiniMax gets its own wall-clock** (`minimaxTimeoutSecs`: short 300s / medium 900s / long 1800s) in `SIZE_PROFILES` and the engine (fallback = `attemptTimeoutSecs`, so unset behaves as before). Both MiniMax-M3 seats in a real medium-profile run timed out at the shared 300s and saved no deliverable (issue #30); M3 needs GLM-style headroom on real code tasks.
+
+- **Self-contained candidate workspaces relocated outside the plugin cache** (issue #34,
+  mirrors the #44 `worktreeRoot` fix). `repoMode:false` candidate workspaces (native
+  Anthropic and every runner-based attempt) now default to `/tmp/je-workspaces/<run-id>/...`
+  instead of `<runDir>/round-*/candidate-*` — `runDir` lives inside the user config dir /
+  plugin cache, a path nested claude-CLI runners (glm/minimax/codex/grok) treat as sensitive
+  and refuse to write under, so a completed runner attempt could burn its whole turn budget
+  fighting write denials and save zero files. Configurable via the new `workspaceRoot` arg
+  (`workspaceRoot: runDir` reproduces the pre-fix layout exactly). Staging/review dirs,
+  `_engine-logs`, the shared context bundle, and every persisted artifact (`mapping.json`,
+  `SUMMARY*.md`, `review-*/`, etc.) are unaffected — they were always written from `runDir`
+  literals, never from the candidate workspace path. `repoMode:true` is untouched.
 
 - **Judging is now a 5-lens deliberating Opus council** (issue #22), replacing the single blind Opus judge at BOTH decision points (Phase 3 review and Phase 5 final rank).
   - Five blind Opus judges, one lens each — **correctness, spec, security, robustness, craft** — vote independently in round 1 (no peer visibility), each returning per-candidate pros/cons, a full ranking, a first-place vote, and a required `checks_run[]` evidence list.
