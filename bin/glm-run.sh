@@ -11,8 +11,11 @@
 #   1. Startup jitter (0..JE_GLM_JITTER_MAX s, default 10) staggers sibling attempts so
 #      they don't open with a synchronized burst.
 #   2. Bounded retry with exponential backoff + jitter, ONLY when the failed try's own
-#      output shows a transient marker (529/5xx/overloaded). Hard errors (bad key, bad
-#      flag, refusals) never retry; a wall-clock timeout (rc 124) never retries.
+#      output shows a TRANSIENT marker: a 5xx/overload status OR (issue #31) a timeout-
+#      class API error on the CLI's stable 'API Error:' line ("The operation timed out."
+#      and its timeout-worded near-neighbours). Hard errors (bad key, bad flag, refusals,
+#      and auth text even on the 'API Error:' line) never retry; the runner's OWN wall-
+#      clock timeout (rc 124, the SIGALRM kill) never retries — it already spent the budget.
 # Retries: JE_GLM_RETRIES (default 3, so <=4 tries). Backoff: JE_GLM_BACKOFF_BASE
 # (default 15s) doubling per retry, plus 0..JE_GLM_JITTER_MAX random seconds.
 set -uo pipefail
@@ -69,10 +72,15 @@ while :; do
   RC=$?
   [ "$RC" -eq 0 ] && break
   if [ "$RC" -eq 124 ]; then echo "JOUST-GLM-TIMEOUT secs=${TIMEOUT}" >> "$LOG"; break; fi
-  # Retry ONLY on a transient-overload marker in THIS try's appended output — hard
-  # errors fail closed immediately. (An extra retry after a genuine failure whose text
-  # merely *mentions* 529 is bounded and harmless; retrying a hard auth/flag error is not.)
-  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'API Error: *(429|500|502|503|529)|overloaded'; then
+  # Retry ONLY on a TRANSIENT marker in THIS try's appended output — hard errors fail
+  # closed immediately. Markers: a 5xx/overload status, OR (issue #31) a timeout-class
+  # API error on the CLI's stable 'API Error:' line ('...timed out' / '...timeout').
+  # The 'API Error:' prefix anchor keeps genuine task output, refusals, and auth text
+  # (even auth carried on that same line) from self-tripping a retry; an extra retry
+  # after a genuine failure whose text merely *mentions* a marker is bounded and harmless,
+  # but retrying a hard auth/flag error is not. rc 124 (the runner's own wall-clock
+  # SIGALRM) is handled above and never reaches this grep.
+  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'API Error: *(429|500|502|503|529)|overloaded|API Error:.*(timed out|timeout)'; then
     if [ "$TRY" -ge "$MAXTRIES" ]; then
       echo "JOUST-GLM-RETRIES-EXHAUSTED tries=${TRY}" >> "$LOG"
       break
