@@ -4,13 +4,13 @@
 >
 > 🌐 **[joustengine.ai](https://joustengine.ai)** — *site coming soon*
 
-**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* Anthropic Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax); the judge is always Opus, held fixed so the comparison stays honest.
+**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* **5-lens deliberating Opus council** scores them, votes, and names a winner — a deterministic majority tally in code, never an LLM "summarising the consensus". The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax, xAI Grok); the judges are always Opus, held fixed so the comparison stays honest.
 
 ```text
 @@JE:5  Build a CLI that flattens nested JSON to dotted keys.
 ```
 
-That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and a blind Opus reviewer crowns a winner. Add `:2` for two passes (a guided second round), or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
+That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and the blind Opus council crowns a winner. Add `:2` for two passes (a guided second round), or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
 
 ---
 
@@ -18,6 +18,8 @@ That one line triggers the loop: it asks which model(s) to run the 5 attempts on
 
 - [The core idea](#the-core-idea)
 - [Single pass vs two pass](#single-pass-vs-two-pass)
+- [The judging council](#the-judging-council)
+- [Plan & Implement rounds](#plan--implement-rounds)
 - [Invoking it: the sigil and prose forms](#invoking-it-the-sigil-and-prose-forms)
   - [The `@@JE` sigil](#the-je-sigil)
   - [Task size (dynamic limits)](#task-size-dynamic-limits)
@@ -42,7 +44,7 @@ A single LLM attempt at a task is one sample from a noisy distribution. The Jous
 
 1. **Generate, don't iterate.** Run **N attempts in parallel**, each a *single-pass exploration* — every attempt writes its solution **once and stops**. No attempt is told it's competing or being judged; none sees another's work. The refinement happens at the *tournament* level (many diverse one-shots → review), never inside a single attempt grinding "until it works." A rough or even failed attempt is useful signal, not a wasted slot.
 
-2. **Judge blind, with a fixed strong judge.** One **Anthropic Opus reviewer** receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. It reads (and where feasible runs) each one, scores against task-appropriate criteria, lists concrete pros and cons, ranks them, and names a winner with reasoning. Because the judge never learns which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
+2. **Judge blind, with fixed strong judges.** A blind **Opus council** (five lens judges; see below) receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. Each judge reads (and where feasible runs) each one, scores it through its lens, lists concrete pros and cons, ranks them, and casts a first-place vote; code tallies the majority. Because the judges never learn which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
 
 The attempts are deliberately *diverse*: different model families, sampling stochasticity, and a per-attempt framing nudge ([diversity injection](#diversity-injection-pool-a--pool-b)) all push the N solutions apart so the review has genuinely different things to compare.
 
@@ -66,10 +68,10 @@ The distilled guidance is two short lists — *positives to consider* and *chall
 
 ```text
 SINGLE PASS
-  task ──▶ [N attempts] ──▶ blind Opus review ──▶ winner ✓
+  task ──▶ [N attempts] ──▶ blind Opus council ──▶ winner ✓
 
 TWO PASS
-  task ──▶ [N attempts] ──▶ blind Opus review ──┬─▶ distil guidance ─┐
+  task ──▶ [N attempts] ──▶ blind Opus council ──┬▶ distil guidance ─┐
                                                 └─▶ save winner ──┐  │
                                                                   │  ▼
             [N fresh attempts + task + guidance] ◀────────────────┼──┘
@@ -78,10 +80,40 @@ TWO PASS
             final pool = N round-2 + saved winner ◀───────────────┘
                               │
                               ▼
-            blind Opus final rank ──▶ overall winner ✓
+            blind Opus council rank ──▶ overall winner ✓
 ```
 
-Two pass roughly **doubles** the attempt count (≈ 2N attempts + 2 Opus passes), so it costs about double single pass. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+Two pass roughly **doubles** the attempt count (≈ 2N attempts + 2 council judging points), so it costs about double single pass. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+
+---
+
+## The judging council
+
+Every judging point (the round-1 review and the final rank) is, by default, a **council of five blind Opus judges**, one lens each — **correctness/verification** (runs the code, cites real exit codes), **spec-compliance**, **security** (holds the veto), **robustness/edge-cases**, and **craft/efficiency**. All five are blind to model identities and must ground every verdict in a required `checks_run` evidence list.
+
+- **Round 1 is independent** — no judge sees a peer. Then the tally runs **in code**: a candidate wins with **>50% of living judges' first-place votes**, and a candidate the security judge flags `UNSAFE` (high/critical severity **with concrete evidence**) cannot win regardless of votes.
+- **No majority → bounded deliberation** (max 3 rounds): each judge sees the peers' verbatim verdicts, may run 1–2 targeted checks to settle a factual dispute, and revises. Peers can rebut a veto with evidence; a standing veto excludes the candidate.
+- **Still split → `NO_CONSENSUS`** — surfaced to you (or needs-human + HALT in a grand loop). It is never silently resolved by a score average, Borda, or a meta-judge.
+- A **verdict-integrity guard** rejects schema-valid-but-junk verdicts (placeholder reasoning, collapsed pros/cons, vacuous veto evidence) at every choke point, so a degenerate judge output dies and retries instead of steering the run.
+- `judges: 1` restores the legacy single blind Opus judge (cheap runs).
+
+The design follows the LLM-as-judge research in [issue #22](https://github.com/robanderson/joust-engine/issues/22) and `docs/superpowers/specs/2026-07-02-judge-council-design.md`: diverse lenses over one generalist, independent votes before cross-talk, aggregation in code, evidence-forcing, and fail-closed no-consensus routing.
+
+---
+
+## Plan & Implement rounds
+
+The tournament is structured as a **cheap, wide planning phase** plus an **optional, narrow implementation phase** (`docs/superpowers/specs/2026-07-03-plan-implement-rounds-design.md`):
+
+| Round | Runs | Pool default |
+|---|---|---|
+| **Plan Round 1 & 2** | always (the two-pass spine) | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
+| **Implement Round 3** | only with the `implement` keyword | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
+| **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate | same pool, guided by the R3 review |
+
+Plan rounds produce plan artifacts judged by a **plan-lens council** (feasibility, completeness, risk, security-by-design, simplicity). The winning plan then seeds every implementer **verbatim** — a deliberate exception to the "never seed prior artifacts" rule, because the plan *is* the specification — and implementations are judged by the code-lens council with verify/build/lint evidence folded in. A plan-phase `NO_CONSENSUS` stops the run **before any implementation spend**.
+
+Phase-scoped prose specs pick the pools inline: `Plan: 2 opus, 2 sonnet, 1 glm 5.2 Implement: 2 opus, 1 codex high implement @@JE:5:2` — each phase segment uses the normal spec grammar, and the `implement` keyword (marker-adjacent, so prose like "implement a CSV parser" never false-triggers) enables rounds 3–4.
 
 ---
 
@@ -205,7 +237,7 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 
 ## Model providers
 
-Attempts can run on five providers. The **reviewer and final ranker are always Anthropic Opus**, dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
+Attempts can run on six providers. The **reviewers and final rankers are always Anthropic Opus** (the 5-lens council, or the `judges:1` single judge), dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
 
 | Provider | Models (selectable axis) | Dispatch | Auth (from the **environment**) |
 |---|---|---|---|
@@ -283,7 +315,7 @@ bin/je-issue.sh claim <N> <run-id>                             # best-effort cla
 - **PUBLIC repo:** never paste secrets or the `mapping.json` unblinding line — refer to a candidate as "blind B," not the model (the helper has refusal greps for both).
 - **Claiming is best-effort, not a mutex:** the GitHub API has no compare-and-swap, so `claim` is a TOCTOU read-after-write with a deterministic tiebreak; a git-ref push under `refs/dogfood-claims/` is the strict escape hatch for high fan-out / grand loops.
 - **No `gh` / offline?** `new` degrades to a committed draft under `docs/dogfood/inbox/` (never `.runs/`); re-file later with `drain-inbox`.
-- Legacy `D-NNNN` items live read-only under `docs/dogfood/archive/`.
+- Legacy `D-NNNN` items were imported as **closed `dogfood` issues** (full evidence in each body); there is no in-repo archive.
 
 ---
 
@@ -397,7 +429,8 @@ joust-engine/
 │   ├── joust-implementer.md       # (grand loops) Opus; applies the winner to the real repo
 │   └── joust-cleanup.md           # (on request) Opus; ASK-FIRST disk reclaim via bin/je-git.sh je_cleanup
 ├── workflows/
-│   └── tournament.mjs                  # the dynamic-workflow engine: attempts → blind review → (two pass) round 2 → final rank
+│   ├── tournament.mjs                  # the dynamic-workflow engine: plan rounds → council review → (implement) rounds 3-4 → council rank
+│   └── tournament-*.test.mjs           # engine test suite (worktree mode, workspace root, verdict integrity, contributions, ...)
 ├── bin/                                # runners + helpers (run with node / bash)
 │   ├── je-parse.mjs                    # Phase 0 invocation parser (sigil, prose spec, Top Mixed, Z, task size)
 │   ├── je-git.sh                       # ALL git/gh side effects for grand loops (preflight, branch, verify, PR, markers, cleanup)
@@ -410,7 +443,7 @@ joust-engine/
 │   ├── je-bench.mjs                    # the throughput benchmark
 │   └── README.je-bench.md              # je-bench usage + results-format reference
 ├── docs/
-│   ├── dogfood/archive/                # read-only legacy D-NNNN evidence
+│   ├── superpowers/specs/              # approved design specs (judge council, plan/implement rounds)
 │   └── dogfood/inbox/                  # committed offline drafts (no-gh fallback)
 └── .bench/results.jsonl                # append-only je-bench history
 ```
@@ -418,7 +451,7 @@ joust-engine/
 **How the pieces fit together at run time:**
 
 - **SKILL.md is the driver.** On a trigger it runs `bin/je-parse.mjs` (Phase 0), the mandatory model gate (Phase 1), diversity injection (Phase 1b), then dispatches.
-- **`workflows/tournament.mjs` is the preferred backend.** Invoked via the `Workflow` tool, it runs the parallel attempts, the blind Opus review, and (two pass) round 2 + final rank deterministically — watchable live in `/workflows`. It returns the structured mapping + rankings the skill reports in Phase 6. (Fallback when workflows are unavailable: manual Task-tool + `glm` CLI dispatch.)
+- **`workflows/tournament.mjs` is the preferred backend.** Invoked via the `Workflow` tool, it runs the parallel attempts, the blind Opus council reviews, and (two pass) round 2 + final rank — plus the optional implement rounds — deterministically — watchable live in `/workflows`. It returns the structured mapping + rankings the skill reports in Phase 6. (Fallback when workflows are unavailable: manual Task-tool + `glm` CLI dispatch.)
 - **Agents are thin command-runners.** Anthropic attempts run native via the Task tool. Each non-Anthropic attempt runs through its wrapper agent (a cheap Bash-only driver) executing the matching `bin/*-run.sh` — the script sets provider env, closes stdin, calls the nested `claude`/`codex`, and writes the provenance marker. This indirection exists because a wrapper handed a *raw* nested command proved unreliable (it would solve the task itself, refuse on "safety," or let the weak inner model bail without saving); it matters most for **codex**, a fully autonomous external agent.
 - **The judge is fixed.** Reviewer and final ranker are always Opus via the Task tool. Before judging, the engine **stages** each deliverable into a clean blind tree (copying files and deleting the known engine files — `_brief.txt`, the run logs — by exact name, an *allowlist* that keeps legitimately `_`-prefixed deliverables), **validates** the success provenance contract, and **pools** the valid deliverables into one blind-labelled `_pool.md` the judge reads — failing closed on any invalid candidate.
 - **Grand loops** add `joust-implementer` (the only repo-writer) and `bin/je-git.sh` (all git/gh); the tournament engine itself stays repo-pure.
