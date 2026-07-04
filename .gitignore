@@ -8,9 +8,9 @@ node_modules/
 __pycache__/
 *.pyc
 
-# Claude Code transient / local
-.claude/worktrees/
-.claude/settings.local.json
+# Claude Code transient / local — the whole dir: it also holds private local
+# notes (.claude/scratch-pad/) that must never reach this public repo
+.claude/
 
 # Joust Engine run scratch — NEVER committed (the dogfood inbox is the durable path)
 .runs/
