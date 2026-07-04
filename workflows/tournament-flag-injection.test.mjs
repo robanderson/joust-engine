@@ -87,5 +87,44 @@ for (const m of BENIGN) {
 check(`(b') empty string rejected`, validModelId('') === false && localFlagFor('') === null)
 check(`(b') undefined rejected`, validModelId(undefined) === false && localFlagFor(undefined) === null)
 
+// (c) Guard SCOPE regression: the guard must only fire on paths that actually interpolate
+// a.model into a shell flag. The original unconditional guard dropped every DOCUMENTED glm
+// attempt (the ARGS shape carries no `model` for glm — GLM_FLAG is keyed by displayModel), so
+// validModelId(undefined) silently zeroed the glm field at dispatch. Extract the shipped
+// interpolatesModelId() + flag maps and assert docs-shaped attempts survive while every
+// genuinely-interpolating path still fails closed on a hostile id.
+function extractConstBlock(src, name) {
+  const start = src.indexOf(`const ${name} = {`)
+  if (start < 0) throw new Error(`could not find const ${name} in tournament.mjs`)
+  const end = src.indexOf('}', start)
+  return src.slice(start, end + 1)
+}
+// eslint-disable-next-line no-eval
+const interpolatesModelId = (0, eval)(
+  `${extractConstBlock(SRC, 'CODEX_FLAG')}; ${extractConstBlock(SRC, 'GROK_FLAG')}; ` +
+  `${extractFn(SRC, 'interpolatesModelId')}; interpolatesModelId`)
+// dispatch()'s shipped guard, verbatim shape: drop iff the path interpolates AND the id is unsafe.
+const dropped = a => interpolatesModelId(a) && !validModelId(a.model)
+
+const EVIL = 'x; rm -rf /'
+check(`(c) docs-shaped glm attempt (no model) is NOT dropped`,
+  dropped({ dispatch: 'glm', displayModel: 'glm-5.2' }) === false)
+check(`(c) minimax attempt (no model, env-pinned) is NOT dropped`,
+  dropped({ dispatch: 'minimax', displayModel: 'minimax-m3' }) === false)
+check(`(c) codex with mapped displayModel (no interpolation) is NOT dropped`,
+  dropped({ dispatch: 'codex', displayModel: 'codex-high', model: 'gpt-5.5' }) === false)
+check(`(c) grok with mapped displayModel (no interpolation) is NOT dropped`,
+  dropped({ dispatch: 'grok', displayModel: 'grok-build' }) === false)
+check(`(c) codex FALLBACK (unmapped displayModel) still fails closed on a hostile model`,
+  dropped({ dispatch: 'codex', displayModel: 'codex-custom', model: EVIL }) === true)
+check(`(c) grok FALLBACK (unmapped displayModel) still fails closed on a hostile model`,
+  dropped({ dispatch: 'grok', displayModel: 'grok-custom', model: EVIL }) === true)
+check(`(c) local always interpolates: hostile id still dropped`,
+  dropped({ dispatch: 'local', displayModel: EVIL, model: EVIL }) === true)
+check(`(c) local with missing model still dropped (fail closed)`,
+  dropped({ dispatch: 'local', displayModel: 'x' }) === true)
+check(`(c) anthropic with a normal model is NOT dropped`,
+  dropped({ dispatch: undefined, model: 'opus', displayModel: 'opus' }) === false)
+
 console.log(failed ? `\n${failed} check(s) FAILED` : '\nAll checks passed')
 process.exit(failed ? 1 : 0)

@@ -1,0 +1,63 @@
+name: publish @@DE dev marketplace
+
+# On push, dynamically generate the renamed "@@DE Development Engine" plugin and publish it
+# to the PRIVATE claude/joust-engine-dev repo, which every workstation adds as a Claude Code
+# marketplace. The rebrand self-verifies (runs the generated tree's own tests) BEFORE any push,
+# so a broken transform fails the job and ships nothing. Canonical main never carries dev names,
+# so GitHub promotion is unaffected. Lives in .gitea/ so GitHub never runs it.
+#
+# The dev marketplace reflects your MOST RECENTLY PUSHED branch (see the branches filter below —
+# restrict to [main] or a dedicated [dev] branch if you prefer, or trigger a specific branch on
+# demand via workflow_dispatch). Requires a Gitea Actions secret DEV_MARKETPLACE_TOKEN: an access
+# token owned by `claude` with write:repository on claude/joust-engine-dev.
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to rebrand & publish (blank = the pushed/default ref)"
+        required: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest          # the gitea-act-runner label
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Configure git identity (je-git.test.sh creates temp repos & commits)
+        run: |
+          git config --global user.name  "ci-rebrand"
+          git config --global user.email "ci-rebrand@git.1hut.com"
+          git config --global init.defaultBranch main
+
+      - name: Rebrand + self-verify (fails the publish if the transform is incoherent)
+        env:
+          DEV_BUILD_NUMBER: ${{ github.run_number }}   # sequential -> published version 0.0.1-dev.<N>
+        run: node bin/rebrand.mjs --out /tmp/dev-marketplace
+
+      - name: Publish generated tree -> claude/joust-engine-dev (force)
+        env:
+          DEV_MARKETPLACE_TOKEN: ${{ secrets.DEV_MARKETPLACE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${DEV_MARKETPLACE_TOKEN:-}" ] || { echo "::error::DEV_MARKETPLACE_TOKEN secret not set"; exit 1; }
+          echo "::add-mask::${DEV_MARKETPLACE_TOKEN}"
+          cd /tmp/dev-marketplace
+          rm -rf .gitea .github            # the dev repo is a marketplace host, not a CI target
+          git init -q
+          git config user.name  "dev-marketplace-bot"
+          git config user.email "dev-marketplace-bot@git.1hut.com"
+          # Token via an auth header so it never lands in the remote URL / .git/config on disk.
+          git config http.https://git.1hut.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'claude:%s' "$DEV_MARKETPLACE_TOKEN" | base64 | tr -d '\n')"
+          git remote add devmkt https://git.1hut.com/claude/joust-engine-dev.git
+          git add -A
+          git commit -q -m "publish @@DE dev marketplace from ${GITHUB_REF_NAME:-?}@${GITHUB_SHA:0:7}"
+          git push -f devmkt HEAD:refs/heads/main
+          echo "Published to https://git.1hut.com/claude/joust-engine-dev (branch main)"

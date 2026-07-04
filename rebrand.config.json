@@ -1,0 +1,41 @@
+{
+  "$comment": "Brand map for bin/rebrand.mjs. Generates a renamed, coexisting copy of this plugin (the '@@DE Development Engine' channel) into a gitignored out-dir. The canonical source is NEVER modified. See docs/gitea-github-pipeline.md and the plan. Replacements are LITERAL (not regex), applied IN ORDER, globally. Tokens are disjoint so order is not load-bearing, but more-specific tokens are listed first for safety.",
+  "brand": {
+    "name": "Development Engine",
+    "plugin": "development-engine",
+    "sigil": "@@DE",
+    "prose": "joustdev:"
+  },
+  "excludeDirs": [".git", ".runs", ".bench", ".dev-engine", "node_modules", ".claude"],
+  "excludeFiles": [".DS_Store"],
+  "replacements": [
+    ["joust-engine", "development-engine"],
+    ["Joust Engine", "Development Engine"],
+    ["joust-bench", "development-bench"],
+    ["@@JE", "@@DE"],
+    ["@@je", "@@de"],
+    ["joust\\s*:", "joustdev\\s*:"],
+    ["JOUST:", "JOUSTDEV:"],
+    ["Joust:", "Joustdev:"],
+    ["joust:", "joustdev:"],
+    ["JE-", "DE-"],
+    ["jewt/", "dewt/"],
+    ["jewt", "dewt"],
+    ["je-scratch", "de-scratch"],
+    ["je-worktrees", "de-worktrees"],
+    ["je-workspaces", "de-workspaces"],
+    ["JE_", "DE_"]
+  ],
+  "renameDirs": [
+    ["skills/joust-engine", "skills/development-engine"],
+    ["skills/joust-bench", "skills/development-bench"]
+  ],
+  "versionBaseFrom": ".claude-plugin/plugin.json",
+  "stampVersionIn": [".claude-plugin/plugin.json", ".claude-plugin/marketplace.json"],
+  "selfTest": [
+    ["node", "bin/je-parse.test.mjs"],
+    ["bash", "bin/je-git.test.sh"],
+    ["bash", "bin/glm-run.test.sh"],
+    ["glob", "workflows/*.test.mjs"]
+  ]
+}

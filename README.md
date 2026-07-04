@@ -4,20 +4,21 @@
 >
 > 🌐 **[joustengine.ai](https://joustengine.ai)** — *site coming soon*
 
-**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* Anthropic Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax); the judge is always Opus, held fixed so the comparison stays honest.
+**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* **5-lens deliberating Opus council** scores them, votes, and names a winner — a deterministic majority tally in code, never an LLM "summarising the consensus". The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax, xAI Grok); the judges are always Opus, held fixed so the comparison stays honest.
 
 ```text
 @@JE:5  Build a CLI that flattens nested JSON to dotted keys.
 ```
 
-That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and a blind Opus reviewer crowns a winner. Add `:2` for two passes (a guided second round), or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
+That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and the blind Opus council crowns a winner. Add `:2` for the full two-round plan phase, `implement` for the implementation rounds, or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
 
 ---
 
 ## Contents
 
 - [The core idea](#the-core-idea)
-- [Single pass vs two pass](#single-pass-vs-two-pass)
+- [The rounds: plan, then implement](#the-rounds-plan-then-implement)
+- [The judging council](#the-judging-council)
 - [Invoking it: the sigil and prose forms](#invoking-it-the-sigil-and-prose-forms)
   - [The `@@JE` sigil](#the-je-sigil)
   - [Task size (dynamic limits)](#task-size-dynamic-limits)
@@ -42,46 +43,64 @@ A single LLM attempt at a task is one sample from a noisy distribution. The Jous
 
 1. **Generate, don't iterate.** Run **N attempts in parallel**, each a *single-pass exploration* — every attempt writes its solution **once and stops**. No attempt is told it's competing or being judged; none sees another's work. The refinement happens at the *tournament* level (many diverse one-shots → review), never inside a single attempt grinding "until it works." A rough or even failed attempt is useful signal, not a wasted slot.
 
-2. **Judge blind, with a fixed strong judge.** One **Anthropic Opus reviewer** receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. It reads (and where feasible runs) each one, scores against task-appropriate criteria, lists concrete pros and cons, ranks them, and names a winner with reasoning. Because the judge never learns which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
+2. **Judge blind, with fixed strong judges.** A blind **Opus council** (five lens judges; see below) receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. Each judge reads (and where feasible runs) each one, scores it through its lens, lists concrete pros and cons, ranks them, and casts a first-place vote; code tallies the majority. Because the judges never learn which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
 
 The attempts are deliberately *diverse*: different model families, sampling stochasticity, and a per-attempt framing nudge ([diversity injection](#diversity-injection-pool-a--pool-b)) all push the N solutions apart so the review has genuinely different things to compare.
 
 ---
 
-## Single pass vs two pass
+## The rounds: plan, then implement
 
-The two modes share one spine. **Two pass is single pass plus a learning step in the middle.**
+The tournament is a **cheap, wide planning phase** (always) followed by an **optional, narrow implementation phase** — high-N diversity where artifacts are cheap to produce and judge, a small strong pool where they are expensive (`docs/superpowers/specs/2026-07-03-plan-implement-rounds-design.md`):
 
-| Phase | Single pass | Two pass |
-|---|---|---|
-| Round 1 attempts | N parallel, isolated, one diversity nudge each | identical |
-| Blind Opus review | scores, ranks, names winner → **this is the result** | scores, ranks, names round-1 winner **and distils guidance** |
-| Carry / discard | — | **save** the winner's deliverable; **discard** every other artifact, keep only the distilled lessons |
-| Round 2 attempts | — | N **fresh** attempts given the task + guidance (positives to emulate, pitfalls to avoid) — but **never** round-1 code |
-| Final rank | — | pool = N round-2 attempts **+ the saved round-1 winner** (N+1), re-labelled blind, one Opus ranker picks overall winner |
-
-The distilled guidance is two short lists — *positives to consider* and *challenges to avoid* — phrased as generic principles, each tagged `[strong]` (held up repeatedly) or `[tentative]` (a single sighting), with no candidate-specific code.
-
-**Why two pass discards the losing code but keeps the lessons:** re-using a winner's code would make round 2 copy it and collapse the diversity that makes the loop work. Re-using the *distilled* pros and cons keeps diversity while raising the floor. The saved round-1 champion then competes blind in the final pool on the merits — it produced no worse work for not having seen the guidance, and if a guided round-2 attempt is genuinely better, it should win.
+| Round | Runs | What happens | Pool default |
+|---|---|---|---|
+| **Plan Round 1** | always | N parallel, isolated plan attempts, one diversity nudge each → the blind plan-lens council reviews, votes a round-1 winner, **and distils guidance** | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
+| **Plan Round 2** | always (two-pass; `:1` stops after Round 1) | winner's plan **saved**, every other artifact discarded; N **fresh** attempts get the task + guidance (never round-1 content); final pool = N + the carried winner, re-labelled blind → the council ranks and elects the **winning plan** | same pool, fresh nudges |
+| **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning plan verbatim** (a deliberate exception to "never seed prior artifacts" — the plan *is* the specification); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
+| **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate (no council majority, all vetoed, or verify failure) | M fresh implementers, guided by the R3 review; still no consensus → **needs-human**, never a silently-picked winner | same pool |
 
 ```text
-SINGLE PASS
-  task ──▶ [N attempts] ──▶ blind Opus review ──▶ winner ✓
+PLAN (always)
+  task ──▶ [N plan attempts] ──▶ plan council ──┬▶ distil guidance ─┐
+                                                └▶ save winner ──┐  │
+                                                                 │  ▼
+           [N fresh plan attempts + guidance] ◀──────────────────┼──┘
+                             │                                   │
+                             ▼                                   │
+           final plan pool = N round-2 + saved winner ◀──────────┘
+                             │
+                             ▼
+                  plan council rank ──▶ WINNING PLAN ✓        (no implement flag → done)
 
-TWO PASS
-  task ──▶ [N attempts] ──▶ blind Opus review ──┬─▶ distil guidance ─┐
-                                                └─▶ save winner ──┐  │
-                                                                  │  ▼
-            [N fresh attempts + task + guidance] ◀────────────────┼──┘
-                              │                                   │
-                              ▼                                   │
-            final pool = N round-2 + saved winner ◀───────────────┘
-                              │
-                              ▼
-            blind Opus final rank ──▶ overall winner ✓
+IMPLEMENT (only with the `implement` keyword)
+  winning plan ──▶ [M implementers, plan seeded verbatim] ──▶ code council + gate ──▶ winner ✓
+                                                                    │ gate fails
+                                                                    ▼
+                   [M fresh implementers + R3 guidance] ──▶ code council + gate ──▶ winner ✓ / needs-human
 ```
 
-Two pass roughly **doubles** the attempt count (≈ 2N attempts + 2 Opus passes), so it costs about double single pass. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+The distilled guidance is two short lists — *positives to consider* and *challenges to avoid* — phrased as generic principles, each tagged `[strong]` (held up repeatedly) or `[tentative]` (a single sighting), with no candidate-specific content.
+
+**Why round 2 discards the losing plans but keeps the lessons:** re-using a winner's content would make round 2 copy it and collapse the diversity that makes the loop work. Re-using the *distilled* pros and cons keeps diversity while raising the floor. The carried round-1 champion competes blind in the final pool on the merits — if a guided round-2 plan is genuinely better, it wins.
+
+Three guard rails: a plan-phase `NO_CONSENSUS` stops the run **before any implementation spend** (the split is surfaced for you to resolve); the R3→R4 fallback is **bounded** (one retry, then needs-human); and phase-scoped prose specs pick the pools inline — `Plan: 2 opus, 2 sonnet, 1 glm 5.2 Implement: 2 opus, 1 codex high implement @@JE:5:2` — with the `implement` keyword recognised only marker-adjacent, so prose like "implement a CSV parser" never false-triggers rounds 3–4.
+
+Cost scales with what you enable: plan-only two pass ≈ 2N attempts + 2 council judging points; `implement` adds M (+M on an R4 retry) and a third judging point. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+
+---
+
+## The judging council
+
+Every judging point (the round-1 review and the final rank) is, by default, a **council of five blind Opus judges**, one lens each — **correctness/verification** (runs the code, cites real exit codes), **spec-compliance**, **security** (holds the veto), **robustness/edge-cases**, and **craft/efficiency**. All five are blind to model identities and must ground every verdict in a required `checks_run` evidence list.
+
+- **Round 1 is independent** — no judge sees a peer. Then the tally runs **in code**: a candidate wins with **>50% of living judges' first-place votes**, and a candidate the security judge flags `UNSAFE` (high/critical severity **with concrete evidence**) cannot win regardless of votes.
+- **No majority → bounded deliberation** (max 3 rounds): each judge sees the peers' verbatim verdicts, may run 1–2 targeted checks to settle a factual dispute, and revises. Peers can rebut a veto with evidence; a standing veto excludes the candidate.
+- **Still split → `NO_CONSENSUS`** — surfaced to you (or needs-human + HALT in a grand loop). It is never silently resolved by a score average, Borda, or a meta-judge.
+- A **verdict-integrity guard** rejects schema-valid-but-junk verdicts (placeholder reasoning, collapsed pros/cons, vacuous veto evidence) at every choke point, so a degenerate judge output dies and retries instead of steering the run.
+- `judges: 1` restores the legacy single blind Opus judge (cheap runs).
+
+The design follows the LLM-as-judge research in [issue #22](https://github.com/robanderson/joust-engine/issues/22) and `docs/superpowers/specs/2026-07-02-judge-council-design.md`: diverse lenses over one generalist, independent votes before cross-talk, aggregation in code, evidence-forcing, and fail-closed no-consensus routing.
 
 ---
 
@@ -205,7 +224,7 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 
 ## Model providers
 
-Attempts can run on five providers. The **reviewer and final ranker are always Anthropic Opus**, dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
+Attempts can run on six providers. The **reviewers and final rankers are always Anthropic Opus** (the 5-lens council, or the `judges:1` single judge), dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
 
 | Provider | Models (selectable axis) | Dispatch | Auth (from the **environment**) |
 |---|---|---|---|
@@ -283,7 +302,7 @@ bin/je-issue.sh claim <N> <run-id>                             # best-effort cla
 - **PUBLIC repo:** never paste secrets or the `mapping.json` unblinding line — refer to a candidate as "blind B," not the model (the helper has refusal greps for both).
 - **Claiming is best-effort, not a mutex:** the GitHub API has no compare-and-swap, so `claim` is a TOCTOU read-after-write with a deterministic tiebreak; a git-ref push under `refs/dogfood-claims/` is the strict escape hatch for high fan-out / grand loops.
 - **No `gh` / offline?** `new` degrades to a committed draft under `docs/dogfood/inbox/` (never `.runs/`); re-file later with `drain-inbox`.
-- Legacy `D-NNNN` items live read-only under `docs/dogfood/archive/`.
+- Legacy `D-NNNN` items were imported as **closed `dogfood` issues** (full evidence in each body); there is no in-repo archive.
 
 ---
 
@@ -397,7 +416,8 @@ joust-engine/
 │   ├── joust-implementer.md       # (grand loops) Opus; applies the winner to the real repo
 │   └── joust-cleanup.md           # (on request) Opus; ASK-FIRST disk reclaim via bin/je-git.sh je_cleanup
 ├── workflows/
-│   └── tournament.mjs                  # the dynamic-workflow engine: attempts → blind review → (two pass) round 2 → final rank
+│   ├── tournament.mjs                  # the dynamic-workflow engine: plan rounds → council review → (implement) rounds 3-4 → council rank
+│   └── tournament-*.test.mjs           # engine test suite (worktree mode, workspace root, verdict integrity, contributions, ...)
 ├── bin/                                # runners + helpers (run with node / bash)
 │   ├── je-parse.mjs                    # Phase 0 invocation parser (sigil, prose spec, Top Mixed, Z, task size)
 │   ├── je-git.sh                       # ALL git/gh side effects for grand loops (preflight, branch, verify, PR, markers, cleanup)
@@ -410,7 +430,7 @@ joust-engine/
 │   ├── je-bench.mjs                    # the throughput benchmark
 │   └── README.je-bench.md              # je-bench usage + results-format reference
 ├── docs/
-│   ├── dogfood/archive/                # read-only legacy D-NNNN evidence
+│   ├── superpowers/specs/              # approved design specs (judge council, plan/implement rounds)
 │   └── dogfood/inbox/                  # committed offline drafts (no-gh fallback)
 └── .bench/results.jsonl                # append-only je-bench history
 ```
@@ -418,7 +438,7 @@ joust-engine/
 **How the pieces fit together at run time:**
 
 - **SKILL.md is the driver.** On a trigger it runs `bin/je-parse.mjs` (Phase 0), the mandatory model gate (Phase 1), diversity injection (Phase 1b), then dispatches.
-- **`workflows/tournament.mjs` is the preferred backend.** Invoked via the `Workflow` tool, it runs the parallel attempts, the blind Opus review, and (two pass) round 2 + final rank deterministically — watchable live in `/workflows`. It returns the structured mapping + rankings the skill reports in Phase 6. (Fallback when workflows are unavailable: manual Task-tool + `glm` CLI dispatch.)
+- **`workflows/tournament.mjs` is the preferred backend.** Invoked via the `Workflow` tool, it runs the parallel attempts, the blind Opus council reviews, and (two pass) round 2 + final rank — plus the optional implement rounds — deterministically — watchable live in `/workflows`. It returns the structured mapping + rankings the skill reports in Phase 6. (Fallback when workflows are unavailable: manual Task-tool + `glm` CLI dispatch.)
 - **Agents are thin command-runners.** Anthropic attempts run native via the Task tool. Each non-Anthropic attempt runs through its wrapper agent (a cheap Bash-only driver) executing the matching `bin/*-run.sh` — the script sets provider env, closes stdin, calls the nested `claude`/`codex`, and writes the provenance marker. This indirection exists because a wrapper handed a *raw* nested command proved unreliable (it would solve the task itself, refuse on "safety," or let the weak inner model bail without saving); it matters most for **codex**, a fully autonomous external agent.
 - **The judge is fixed.** Reviewer and final ranker are always Opus via the Task tool. Before judging, the engine **stages** each deliverable into a clean blind tree (copying files and deleting the known engine files — `_brief.txt`, the run logs — by exact name, an *allowlist* that keeps legitimately `_`-prefixed deliverables), **validates** the success provenance contract, and **pools** the valid deliverables into one blind-labelled `_pool.md` the judge reads — failing closed on any invalid candidate.
 - **Grand loops** add `joust-implementer` (the only repo-writer) and `bin/je-git.sh` (all git/gh); the tournament engine itself stays repo-pure.

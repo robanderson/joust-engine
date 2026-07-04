@@ -112,6 +112,24 @@ const NORMALISER = {
 // Top Mixed preset pool, in remainder-priority order.
 const TOP_MIXED_POOL = ['opus', 'glm-5.2', 'codex-high'];
 
+// ---------------------------------------------------------------------------
+// Plan/Implement round split (2026-07-03 design).
+// The tournament is split into a cheap, wide PLAN phase (rounds 1 & 2, always)
+// and an optional narrow IMPLEMENT phase (rounds 3 & 4, only with the implement
+// flag). Each phase draws from its own default pool; a phase-scoped prose spec
+// ('Plan: 2 opus, ..., Implement: 2 opus, ...') overrides the relevant pool.
+//   - PLAN_DEFAULT_POOL   : wide, diverse — plans are cheap to produce/judge (N=10).
+//   - IMPLEMENT_DEFAULT_POOL : small, strong — code is expensive (M=5).
+// The plan pool sum is the tournament N (attempts per plan round); the implement
+// pool sum is M (implementers in round 3/4). Both are capped by N_MAX.
+const PLAN_DEFAULT_POOL = [
+  'opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'codex-high',
+  'glm-5.2', 'glm-5.2', 'minimax-m3', 'minimax-m3',
+];
+// 2026-07-03: sonnet joined the implement pool (Sonnet 5 = newer base, better value; Rob wants
+// opus >= 2 AND sonnet >= 2), trading one codex-high seat to keep M lean.
+const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'glm-5.2'];
+
 // Recognised model token alternatives for the SPEC scan. These match the
 // HEAD of an item (after the count); the normaliser then validates exactly.
 // Order matters: longer / more-specific patterns first so we capture the full
@@ -194,6 +212,29 @@ const NO_REPO_BEFORE_RX = /(?:--no-repo|self[\s-]?contained)\b[\s:,-]*$/i;
 const SIZE_AFTER_RX  = /^[\s:,-]*\b(short|medium|long)\b(?=\s*(?:[,;]|$))/i;
 const SIZE_BEFORE_RX = /\b(short|medium|long)\b[\s:,-]*$/i;
 
+// Marker-adjacent 'implement' keyword (plan/implement round split). It enables the
+// implement rounds (3–4) without a phase-scoped Implement: spec. Like the pass /
+// repo-mode / size keywords it is recognised ONLY immediately adjacent to the marker
+// and stripped at THAT side (the D-0006 discipline), so an ordinary 'implement …' in
+// the task body ('implement a CSV parser') is NEVER misread as a directive and never
+// eaten from the task. The AFTER form additionally needs a clause boundary (comma /
+// semicolon / end) right after the word, so only a deliberately set-off '@@JE implement,
+// <task>' or '@@JE:5 implement' matches — '@@JE implement a parser' does NOT.
+//   AFTER  : immediately follows the marker, then a clause boundary (, ; eol)
+//   BEFORE : immediately precedes the marker
+const IMPLEMENT_AFTER_RX  = /^[\s:,-]*\bimplement\b(?=\s*(?:[,;]|$))/i;
+const IMPLEMENT_BEFORE_RX = /\bimplement\b[\s:,-]*$/i;
+
+// Phase-scoped prose model specs. 'Plan: <spec>' / 'Implement: <spec>' segment
+// labels let the user set a distinct pool per phase, e.g.
+//   'Plan: 2 opus, 2 sonnet, 2 codex high, Implement: 2 opus, 2 codex high'.
+// A non-empty Implement: segment ALSO enables the implement rounds (like the keyword).
+// These are explicit, distinctive labels (a capitalised word + colon), so — unlike the
+// bare 'implement' keyword — they are recognised ANYWHERE in the message; the label
+// words and their spec chains are stripped from the task by stripAll().
+const PLAN_LABEL_RX      = /\bplan\s*:/i;
+const IMPLEMENT_LABEL_RX = /\bimplement\s*:/i;
+
 // ---------------------------------------------------------------------------
 // Task-size limit profiles (single source of truth for the dynamic limits).
 //
@@ -211,6 +252,7 @@ const SIZE_BEFORE_RX = /\b(short|medium|long)\b[\s:,-]*$/i;
 //   glmTimeoutSecs  : GLM-only wall-clock (GLM via z.ai is slow on heavy code)
 //   codexTimeoutSecs: Codex-only wall-clock (codex has NO turn cap -> wall clock only)
 //   grokTimeoutSecs : Grok-only wall-clock
+//   minimaxTimeoutSecs : MiniMax-only wall-clock (M3 is slow on real code; issue #30)
 // ---------------------------------------------------------------------------
 const SIZE_PROFILES = {
   short: {
@@ -222,6 +264,7 @@ const SIZE_PROFILES = {
     glmTimeoutSecs: 600,
     codexTimeoutSecs: 300,
     grokTimeoutSecs: 300,
+    minimaxTimeoutSecs: 300,
   },
   medium: { // == today's engine defaults (with a roomier GLM wall-clock, which is slow)
     attemptMaxTurns: 30,
@@ -232,6 +275,7 @@ const SIZE_PROFILES = {
     glmTimeoutSecs: 1200,
     codexTimeoutSecs: 600,
     grokTimeoutSecs: 600,
+    minimaxTimeoutSecs: 900, // issue #30: both M3 seats blew the shared 300s on a real medium task
   },
   long: {
     attemptMaxTurns: 50,
@@ -242,6 +286,7 @@ const SIZE_PROFILES = {
     glmTimeoutSecs: 2400,
     codexTimeoutSecs: 1200,
     grokTimeoutSecs: 1200,
+    minimaxTimeoutSecs: 1800,
   },
 };
 
@@ -427,6 +472,57 @@ function topMixedAssignment(n) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase-scoped prose model specs ('Plan: ...' / 'Implement: ...').
+// ---------------------------------------------------------------------------
+// Slice the message into the Plan and Implement label segments, run the existing
+// spec grammar (expandSpec via locateSpec) on each, and return the per-phase
+// expansion. Returns null when neither label is present (the caller then uses the
+// single-pool / default path). Each label's segment runs from just after its own
+// label to the start of the OTHER label (whichever comes later) or end-of-message,
+// so a Plan pool never bleeds into the Implement pool.
+function extractPhaseSpecs(msg) {
+  const planLbl = PLAN_LABEL_RX.exec(msg);
+  const implLbl = IMPLEMENT_LABEL_RX.exec(msg);
+  if (!planLbl && !implLbl) return null;
+
+  // Ordered boundaries so each segment ends where the next label starts.
+  const marks = [];
+  if (planLbl) marks.push({ name: 'plan', start: planLbl.index, end: planLbl.index + planLbl[0].length });
+  if (implLbl) marks.push({ name: 'implement', start: implLbl.index, end: implLbl.index + implLbl[0].length });
+  marks.sort((a, b) => a.start - b.start);
+
+  const out = { plan: null, implement: null };
+  for (let i = 0; i < marks.length; i++) {
+    const seg = msg.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].start : msg.length);
+    const loc = locateSpec(seg);
+    // Collect unknown-but-spec-ish tokens so a typo in a phase spell-out errors LOUDLY
+    // (never silently drops a token → never silently changes N): the connector/comma-
+    // licensed unknowns the recognised scan misses, plus a leading '<count> <token>' item
+    // (a phase segment's first item is definitionally a spec item, right after the label).
+    const unk = phaseSegmentUnknowns(seg);
+    // An Implement: label with no model spell-out is still a signal to enable the
+    // implement rounds (defaults fill the pool); record an empty expansion for it.
+    const exp = loc.found ? expandSpec(loc.raw) : { assignment: [], count: 0, unknowns: [], overflows: [], any: false };
+    for (const u of unk) if (!exp.unknowns.includes(u)) exp.unknowns.push(u);
+    out[marks[i].name] = exp;
+  }
+  return out;
+}
+
+// Spec-ish UNKNOWN tokens in one phase segment: comma/and/connector-licensed ones
+// (existing semantics) plus the segment's leading '<count> <token>' item. A token that
+// normalises to a known model is NOT an unknown.
+function phaseSegmentUnknowns(seg) {
+  const unk = [];
+  for (const h of locateUnknownNearConnector(seg)) {
+    if (!normaliseModel(h.tok) && !unk.includes(h.tok)) unk.push(h.tok);
+  }
+  const lead = /^\s*(\d+)x?\s+([a-z][\w.+-]*)/i.exec(seg);
+  if (lead && !normaliseModel(lead[2]) && !unk.includes(lead[2])) unk.push(lead[2]);
+  return unk;
+}
+
+// ---------------------------------------------------------------------------
 // Main parse.
 // ---------------------------------------------------------------------------
 function parse(rawInput) {
@@ -440,6 +536,13 @@ function parse(rawInput) {
     repoMode: false, // P0 (plan §4): false => today's self-contained tournament unchanged
     baseRef: null,   // P0: resolved to a pinned sha by the SKILL; the parser records null
     size: null,      // manual task-size override (short|medium|long); null => SKILL estimates
+    // Plan/Implement round split (2026-07-03). `implement` gates rounds 3–4;
+    // planAssignment is the plan-phase pool (== assignment, kept for clarity);
+    // implementAssignment is the implement-phase pool (rounds 3–4), null when
+    // implement is off.
+    implement: false,
+    planAssignment: null,
+    implementAssignment: null,
   };
   const errors = [];
   const oversizedNs = new Set();
@@ -594,6 +697,16 @@ function parse(rawInput) {
     else preMarker = preMarker.replace(SIZE_BEFORE_RX, ' ');
   }
 
+  // --- 4d. Implement keyword (marker-adjacent; plan/implement round split). ---
+  // Enables the implement rounds (3–4). Stripped at its source side (same D-0006
+  // discipline as the pass / repo / size keywords) so an ordinary 'implement …' in the
+  // task body is left intact. A phase-scoped 'Implement:' spec ALSO enables the
+  // rounds and is resolved in section 7 (`implementEnabled` there ORs both signals).
+  let implementKw = false;
+  const imAfter = IMPLEMENT_AFTER_RX.exec(postMarker);
+  if (imAfter) { implementKw = true; postMarker = postMarker.replace(IMPLEMENT_AFTER_RX, ' '); }
+  else if (IMPLEMENT_BEFORE_RX.test(preMarker)) { implementKw = true; preMarker = preMarker.replace(IMPLEMENT_BEFORE_RX, ' '); }
+
   // Task = both sides of the marker (D-0007), with the adjacent pass directive (if
   // any) already removed; stripAll() removes the spec / keywords / other directives.
   let task = preMarker + ' ' + postMarker;
@@ -714,7 +827,52 @@ function parse(rawInput) {
   // Connector-licensed unknown tokens (loud rejection of typos).
   const unknownHits = locateUnknownNearConnector(scanMsg);
 
-  if (topMixedPresent) {
+  // --- 7a. Phase-scoped specs + implement flag (plan/implement round split). ---
+  // Phase labels ('Plan:' / 'Implement:') split the pool per phase; a phase branch
+  // below takes precedence over the single-pool Top-Mixed/spec path. The implement
+  // rounds turn on from the marker-adjacent `implement` keyword OR a present
+  // 'Implement:' label. Omitted pools fall back to the design defaults.
+  const phaseSpecs = extractPhaseSpecs(scanMsg);
+  const implementEnabled = implementKw || (phaseSpecs && phaseSpecs.implement !== null);
+  result.implement = !!implementEnabled;
+  // Resolve the implement-phase pool (rounds 3–4). Explicit Implement: spec wins;
+  // otherwise, when the implement rounds are on, the small strong default pool fills it.
+  let implementAssignment = null;
+  const implExp = phaseSpecs && phaseSpecs.implement;
+  if (implExp && (implExp.any || implExp.unknowns.length || implExp.overflows.length)) {
+    if (implExp.overflows.length) { for (const o of implExp.overflows) pushNMaxError(o.total); }
+    else if (implExp.unknowns.length) {
+      errors.push('Unrecognised model token(s) in Implement: spec: ' +
+        implExp.unknowns.map(u => '"' + u + '"').join(', ') + '. Re-state the spec.');
+    } else {
+      implementAssignment = implExp.assignment;
+    }
+  } else if (implementEnabled) {
+    implementAssignment = IMPLEMENT_DEFAULT_POOL.slice();
+  }
+  result.implementAssignment = implementAssignment;
+
+  if (phaseSpecs) {
+    // Phase-scoped path: the PLAN pool drives assignment + nSpec (the per-round N).
+    // Explicit Plan: spec wins; an omitted Plan pool falls back to the wide default.
+    preset = null;
+    const planExp = phaseSpecs.plan;
+    if (planExp && (planExp.any || planExp.unknowns.length || planExp.overflows.length)) {
+      if (planExp.overflows.length) {
+        for (const o of planExp.overflows) pushNMaxError(o.total);
+        assignment = null; nSpec = null;
+      } else if (planExp.unknowns.length) {
+        errors.push('Unrecognised model token(s) in Plan: spec: ' +
+          planExp.unknowns.map(u => '"' + u + '"').join(', ') + '. Re-state the spec (a dropped token would silently change N).');
+        assignment = null; nSpec = null;
+      } else {
+        assignment = planExp.assignment; nSpec = planExp.count;
+      }
+    } else {
+      // No explicit Plan pool -> the wide default (N=10).
+      assignment = PLAN_DEFAULT_POOL.slice(); nSpec = PLAN_DEFAULT_POOL.length;
+    }
+  } else if (topMixedPresent) {
     preset = 'top-mixed';
     // N for top mixed: leading count, else sigil/marker N.
     let tmN = topMixedLeadCount != null ? topMixedLeadCount : nMarker;
@@ -829,6 +987,7 @@ function parse(rawInput) {
 
   result.n = n;
   result.assignment = assignment;
+  result.planAssignment = assignment; // the plan pool IS the per-round attempt set
   if (preset) result.preset = preset;
 
   // --- 10. Build the task text (strip marker + spec + top-mixed keyword). ---
@@ -842,6 +1001,8 @@ function parse(rawInput) {
     result.errors = errors;
     result.n = null;
     result.assignment = null;
+    result.planAssignment = null;
+    result.implementAssignment = null;
   }
 
   return result;
@@ -873,6 +1034,11 @@ function stripAll(preMarkerTask, spec, fullMsg, marker) {
 
   // Remove top-mixed phrases (with optional leading count) from the task.
   t = t.replace(/(\d+\s*)?top[\s-]*mix(?:ed)?/ig, ' ');
+
+  // Remove phase-scoped spec labels ('Plan:' / 'Implement:') — the directive markers
+  // for the plan/implement round split. The model chains that followed each label are
+  // stripped by the chain regex below; only the bare labels need removing here.
+  t = t.replace(/\bplan\s*:/ig, ' ').replace(/\bimplement\s*:/ig, ' ');
 
   // Remove recognised model-spec chains from the task. Re-run the chain regex on
   // the task text (the spec may sit on EITHER side of the marker — D-0007).
@@ -910,9 +1076,12 @@ export {
   topMixedAssignment,
   expandSpec,
   locateSpec,
+  extractPhaseSpecs,
   sizeProfile,
   NORMALISER,
   TOP_MIXED_POOL,
+  PLAN_DEFAULT_POOL,
+  IMPLEMENT_DEFAULT_POOL,
   SIZE_PROFILES,
   Z_MAX,
   N_MAX,

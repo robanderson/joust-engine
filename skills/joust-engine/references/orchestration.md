@@ -13,7 +13,7 @@ The Phase 1 selection maps to these. There are two families with two different d
 | Choice  | Alias    | API model string     | Role                        |
 |---------|----------|----------------------|-----------------------------|
 | Opus    | `opus`   | `claude-opus-4-8`    | attempt, review, or rank    |
-| Sonnet  | `sonnet` | `claude-sonnet-4-6`  | attempt                     |
+| Sonnet  | `sonnet` | `claude-sonnet-5`    | attempt                     |
 | Haiku   | `haiku`  | `claude-haiku-4-5`   | attempt                     |
 
 **GLM models (z.ai)** — dispatched by shelling out to the `glm` CLI (see "Dispatching GLM attempts" below). `glm` is the `claude` CLI pointed at z.ai's Anthropic-compatible endpoint; it is selected through `glm`'s `--model` flag, which is **not** the same as a GLM model name. Use this exact mapping:
@@ -35,7 +35,7 @@ The `--model opus/sonnet/haiku` aliases resolve to GLM models only because the `
 
 **Grok models (xAI, via the `grok` headless CLI)** — dispatched by shelling out to `grok -p` through `bin/grok-run.sh`. TWO variants on a **`-m` model axis**: `grok-build` (xAI's own agentic-coding model; `grok-code-fast-1` is an alias; 256K context) and `grok-composer-2.5-fast` (Cursor Composer 2.5, Kimi K2.5 lineage; the CLI default). The `displayModel` **is** the dispatch key: `GROK_FLAG[displayModel]` → `-m <id>`. Auth is the operator's grok.com **OAuth session** (`~/.grok/auth.json`, `auth_mode=oidc`); `XAI_API_KEY` (prefix `xai-`) is the headless/CI fallback — the runner injects **neither** and requires **neither** (grok resolves its own credential, exactly like codex reads `~/.codex/auth.json`, so — unlike glm/minimax — it does NOT hard-fail on a missing env key). Default inference flows over `cli-chat-proxy.grok.com` (NOT `api.x.ai`). **One generic worker agent (`joust-grok`) handles both variants**; the provenance marker is `JOUST-GROK-PROVENANCE endpoint=cli-chat-proxy.grok.com` in `_grok_run.log`. Unlike codex, grok **HAS `--max-turns`**, so it uses **both** per-attempt guards (`grokMaxTurns`, default 30, via `JE_MAX_TURNS`; `grokTimeoutSecs`, default 600, via `JE_TIMEOUT_SECS`) through the standard `runnerCmd`. Grok bills the operator's SuperGrok / X Premium+ plan.
 
-The Phase 3 reviewer (single pass and two pass) and the final ranker (Phase 5, two pass only) are **always Anthropic Opus**, dispatched via the Task tool — never GLM. Holding the judge fixed keeps scoring consistent across attempts and across rounds.
+The Phase 3 reviewer (single pass and two pass) and the final ranker (Phase 5, two pass only) are **always Anthropic Opus**, dispatched via the Task tool — never GLM. By default each is a **5-lens deliberating council** of blind Opus judges (see "Dispatching the Opus passes" below); `judges: 1` selects the legacy single blind Opus judge. Holding the judge model fixed on Opus keeps scoring consistent across attempts and across rounds.
 
 ## Dynamic-workflow dispatch (preferred backend)
 
@@ -52,6 +52,17 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   task: "<exact task text>",
   mode: "single" | "two",
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
+  workspaceRoot: "<absolute base dir>",  // optional: base dir for SELF-CONTAINED candidate
+                                          // workspaces (repoMode:false). Default (omit) =
+                                          // /tmp/je-workspaces/<run-id> — deliberately OUTSIDE
+                                          // the plugin cache / ~/.claude/, which nested
+                                          // claude-CLI runners (glm/minimax/codex/grok) treat
+                                          // as sensitive and refuse to write under (issue #34).
+                                          // Pass workspaceRoot: runDir to reproduce the
+                                          // pre-fix layout verbatim. Mirrors repoMode's
+                                          // worktreeRoot (issue #44); staging/review dirs,
+                                          // _engine-logs, the context bundle, and every
+                                          // persisted artifact stay under runDir either way.
   contextFiles: ["<path>", ...],         // optional: known input files all workers need (see below)
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
@@ -66,11 +77,16 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   localMaxTurns: 20,                      // LOCAL iteration cap; engine fallback 20
   minimaxMaxTurns: 30,                    // MiniMax iteration cap; engine fallback = attemptMaxTurns
   grokMaxTurns: 30,                       // Grok iteration cap; engine fallback = attemptMaxTurns (grok has BOTH guards)
-  attemptTimeoutSecs: 300,               // wall-clock backstop (local/minimax/GLM base); engine fallback 300
+  attemptTimeoutSecs: 300,               // wall-clock backstop (local/base); engine fallback 300
   glmTimeoutSecs: 2400,                  // GLM-only wall-clock (GLM is slow on heavy code); engine fallback = attemptTimeoutSecs
+  minimaxTimeoutSecs: 900,               // MiniMax-only wall-clock (M3 is slow on real code — issue #30); engine fallback = attemptTimeoutSecs
   codexTimeoutSecs: 600,                 // wall-clock backstop for Codex; engine fallback 600 (codex has no turn cap)
   grokTimeoutSecs: 600,                  // wall-clock backstop for Grok; engine fallback 600 (grok ALSO honours grokMaxTurns)
   grokWebSearch: false,                  // optional — true enables grok web search (default false = hermetic, like the other providers)
+  judges: 5,                             // optional — judging council size. DEFAULT (omit) = the 5-lens deliberating
+                                         // Opus council at both decision points. Set `1` for the LEGACY single blind
+                                         // Opus judge (byte-for-byte the pre-council behaviour). Any value other than
+                                         // 1 selects the 5-lens council (council size is fixed at 5, not tunable).
   attempts: [                            // one per attempt, length N
     { label: "candidate-1",
       dispatch: "anthropic",             // native, runs in-process
@@ -103,6 +119,21 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   ]
 }
 ```
+
+**Plan/Implement args (2026-07-03 round split).** The tournament is a **Plan phase** (Plan Round 1 + Plan Round 2, always — plans are cheap to produce/judge) plus an optional **Implement phase** (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate). `attempts` seat the plan rounds; two extra args seat the implement rounds:
+
+```
+  implement: true,                        // optional (default false). Enables Implement Round 3 (+ 4).
+                                          // The parser sets it from the `implement` keyword or a
+                                          // non-empty `Implement:` phase spec.
+  implementAttempts: [ ... ],             // optional: the implement-phase pool (SAME per-attempt shape
+                                          // as `attempts`; a small strong pool). Defaults to `attempts`
+                                          // when omitted. From je-parse's `implementAssignment`.
+```
+
+- When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
+- **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
+- **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`). The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`).
 
 **Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `joust-engine:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):
 
@@ -145,8 +176,9 @@ Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns th
 | `localMaxTurns` | 12 | 20 | 35 |
 | `minimaxMaxTurns` | 15 | 30 | 50 |
 | `grokMaxTurns` | 15 | 30 | 50 |
-| `attemptTimeoutSecs` (local/MiniMax/base) | 180 | 300 | 600 |
+| `attemptTimeoutSecs` (local/base) | 180 | 300 | 600 |
 | `glmTimeoutSecs` | 600 | 1200 | 2400 |
+| `minimaxTimeoutSecs` | 300 | 900 | 1800 |
 | `codexTimeoutSecs` | 300 | 600 | 1200 |
 | `grokTimeoutSecs` | 300 | 600 | 1200 |
 
@@ -163,26 +195,42 @@ If dynamic workflows are unavailable, use the manual Task-tool + `glm`/`omlx`-CL
 
 ## Run layout
 
-One run directory, with separate round folders and isolated per-candidate workspaces. Isolation is not optional: parallel agents writing to a shared path produce race conditions and overwritten files.
+Two roots, not one. `runDir` holds round bookkeeping, staged/blind review pools, and every
+persisted artifact (mapping.json, SUMMARY*.md, review-*/, contributions.json). Each
+candidate's raw, unstaged WORKSPACE lives under a separate `workspaceRoot` — by default
+`/tmp/je-workspaces/<run-id>` (issue #34: `runDir` sits inside the plugin cache / user config
+dir, a path nested claude-CLI runners — glm/minimax/codex/grok — refuse to write under, so a
+completed runner attempt could burn its whole turn budget fighting write denials and save
+nothing). Pass `workspaceRoot: runDir` to reproduce the pre-fix single-tree layout. Isolation
+is not optional either way: parallel agents writing to a shared path produce race conditions
+and overwritten files.
 
 ```
-<plugin-root>/
-└── <run-id>/
-    ├── round-1/
-    │   ├── candidate-1/        # round 1 attempt workspaces
-    │   ├── candidate-2/
-    │   ├── ...
-    │   └── candidate-N/
-    ├── review-1/               # Phase 3 Opus reviewer workspace + report (+ guidance in two pass)
-    ├── winner/                 # (two pass) the saved round 1 winner artifact
-    ├── round-2/                # (two pass) round 2 attempt workspaces
-    │   ├── candidate-1/
-    │   ├── ...
-    │   └── candidate-N/
-    └── final-rank/             # (two pass) final Opus ranker workspace + report
+<runDir>                                  (default <plugin-root>/.runs/<run-id>)
+├── round-1/                              # round 1 candidate workspaces (repoMode:true only —
+│   ├── candidate-1/                      #   worktree checkouts under worktreeRoot instead;
+│   └── ...                               #   repoMode:false has NO round-1/ here, see below)
+├── review-1/                             # Phase 3 Opus reviewer workspace + report (+ guidance)
+├── winner/                               # (two pass) the saved round 1 winner artifact
+├── round-2/                              # (repoMode:true only, mirrors round-1/ above)
+├── final-rank/                           # (two pass) final Opus ranker workspace + report
+└── _context/                             # shared context bundle, if contextFiles was passed
+
+<workspaceRoot>                           (default /tmp/je-workspaces/<run-id>, repoMode:false only)
+├── round-1/
+│   ├── candidate-1/                      # round 1 attempt workspaces
+│   ├── candidate-2/
+│   ├── ...
+│   └── candidate-N/
+└── round-2/                              # (two pass) round 2 attempt workspaces
+    ├── candidate-1/
+    ├── ...
+    └── candidate-N/
 ```
 
-Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the result.
+Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the
+result. `repoMode:true` uses `worktreeRoot` (default `/tmp/je-worktrees/<run-id>`) for the
+same reason and in the same shape — see the repo-anchored-mode notes below.
 
 ## Dispatching the attempts
 
@@ -287,13 +335,22 @@ A quick liveness check before a big round is cheap: `glm -p "reply OK" --model h
 - **Validate**: a candidate must have saved a deliverable AND (for GLM/local/codex) its log must show the **success** provenance contract — the `PROVENANCE` marker *and* `DONE exit=0` *and* no `TIMEOUT`/`ERROR` line (merely "a `JOUST-` line exists" is not enough; the runners write those before/around failures too). The greps are **line-anchored and provider-specific** (`^JOUST-<PROV>-…`, where `<PROV>` is the candidate's own `GLM`/`LOCAL`/`CODEX`), **not** a greedy `JOUST-.*-` — a real fix: the greedy form invalidated two genuinely-successful GLM proposals because the proposals' own text discussed a `JOUST-CODEX-ERROR` marker, which got echoed mid-line into the runner log and matched. Anchoring to column 0 (where the runner writes its markers) and pinning the provider stops an attempt whose deliverable merely *mentions* a marker from false-failing. The agent returns the per-candidate `{deliverable, provenance}` as a **schema** (not scraped prose), and the engine **fails closed** — any candidate missing from the return, or not deliverable+provenance, is invalid and excluded *before* the judge runs (recorded `valid:false` + reason).
 - **Pool**: concatenate the valid deliverables into one blind-labelled `_pool.md` (`===== Candidate A =====` sections). The judge reads that ONE file instead of N per-candidate dirs (the per-candidate dirs remain only so the judge can *run* code when needed) — the same read-cost collapse the context bundle gives the attempts.
 
-The judge's returned winner/ranking are then reconciled against the real blind-label set (normalised, repaired to a full permutation), both judge calls are retried-once-then-degrade-to-a-partial-result rather than crashing a fully-paid run, and an empty valid pool short-circuits instead of asking the judge to rank nothing.
+Each judge's returned winner/ranking is reconciled against the real blind-label set (normalised, repaired to a full permutation), every judge call is retried-once-then-degrades-to-a-partial-result rather than crashing a fully-paid run, and an empty valid pool short-circuits instead of asking the judge to rank nothing.
 
-**Residual blindness caveats (advisory, not enforced).** Two things the prompt asks for but cannot mechanically guarantee: (a) the judge has `Read`/`Bash` and the absolute `runDir`, so it *could* walk to a sibling `round-*/candidate-*/` and read a provenance log — the prompt tells it not to read anything outside the pool, but that is honour-system; (b) the blind letter is decorrelated from dispatch order by a constant rotation, but the *presentation order* in `_pool.md` is fixed, so any positional/first-listed bias in the judge is uncorrected (and reproducible) — weight on merits, not order.
+**Residual blindness caveats (advisory, not enforced).** Two things the prompt asks for but cannot mechanically guarantee: (a) each judge has `Read`/`Bash` and the absolute `runDir`, so it *could* walk to a sibling `round-*/candidate-*/` and read a provenance log — the prompt tells it not to read anything outside the pool, but that is honour-system; (b) the blind letter is decorrelated from dispatch order by a constant rotation, and each council lens additionally gets a *differently-rotated* candidate listing (position-bias control), but the *presentation order* in the shared `_pool.md` is fixed — so any residual positional bias is uncorrected (and reproducible) — weight on merits, not order.
 
-**Phase 3 reviewer (both modes):** collect each first-round deliverable and self-summary, assign blind labels (Candidate A, B, ...) in a fixed order, keep a private label-to-model mapping, and spawn one Opus agent with the candidates and `references/review-rubric.md`. It returns the per-candidate pros and cons, the ranking, and the winner. In **two pass** it additionally returns the two distilled lists (positives to consider, challenges to avoid); in **single pass** those lists are not needed. Do not pass model identities to it.
+**The judging council (default) — the shape at both decision points.** Judging is a **5-lens deliberating Opus council** unless `judges: 1` is passed. All five lenses read the same staged blind `_pool.md`; the pipeline is:
 
-**Final ranker (Phase 5, two pass only):** build the pool of N round two attempts plus the one saved round one winner, re-label the whole pool blind in a fixed order, keep a fresh private mapping, and spawn one Opus agent with the pool and the rubric. Do not tell it which candidate is the carried-over winner; it ranks blind on the merits.
+1. **Round 1 (independent).** Five Opus judges — **correctness, spec, security, robustness, craft** — run in parallel with no peer visibility. Each returns per-candidate pros/cons through its lens, a full ranking, a first-place `vote`, `reasoning`, and a required `checks_run[]`. The **security** lens also returns per-candidate `safety` (`SAFE`/`UNSAFE` + severity + evidence).
+2. **Tally (plain code, every round).** Majority = strictly **>50%** of the *living* judges' first-place votes on a candidate the security lens has **not** vetoed. No LLM ever aggregates votes — the tally and the veto are deterministic code in `tournament.mjs` (`councilTally`).
+3. **Deliberation (max 3 rounds).** No majority (or the leader is vetoed) → each judge sees peers' verbatim verdicts, addresses disagreements in `response_to_peers`, may run 1–2 checks, and revises (`changed_this_round`/`changed_from_round1`). Peers may rebut a veto with evidence; a refuted flag is withdrawn, a standing one keeps excluding the candidate.
+4. **NO_CONSENSUS.** Still split after 3 deliberation rounds, or every candidate vetoed → the workflow returns `no_consensus: true` with `winner: null` (never a synthesised/averaged winner). Interactive runs surface the split; a grand loop routes the loop to needs-human + HALT.
+5. **Judge death.** Each lens retries once; a still-dead lens drops and the majority recomputes over the living. Exception: the security lens dying in repo-anchored mode is unresolvable veto coverage → fail closed to NO_CONSENSUS; an isolated run proceeds with a loud logged warning.
+6. **Guidance (two pass).** A *separate* synthesis call (explicitly not a decision-maker) distils the round-2 guidance from the five final verdicts under the same cap/schema/blind rules — it never picks or changes a winner.
+
+Council metadata (per-judge verdicts, per-round tally, vote evolution, veto events, `no_consensus`) is logged and persisted (`review-*/council.json`, `verdict.md`, the run summaries). The consolidated `ranking` downstream consumers read is derived in code (winner first, then remaining by first-place votes, average rank, blind label); it is bookkeeping, not a consensus override — the winner slot is only ever a majority non-vetoed candidate.
+
+**Legacy single judge (`judges: 1`).** One blind Opus agent does the whole job at each point — the pre-council path, byte-for-byte. Spawn it with the candidates and `references/review-rubric.md`: it returns per-candidate pros/cons, ranking, and winner (and in two pass the two guidance lists). Do not pass model identities to it. The final ranker (Phase 5) builds the pool of N round-two attempts plus the one saved round-one winner, re-labelled blind, and ranks it the same way.
 
 ## Harness notes
 
