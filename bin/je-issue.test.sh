@@ -34,14 +34,29 @@ expect_rc 4 "blind=model"      '> reviewer on blind B = the haiku+Bash plan rank
 expect_rc 4 "blind is model"   'blind C is opus and it won'
 expect_rc 4 "mapping.json ref" 'see mapping.json (round 1): blind A won'
 expect_rc 4 "candidate json"   'mapping: {"candidate":"E","model":"codex-high"}'
+# a NEW (un-enumerated) provider name must still be caught via the JSON / "(model)" shapes
+expect_rc 4 "blind=newprovider" 'blind D = acme-ultra-7b (model) won round 2'
+expect_rc 4 "candidate->model"  '{"candidate":"F","model":"acme-ultra-7b"}'
 
 # --- rc 5: secrets ------------------------------------------------------------
 expect_rc 5 "gh token"         'the log leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 oops'
 expect_rc 5 "api key kv"       'config had api_key = sk-abcdef0123456789abcdef0123 in it'
+# new formats — all values are obviously FAKE but match the real format shape
+expect_rc 5 "google api key"   'env had GOOGLE_KEY=AIzaFAKE_NOT_A_REAL_GOOGLE_KEY_00000000 set'
+expect_rc 5 "slack token"      'the bot used xoxb-FAKE-NOT-A-REAL-TOKEN-000000 to post'
+expect_rc 5 "pem private key"  $'-----BEGIN RSA PRIVATE KEY-----\nMIIFAKEFAKEFAKE\n-----END RSA PRIVATE KEY-----'
+expect_rc 5 "jwt"              'Authorization header was eyJFAKE-header-not-real.FAKE-payload-not-real.FAKE-sig-not-real'
+# Stripe live keys: assemble the literal at runtime so the obviously-fake token is
+# never a contiguous string in source (avoids tripping push-protection scanners),
+# while still feeding check-evidence a value that matches the [sr]k_live_ shape.
+_live="_live_"; _body="FAKEFAKEFAKEFAKE00000000"
+expect_rc 5 "stripe live sk"   "the webhook used sk${_live}${_body} to charge"
+expect_rc 5 "stripe live rk"   "a restricted key rk${_live}${_body} leaked too"
 
 # --- rc 0: legitimate verbatim evidence (no leak) -----------------------------
 expect_rc 0 "clean excerpt"    $'> Round-1 reviewer, on blind candidate B:\n> "the core mechanism is wrong" — but a later probe proved node:fs is absent.'
 expect_rc 0 "clean prose"      'je-parse mis-read the prose "two pass" form and ran single pass.'
+expect_rc 0 "prose mentions key" 'the api description was clear but the secret sauce is the ranking heuristic.'
 
 echo
 echo "je-issue guards: $pass passed, $fail failed"
