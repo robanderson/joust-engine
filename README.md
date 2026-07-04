@@ -10,16 +10,15 @@
 @@JE:5  Build a CLI that flattens nested JSON to dotted keys.
 ```
 
-That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and the blind Opus council crowns a winner. Add `:2` for two passes (a guided second round), or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
+That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and the blind Opus council crowns a winner. Add `:2` for the full two-round plan phase, `implement` for the implementation rounds, or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
 
 ---
 
 ## Contents
 
 - [The core idea](#the-core-idea)
-- [Single pass vs two pass](#single-pass-vs-two-pass)
+- [The rounds: plan, then implement](#the-rounds-plan-then-implement)
 - [The judging council](#the-judging-council)
-- [Plan & Implement rounds](#plan--implement-rounds)
 - [Invoking it: the sigil and prose forms](#invoking-it-the-sigil-and-prose-forms)
   - [The `@@JE` sigil](#the-je-sigil)
   - [Task size (dynamic limits)](#task-size-dynamic-limits)
@@ -50,40 +49,44 @@ The attempts are deliberately *diverse*: different model families, sampling stoc
 
 ---
 
-## Single pass vs two pass
+## The rounds: plan, then implement
 
-The two modes share one spine. **Two pass is single pass plus a learning step in the middle.**
+The tournament is a **cheap, wide planning phase** (always) followed by an **optional, narrow implementation phase** — high-N diversity where artifacts are cheap to produce and judge, a small strong pool where they are expensive (`docs/superpowers/specs/2026-07-03-plan-implement-rounds-design.md`):
 
-| Phase | Single pass | Two pass |
-|---|---|---|
-| Round 1 attempts | N parallel, isolated, one diversity nudge each | identical |
-| Blind Opus review | scores, ranks, names winner → **this is the result** | scores, ranks, names round-1 winner **and distils guidance** |
-| Carry / discard | — | **save** the winner's deliverable; **discard** every other artifact, keep only the distilled lessons |
-| Round 2 attempts | — | N **fresh** attempts given the task + guidance (positives to emulate, pitfalls to avoid) — but **never** round-1 code |
-| Final rank | — | pool = N round-2 attempts **+ the saved round-1 winner** (N+1), re-labelled blind, one Opus ranker picks overall winner |
-
-The distilled guidance is two short lists — *positives to consider* and *challenges to avoid* — phrased as generic principles, each tagged `[strong]` (held up repeatedly) or `[tentative]` (a single sighting), with no candidate-specific code.
-
-**Why two pass discards the losing code but keeps the lessons:** re-using a winner's code would make round 2 copy it and collapse the diversity that makes the loop work. Re-using the *distilled* pros and cons keeps diversity while raising the floor. The saved round-1 champion then competes blind in the final pool on the merits — it produced no worse work for not having seen the guidance, and if a guided round-2 attempt is genuinely better, it should win.
+| Round | Runs | What happens | Pool default |
+|---|---|---|---|
+| **Plan Round 1** | always | N parallel, isolated plan attempts, one diversity nudge each → the blind plan-lens council reviews, votes a round-1 winner, **and distils guidance** | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
+| **Plan Round 2** | always (two-pass; `:1` stops after Round 1) | winner's plan **saved**, every other artifact discarded; N **fresh** attempts get the task + guidance (never round-1 content); final pool = N + the carried winner, re-labelled blind → the council ranks and elects the **winning plan** | same pool, fresh nudges |
+| **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning plan verbatim** (a deliberate exception to "never seed prior artifacts" — the plan *is* the specification); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
+| **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate (no council majority, all vetoed, or verify failure) | M fresh implementers, guided by the R3 review; still no consensus → **needs-human**, never a silently-picked winner | same pool |
 
 ```text
-SINGLE PASS
-  task ──▶ [N attempts] ──▶ blind Opus council ──▶ winner ✓
+PLAN (always)
+  task ──▶ [N plan attempts] ──▶ plan council ──┬▶ distil guidance ─┐
+                                                └▶ save winner ──┐  │
+                                                                 │  ▼
+           [N fresh plan attempts + guidance] ◀──────────────────┼──┘
+                             │                                   │
+                             ▼                                   │
+           final plan pool = N round-2 + saved winner ◀──────────┘
+                             │
+                             ▼
+                  plan council rank ──▶ WINNING PLAN ✓        (no implement flag → done)
 
-TWO PASS
-  task ──▶ [N attempts] ──▶ blind Opus council ──┬▶ distil guidance ─┐
-                                                └─▶ save winner ──┐  │
-                                                                  │  ▼
-            [N fresh attempts + task + guidance] ◀────────────────┼──┘
-                              │                                   │
-                              ▼                                   │
-            final pool = N round-2 + saved winner ◀───────────────┘
-                              │
-                              ▼
-            blind Opus council rank ──▶ overall winner ✓
+IMPLEMENT (only with the `implement` keyword)
+  winning plan ──▶ [M implementers, plan seeded verbatim] ──▶ code council + gate ──▶ winner ✓
+                                                                    │ gate fails
+                                                                    ▼
+                   [M fresh implementers + R3 guidance] ──▶ code council + gate ──▶ winner ✓ / needs-human
 ```
 
-Two pass roughly **doubles** the attempt count (≈ 2N attempts + 2 council judging points), so it costs about double single pass. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+The distilled guidance is two short lists — *positives to consider* and *challenges to avoid* — phrased as generic principles, each tagged `[strong]` (held up repeatedly) or `[tentative]` (a single sighting), with no candidate-specific content.
+
+**Why round 2 discards the losing plans but keeps the lessons:** re-using a winner's content would make round 2 copy it and collapse the diversity that makes the loop work. Re-using the *distilled* pros and cons keeps diversity while raising the floor. The carried round-1 champion competes blind in the final pool on the merits — if a guided round-2 plan is genuinely better, it wins.
+
+Three guard rails: a plan-phase `NO_CONSENSUS` stops the run **before any implementation spend** (the split is surfaced for you to resolve); the R3→R4 fallback is **bounded** (one retry, then needs-human); and phase-scoped prose specs pick the pools inline — `Plan: 2 opus, 2 sonnet, 1 glm 5.2 Implement: 2 opus, 1 codex high implement @@JE:5:2` — with the `implement` keyword recognised only marker-adjacent, so prose like "implement a CSV parser" never false-triggers rounds 3–4.
+
+Cost scales with what you enable: plan-only two pass ≈ 2N attempts + 2 council judging points; `implement` adds M (+M on an R4 retry) and a third judging point. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
 
 ---
 
@@ -98,22 +101,6 @@ Every judging point (the round-1 review and the final rank) is, by default, a **
 - `judges: 1` restores the legacy single blind Opus judge (cheap runs).
 
 The design follows the LLM-as-judge research in [issue #22](https://github.com/robanderson/joust-engine/issues/22) and `docs/superpowers/specs/2026-07-02-judge-council-design.md`: diverse lenses over one generalist, independent votes before cross-talk, aggregation in code, evidence-forcing, and fail-closed no-consensus routing.
-
----
-
-## Plan & Implement rounds
-
-The tournament is structured as a **cheap, wide planning phase** plus an **optional, narrow implementation phase** (`docs/superpowers/specs/2026-07-03-plan-implement-rounds-design.md`):
-
-| Round | Runs | Pool default |
-|---|---|---|
-| **Plan Round 1 & 2** | always (the two-pass spine) | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
-| **Implement Round 3** | only with the `implement` keyword | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
-| **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate | same pool, guided by the R3 review |
-
-Plan rounds produce plan artifacts judged by a **plan-lens council** (feasibility, completeness, risk, security-by-design, simplicity). The winning plan then seeds every implementer **verbatim** — a deliberate exception to the "never seed prior artifacts" rule, because the plan *is* the specification — and implementations are judged by the code-lens council with verify/build/lint evidence folded in. A plan-phase `NO_CONSENSUS` stops the run **before any implementation spend**.
-
-Phase-scoped prose specs pick the pools inline: `Plan: 2 opus, 2 sonnet, 1 glm 5.2 Implement: 2 opus, 1 codex high implement @@JE:5:2` — each phase segment uses the normal spec grammar, and the `implement` keyword (marker-adjacent, so prose like "implement a CSV parser" never false-triggers) enables rounds 3–4.
 
 ---
 
