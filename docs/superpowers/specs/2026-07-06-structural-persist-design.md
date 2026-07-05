@@ -36,9 +36,12 @@ bytes, at 4-6 checkpoints per plan/implement run. Live evidence: run C's R1 pers
   within that — e.g. exploit that the harness already persists journal.jsonl and agent
   transcripts to disk without any model in the loop.
 - **Speed:** a review checkpoint should take seconds-to-a-minute, not 15 minutes.
-- **Model-independence restored:** once no model re-types content, the helper can go
-  back to the cheapest tier (haiku) — HELPER_MODEL stays sonnet only where a helper
-  genuinely reasons (context bundling summaries, staging validation judgment).
+- **Model-independence as a PROPERTY, not a downgrade:** the design must make the
+  dataplane correct regardless of which model drives the helper — but HELPER_MODEL
+  STAYS `sonnet` everywhere (operator decision, 2026-07-06: no haiku sub-agents until
+  a Haiku 5.x-base ships; Haiku 4.5's agentic awareness is not trusted for engine
+  duty even on "mechanical" steps). Do NOT reintroduce haiku anywhere; do NOT make
+  HELPER_MODEL per-step configurable as part of this change.
 - **No contract changes:** same files, same paths, same shapes (mapping.json,
   council.json, verdict.md, SUMMARY.md, rc_summary rendering); crash-survival
   (incremental checkpoints) preserved or improved.
