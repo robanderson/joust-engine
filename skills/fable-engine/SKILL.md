@@ -48,6 +48,8 @@ replacement, same runner paths, same size-profile args from `bin/je-parse.mjs --
 the N isolated attempts, validates provenance fail-closed, stages the survivors blind, and
 returns `{ poolPath, round1.mapping, candidates[], rc_summary }` — no councils.
 
+Wide rounds SHOULD use **Pool A2 angle briefs** (one orthogonal one-paragraph angle per draft, riding `r1nudge` verbatim) instead of one-line nudges — see "Pool A2" in `skills/joust-engine/references/diversity-injection.md`.
+
 ## Phase 3: Compose (you)
 
 Read `poolPath` (the blind pool — do NOT read mapping.json or the raw workspaces yet).

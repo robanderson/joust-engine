@@ -6,6 +6,18 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Pool A2 angle briefs — specification-level diversity injection.** New reusable library of
+  10 orthogonal one-paragraph angle briefs for design-brief rounds (minimal-diff conservative,
+  refactor-first structural, data-model-led, interface/contract-led, test-harness-led,
+  operational/observability-led, failure-mode-led, performance-budget-led, security-posture-led,
+  simplest-thing-spec-purist). Each commits an explorer to a distinct solution-space STARTING
+  ANGLE without biasing quality criteria (blind-review-safe); drawn without replacement,
+  same-model siblings get most-distant angles, text rides the existing `r1nudge`/`r2nudge`
+  fields verbatim, draw logged. Preferred over one-line nudges for wide rounds (distinct
+  per-explorer spec angles yield 2-3x measured diversity vs sampling randomness;
+  arXiv:2606.10302). Docs-only: `diversity-injection.md` + pointers in joust/fable SKILL.md
+  and `orchestration.md`.
+
 - **Cross-run leaderboard ledger (issue #41): `bin/je-ledger.mjs`.** `record <runDir>`
   appends one JSON line per completed run (unblinded seats, winners, rc_summary, and — when
   `timeline.jsonl` exists — per-phase barrier + attempt durations) to an append-only ledger

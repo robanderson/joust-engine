@@ -120,6 +120,8 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
       model: "haiku",                    // opus | sonnet | haiku
       displayModel: "haiku",             // for the report; NOT shown to judges
       r1nudge: "<Pool A nudge>", r2nudge: "<fresh Pool A nudge>" },
+                                         // design-brief rounds: carry a Pool A2 angle-brief PARAGRAPH
+                                         // verbatim in these same fields (see diversity-injection.md).
     { label: "candidate-2",
       dispatch: "glm",                              // runs via a wrapper agent + the runner script
       agentType: "joust-engine:joust-glm-5-2",  // namespaced bundled GLM worker agent
@@ -338,7 +340,8 @@ And pitfalls that hurt attempts (avoid, unless you have a concrete reason they d
 - [strong] <repeated failure mode> (<why>)
 - [tentative] <one-off weakness> (<why>)
 
-<one drawn Pool A nudge, per references/diversity-injection.md, e.g.
+<one drawn Pool A nudge — or, for design-brief rounds, one Pool A2 angle-brief paragraph —
+per references/diversity-injection.md, e.g.
 "Approach this task starting from the data model or core types.">
 
 Rules:

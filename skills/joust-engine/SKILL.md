@@ -160,6 +160,7 @@ In two pass, the model assignment applies to **both rounds**: round two re-uses 
 Independent attempts are only valuable if they actually differ. Model heterogeneity and sampling give some of that, but same-model siblings on an identical prompt tend to converge. To prevent that, give each attempt a distinct framing drawn from a modifier pool, following `references/diversity-injection.md`. In short:
 
 - **Pool A (approach nudges), on by default.** These vary how an attempt starts and proceeds, not what counts as a good answer, so the review stays blind. Drawn without replacement within a round so no two attempts share one, biased so same-model siblings get the most different nudges.
+- **Pool A2 (angle briefs), preferred for design-brief rounds.** One-paragraph orthogonal angle briefs instead of one-line nudges — same blind-safety and draw rules, measurably higher pool diversity; see "Pool A2" in `references/diversity-injection.md`.
 - **Pool B (objective lenses like safely, quickly, efficiently), opt-in only.** These bias the tradeoff an attempt makes. Offer them when the user wants to fan attempts across a tradeoff frontier on purpose, and read the Pool B handling notes before using them (they interact with blind review).
 
 Seed and log the draw so the run is reproducible and the report can show what was applied. If the user prefers fully identical briefs, they can turn diversity injection off.

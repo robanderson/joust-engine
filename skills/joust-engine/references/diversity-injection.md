@@ -48,6 +48,42 @@ These vary where an attempt starts and how it proceeds, not what counts as a goo
 
 Items tagged `[any]` work for either domain and are the top-up pool. Keep the sampling rules below (draw without replacement, bias same-model siblings apart) unchanged; they apply within the chosen set.
 
+### Pool A2: angle briefs (preferred for design-brief rounds)
+
+One-line nudges shift an attempt's first step; **angle briefs** commit an explorer to a whole region of the solution space. Research: distinct per-explorer specification angles yield 2-3x measured diversity versus sampling randomness alone, and best-of-N quality is ceilinged by pool diversity (arXiv:2606.10302). For **design-brief rounds** — attempts produce plans/proposals/drafts rather than a direct artifact — prefer Pool A2: the orchestrator writes (or draws from the library below) N orthogonal ONE-PARAGRAPH angle briefs, each committing its explorer to a distinct solution-space angle.
+
+Like Pool A, angle briefs are **blind-review-safe**: each steers the STARTING ANGLE — where the attempt begins and what it treats as the backbone — never the quality criteria or what counts as a good answer, so the reviewer stays blind to the draw and no attempt is set up to be marked down for following its brief.
+
+**Rules** (Pool A sampling rules apply, plus):
+
+- Draw **without replacement** within a round — no two attempts share an angle.
+- **Same-model siblings get the most-distant angles** available (e.g. minimal-diff conservative vs refactor-first structural; data-model-led vs interface/contract-led).
+- The angle text **rides the existing `r1nudge` / `r2nudge` fields verbatim** — no engine changes; that plumbing already carries arbitrary text.
+- **Log the draw** (attempt → angle name, plus seed) exactly as for Pool A, so the run is reproducible and the report can show it.
+- If N exceeds 10, top up from the Pool A one-liners rather than repeating an angle.
+
+**Library: 10 angle briefs for engineering tasks.** Each is 3-5 sentences; prepend one, whole and verbatim, per attempt.
+
+1. **minimal-diff conservative** — Anchor your solution in the code as it stands today. Treat the existing structure, names, and conventions as fixed, and find where the task's behavior can attach within them. Start by identifying the exact seams where the change wants to live, and let the current architecture tell you the shape of the change. Restructuring is out of scope for your angle; work with the grain of what exists.
+
+2. **refactor-first structural** — Begin by asking what shape the code would need to be in for this task to become easy, and treat that restructuring as a first-class part of your plan. Map the current structure, name the friction it creates for this specific task, and design the target structure before designing the feature. Let the feature itself fall out as the final, small step on top of the reshaped foundation.
+
+3. **data-model-led** — Start from the data: the entities, their fields, their relationships, and their lifecycle. Write the schemas, types, or core structures first, and let every function and interface be derived from what the data demands. When a design question arises, resolve it by asking what the most truthful representation of the data would be.
+
+4. **interface/contract-led** — Begin at the boundary: the public API, CLI surface, function signatures, or protocol that callers will touch. Write the contract first — inputs, outputs, errors, invariants — as if its consumers already existed, and only then work inward to an implementation that honors it. Let questions about internals be settled by whatever makes the contract cleanest to uphold.
+
+5. **test-harness-led** — Start by designing how the behavior will be exercised and observed: the harness, the fixtures, and the concrete cases that would demonstrate the task is done. Sketch those executable checks before any implementation, and let their setup needs drive the shape of the code under test. Build outward from what is verifiable.
+
+6. **operational/observability-led** — Approach the task from the perspective of the person operating this in production. Start from how it will be deployed, configured, monitored, and debugged: what it logs, what it exposes, how an operator sees inside it when something is off. Design that runtime story first, and let the implementation be shaped by what makes its behavior legible in operation.
+
+7. **failure-mode-led** — Begin by enumerating the ways this can go wrong: bad inputs, partial failures, races, resource exhaustion, dying midway. Design the behavior of each failure path first — what is detected, what is reported, what state survives — then fill in the happy path as the case where none of them fire. Let the failure taxonomy drive the structure.
+
+8. **performance-budget-led** — Start by writing down a concrete resource budget for the task — latency, throughput, memory, calls to expensive dependencies — and identifying where the hot path runs. Design the data flow and algorithms against that budget from the first sketch, rather than as a later tuning pass. When two designs are otherwise comparable, let the budget break the tie.
+
+9. **security-posture-led** — Approach the task from its trust boundaries: who or what supplies each input, what privileges each component holds, what an adversarial caller could attempt. Map those boundaries first, and design validation, authority, and data handling around them before filling in functionality. Let where untrusted data flows determine the shape of the solution.
+
+10. **simplest-thing-spec-purist** — Read the task statement as the entire specification: build exactly what it asks, in the most direct construction available, and nothing speculative beyond it. Start by restating the requirements as a short checklist, then design the plainest mechanism that satisfies each item literally. Where the spec is silent, choose the least mechanism rather than anticipating futures.
+
 ### Pool B: objective lenses (opt-in, logged)
 
 These deliberately bias the tradeoff an attempt makes. They are useful when you want to fan attempts across a tradeoff frontier on purpose. The cost: an attempt told "quickly" may correctly produce something fast and thin, and a blind reviewer scoring on completeness and robustness will mark it down through no fault of the attempt.
