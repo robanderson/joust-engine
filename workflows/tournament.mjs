@@ -1129,8 +1129,13 @@ const LENS_PROFILES = { code: LENSES, plan: PLAN_LENSES }
 // byte-for-byte (no per-call lens arg needed): the PLAN phase ('Review' = Plan Round 1 review,
 // 'Final rank' = Plan Final rank) uses the plan lenses; everything else (the implement rounds and
 // any legacy point) uses the code lenses.
+// dualSecurity:false (per-run escape hatch) drops the security-x seat, restoring the 5-seat odd
+// panel — an even panel can 3-3 gridlock through every deliberation round. Interim measure until
+// the steelman-shootout redesign (2026-07-05-steelman-loop-design.md) makes ties cheap; the
+// PRIMARY security veto seat is unaffected and can never be disabled.
 function defaultLensesFor(phaseTitle) {
-  return (phaseTitle === 'Review' || phaseTitle === 'Final rank') ? PLAN_LENSES : LENSES
+  const table = (phaseTitle === 'Review' || phaseTitle === 'Final rank') ? PLAN_LENSES : LENSES
+  return A.dualSecurity === false ? table.filter(l => l.key !== 'security-x') : table
 }
 
 // Per-lens structured-output schemas. checks_run is REQUIRED on every verdict (the forced-evidence lever).

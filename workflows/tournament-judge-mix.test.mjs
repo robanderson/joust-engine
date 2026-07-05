@@ -191,3 +191,9 @@ test('(structural) askLens falls back to native Opus after exhausting codex retr
   assert.match(askLensSrc, /JE-COUNCIL-FALLBACK/)
   assert.match(askLensSrc, /askLensNative/)
 })
+test('(structural) dualSecurity:false drops ONLY the security-x seat; primary security has no such escape', () => {
+  const src = slice('function defaultLensesFor(phaseTitle)', '\n}\n')
+  assert.match(src, /A\.dualSecurity === false/)
+  assert.match(src, /filter\(l => l\.key !== 'security-x'\)/)
+  assert.ok(!src.includes("!== 'security'"), 'must never filter the primary security seat')
+})

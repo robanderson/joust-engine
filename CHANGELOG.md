@@ -6,6 +6,12 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Changed
 
+- **`dualSecurity: false` escape hatch** — per-run arg that drops the `security-x` seat,
+  restoring the 5-seat odd panel (an even panel can 3-3 gridlock through every
+  deliberation round; observed live, hours of final-rank deliberation). Interim measure
+  until the steelman-shootout redesign makes ties cheap, after which the dual gates run
+  by default again. The PRIMARY security veto seat cannot be disabled by any flag.
+
 - **Runner wrapper agents haiku → sonnet.** The 8 provider wrapper agents
   (`joust-codex`, `joust-glm-*` ×4, `joust-minimax`, `joust-local`, `joust-grok`) pinned
   `model: haiku` in their frontmatter — the last haiku sub-agents left after the
