@@ -53,6 +53,12 @@ if (!Array.isArray(attempts) || attempts.length === 0) {
 // 'two' under `implement`. A plan-only run keeps its @@JE:N:M single/two semantics unchanged.
 const implement = A.implement === true
 const implementAttempts = (Array.isArray(A.implementAttempts) && A.implementAttempts.length) ? A.implementAttempts : attempts
+// A/B briefs (design-brief A/B test): when true AND the final rank produced a second gated,
+// non-vetoed finalist, the implementer pool is seeded ALTERNATELY with both design briefs.
+// Judges stay blind to brief lineage (they judge code against the ORIGINAL task + fundamentals,
+// never against a brief); the A/B readout is derived from mapping afterwards, never from votes.
+const AB_BRIEFS = A.abBriefs === true
+let implementSeats = implementAttempts // reassigned by the A/B hook when a second finalist exists
 // composeOnly (@@FE Fable Engine): run Round 1 + stage/validate/pool, then STOP — no councils,
 // no round 2, no implement. The caller (the orchestrating model) reads the blind pool and
 // composes/implements itself. Mutually exclusive with implement.
@@ -117,31 +123,32 @@ function brief(nudge, ws, guidance, ctx, kind = 'implement', seedPlanPath = null
 
   // ---- PLAN phase (Plan Round 1/2): produce a PLAN artifact, never touch the repo. ----
   if (kind === 'plan') {
-    return `You are producing a PLAN — a concrete, file-level change proposal for a task. You do NOT implement anything and you do NOT touch any real repository.
+    return `You are producing a DESIGN BRIEF — a decision-level proposal for HOW to solve a task. You do NOT implement anything, you do NOT write line-level edits, and you do NOT touch any real repository.
 
-Task to plan:
+Task to design for:
 ${task}
 ${g}${ctxLine}
 ${nudge}
 
-Write ONE plan file, PLAN.md, in your workspace. A strong plan is:
-- CONCRETE and FILE-LEVEL: name each file to add / edit / delete, and say exactly what changes in each (functions, signatures, data shapes, config), enough that an implementer could execute it without guessing.
-- COMPLETE: cover every requirement, edge case, migration, test, and doc update the task implies — do not hand-wave the hard parts.
-- FEASIBLE: reference only real, reachable files/APIs/mechanisms; each step must follow from the last.
-- RISK-AWARE and SECURE-BY-DESIGN: name the execution risks (breaking changes, coupling, data/compat, ordering) and the security posture (least privilege, input validation, safe secrets/supply-chain), and how the plan mitigates them.
-- PROPORTIONATE: the smallest coherent change that fully solves the task — no gold-plating.
+Write ONE file, PLAN.md, in your workspace: AT MOST 10 bullets total, organised as:
+- APPROACH (2-4 bullets): the approach you choose and WHY. If a genuinely competitive alternative exists, name it in one bullet and say why you rejected it.
+- SURFACES (1-3 bullets): which files/areas change and what KIND of change each takes (new module, extend function X's contract, config addition) — never line-level edits.
+- RISKS (1-2 bullets): the riskiest assumptions or side effects (breaking changes, coupling, data/compat, security posture) and the mitigation.
+- ACCEPTANCE CRITERIA (2-4 bullets): testable, approach-neutral checks that define done ("<metric> improves by >=X", "no existing test regresses", "behaviour Z is preserved", "a new test covers case W").
+
+ALTITUDE RULE (hard): NO code blocks, NO diffs, NO line numbers, NO function bodies. Every factual claim about the codebase must be true — reviewers verify that named surfaces and constraints actually exist. A brief that reads like an implementation will be judged DOWN for altitude violation, however good its code is; a brief that hand-waves the hard 20% will be judged down for incompleteness. Decisions and criteria are the deliverable — implementation details belong to the implementers.
 
 Rules:
-- This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your plan.
-- Produce the PLAN ONLY. Do NOT write the implementation, do NOT edit real source files, do NOT run anything. A plan, not a patch.
+- This task is fully specified and self-contained. Do NOT ask clarifying questions or stop for input — make reasonable default choices and commit to them.
+- Produce the BRIEF ONLY. Do NOT write the implementation, do NOT edit real source files, do NOT run anything beyond what you need to verify your claims.
 - Work in a SINGLE pass and then STOP. Your first version is final; do not rewrite or polish it.
 - Save PLAN.md into: ${ws} (create the directory if needed). To save a file, just write it; if a file-edit tool refuses because the file "must be read first", overwrite it directly with the shell (\`cat > FILE <<'EOF' ... EOF\`).
-- End PLAN.md with a 2 to 4 sentence note on your approach, tradeoffs, and known limitations.`
+- End PLAN.md with a 2 to 4 sentence note on your approach, tradeoffs, and known limitations (outside the 10-bullet budget).`
   }
 
   // ---- IMPLEMENT phase (Implement Round 3/4): the winning plan IS the spec. ----
   const seedBlock = seedPlanPath
-    ? `\nAn APPROVED PLAN for this task has already been chosen by a review council. It is your specification — follow it. Read it in full at the start:\n${seedPlanPath}\nImplement THAT plan. Where the plan is concrete, follow it verbatim; where it leaves a small detail open, make the smallest reasonable choice consistent with it. Do NOT re-plan or second-guess the overall approach.\n`
+    ? `\nAn APPROVED DESIGN BRIEF for this task has already been chosen by a review council. It is your specification — read it in full at the start:\n${seedPlanPath}\nFollow its APPROACH and satisfy its ACCEPTANCE CRITERIA. The implementation details are yours: make the smallest coherent implementation consistent with the brief. Where the brief is explicit, honour it; where it is silent, choose well. Do NOT re-plan or second-guess the overall approach.\n`
     : ''
 
   if (repoMode) {
@@ -673,6 +680,16 @@ function mergeMechanical(staged, byBlind) {
   })
 }
 // ---- end: mechanical patch gate --------------------------------------------------------------
+
+// ---- begin: ab briefs --------------------------------------------------------------------------
+// PURE: alternate two design-brief seed paths across the implementer pool. Even index -> brief-1
+// (the final-rank winner), odd -> brief-2 (the runner-up finalist). Anything but exactly two paths
+// returns the pool unchanged (fail-safe: never partially seeded).
+function assignAbSeeds(attempts, seedPaths) {
+  if (!Array.isArray(seedPaths) || seedPaths.length !== 2 || !seedPaths[0] || !seedPaths[1]) return attempts.map(a => ({ ...a }))
+  return attempts.map((a, i) => ({ ...a, seedPlanPath: seedPaths[i % 2], seedBrief: i % 2 === 0 ? 'brief-1' : 'brief-2' }))
+}
+// ---- end: ab briefs ----------------------------------------------------------------------------
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
 const rcSummaryLive = () => buildRcSummary(seatRcs)
@@ -1525,12 +1542,12 @@ const LENSES = [
 // work UNCHANGED) but is DISPLAYED as 'security-by-design' via `title`. lensPrompt renders
 // `title || key`; every logic path (schema selection, tally, safety) still keys off `key`.
 const PLAN_LENSES = [
-  { key: 'feasibility', owns: 'can this plan actually be built as written — are the named files, APIs, and mechanisms real and reachable, does each step follow from the last, and DO THE PLAN\'S FACTUAL CLAIMS about the current tree check out (demand the proof: verify cited files, functions, and behaviours against the snapshot — a plan built on a misread codebase is infeasible however coherent)', special: 'You are the reality judge; audit the claims, not just the steps.' },
-  { key: 'completeness', owns: 'does the plan cover EVERYTHING the task asked — every requirement, edge case, migration, test, and doc update, with no silent gaps', special: 'You catch the "plans the easy 80%, hand-waves the hard 20%" failure.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
-  { key: 'risk', owns: 'what could go wrong on execution — hidden coupling, breaking changes, data/compat hazards, rollout/ordering risk, and whether the plan names and mitigates them', special: 'Probe the failure modes the plan glosses over, not just the happy path.' },
-  { key: 'security', title: 'security-by-design', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold the council VETO: veto a plan that designs in a real, evidenced security hazard.' },
-  { key: 'simplicity', owns: 'simplicity and proportionality — is the plan the smallest coherent change that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the plan is proportionate to the task; reward the simplest approach that is still complete.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
-  { key: 'security-x', title: 'security-by-design (cross-family)', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold a council VETO — the second, cross-family security gate: veto a plan that designs in a real, evidenced security hazard.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'feasibility', owns: 'is this design brief buildable and TRUE — do the surfaces, mechanisms, and constraints it names actually exist in the snapshot (demand the proof: verify every factual claim about the codebase — a brief built on a misread codebase is infeasible however coherent), and does the chosen approach actually reach the acceptance criteria', special: 'You are the reality judge; audit the claims, not the prose. A brief at the WRONG ALTITUDE (code blocks, diffs, line numbers, function bodies) violates the deliverable contract — score it down for that, never up for the extra detail.' },
+  { key: 'completeness', owns: 'does the brief cover EVERYTHING material the task implies — the hard 20% named (not hand-waved), the real risks, and acceptance criteria that are TESTABLE and approach-neutral, with no silent gaps in what "done" means', special: 'You catch the "frames the easy 80%, hand-waves the hard 20%" failure. Completeness is decision coverage, NOT edit-level detail — never reward line-level specificity.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'risk', owns: 'what could go wrong executing this approach — hidden coupling, breaking changes, data/compat hazards, rollout/ordering risk — and whether the brief names the riskiest assumptions and mitigates them', special: 'Probe the failure modes the brief glosses over, not just the happy path.' },
+  { key: 'security', title: 'security-by-design', owns: 'security-by-design: does the chosen approach build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold the council VETO: veto a brief whose approach designs in a real, evidenced security hazard.' },
+  { key: 'simplicity', owns: 'simplicity and proportionality — is the chosen approach the smallest coherent one that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the APPROACH is proportionate; reward the simplest complete approach. A longer brief is not a better brief.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'security-x', title: 'security-by-design (cross-family)', owns: 'security-by-design: does the chosen approach build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold a council VETO — the second, cross-family security gate: veto a brief whose approach designs in a real, evidenced security hazard.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
 ]
 
 // Lens profiles the council can run under. Default = code lenses (unchanged behaviour).
@@ -2703,9 +2720,10 @@ function implGatePassed(r) {
 // Run ONE implement round: dispatch the implement pool seeded with the plan, stage, enrich, and
 // judge with the CODE lenses. `wantGuidance` distils round-3 → round-4 priors (round 3 only).
 async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance, reviewDir, wantGuidance) {
-  const list = implementAttempts.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
+  const list = implementSeats.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
   await buildWorktrees(roundName, list)
-  const doneRaw = (await parallelQuorum(list, (a) => dispatch(a, a.ws, guidance, phaseTitle, 'implement', seedPlanPath), phaseTitle, {
+  // Per-attempt seed (A/B briefs): a seat carrying its own seedPlanPath uses it; else the shared one.
+  const doneRaw = (await parallelQuorum(list, (a) => dispatch(a, a.ws, guidance, phaseTitle, 'implement', a.seedPlanPath || seedPlanPath), phaseTitle, {
     timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
   })).filter(Boolean)
   const done = doneRaw.map(c => ({ ...c, roundName }))
@@ -2719,6 +2737,7 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
   const blind = staged.filter(c => c.valid)
   const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
     ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
+    ...(c.seedBrief ? { seedBrief: c.seedBrief } : {}), // A/B lineage — bookkeeping only, judges never see it
     ...(c.valid ? {} : { failReason: c.failReason }) }))
   if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables (post-mechanical-gate)' } }
   if (repoMode) await enrichBlindPool(blind, reviewDir, phaseTitle)
@@ -3016,9 +3035,28 @@ if (implement) {
   const planWinner = blindF.find(c => c.blind === finalRank.winner) || champ || blindF[0]
   const seedPlanPath = `${runDir}/_winning-plan/plan.md`
   await bundlePlan(planWinner.ws, seedPlanPath)
+  // A/B briefs: seed the implementer pool alternately with the winner's AND the runner-up finalist's
+  // briefs. The runner-up comes from the steelman's seeded finalists (top-2 NON-VETOED by
+  // construction — a vetoed candidate can never be a finalist), so a vetoed brief can never seed an
+  // implementer. Judges stay blind to lineage; the readout is derived from mapping afterwards.
+  let abInfo = null
+  if (AB_BRIEFS) {
+    const fin = (finalRank.council && finalRank.council.steelman && Array.isArray(finalRank.council.steelman.finalists)) ? finalRank.council.steelman.finalists : []
+    const ruLetter = fin.find(l => l !== finalRank.winner) || null
+    const ru = ruLetter ? blindF.find(c => c.blind === ruLetter) : null
+    if (ru) {
+      const brief2Path = `${runDir}/_winning-plan/brief-2.md`
+      await bundlePlan(ru.ws, brief2Path)
+      implementSeats = assignAbSeeds(implementAttempts, [seedPlanPath, brief2Path])
+      abInfo = { 'brief-1': finalRank.winner, 'brief-2': ruLetter }
+      log(`A/B BRIEFS: implementers split alternately across brief-1 (final-rank ${finalRank.winner}) and brief-2 (final-rank ${ruLetter}). Judges are blind to lineage — the A/B readout is derived from mapping, never from votes.`)
+    } else {
+      log('A/B BRIEFS requested but the final rank has no second non-vetoed finalist — all implementers seed from the single winning brief.')
+    }
+  }
   const impl = await implementPhase(seedPlanPath)
   await persist([
-    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...impl }) },
+    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...(abInfo ? { ab: abInfo } : {}), ...impl }) },
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')

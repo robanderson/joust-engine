@@ -6,6 +6,21 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Design briefs replace file-level plans (+ split-brief A/B implement rounds).** The plan phase
+  deliverable is re-altituded: attempts now produce a DESIGN BRIEF — at most 10 bullets (approach
+  + why, surfaces touched, risks, testable approach-neutral acceptance criteria) with a HARD
+  altitude rule (no code blocks/diffs/line numbers; weeds are judged DOWN) — instead of the
+  line-level pseudo-implementations plans had drifted into. Plan lenses retuned to match
+  (feasibility verifies claimed surfaces/constraints exist; completeness = decision coverage,
+  never edit-level detail; simplicity: a longer brief is not a better brief). Implementers are
+  seeded with the brief as an approach+criteria contract (details are theirs). NEW `abBriefs:
+  true`: when the final rank leaves a second non-vetoed steelman finalist, the implementer pool
+  seeds ALTERNATELY from both briefs (per-attempt seedPlanPath) — judges stay blind to lineage
+  and judge code against the ORIGINAL task + fundamentals only; `mapping.json` records
+  `seedBrief` per implementer and `implement.json` gains `ab: {brief-1, brief-2}`, so approach
+  A/B results are derived from bookkeeping, never votes. Briefs compete through their children;
+  children are judged as orphans.
+
 - **Mechanical pre-council patch gate + guidance-stub launch gate (run F).** Before the code
   council convenes on implement candidates, ONE deterministic helper step classifies each valid
   staged deliverable — `clean_patch` (incl. `--recount`/structure-only nuance) | `corrupt_patch` |

@@ -130,7 +130,8 @@ test('(structural) every judge brief carries the anti-length-bias line', () => {
   assert.ok(hits >= 2, `expected the anti-length line in council AND legacy briefs, found ${hits}`)
 })
 test('(structural) feasibility lens owns demand-the-proof claim auditing', () => {
-  assert.match(SRC, /demand the proof: verify cited files, functions, and behaviours against the snapshot/)
+  // Design-briefs altitude change: feasibility still owns demand-the-proof, now phrased for briefs.
+  assert.match(SRC, /demand the proof: verify every factual claim about the codebase/)
 })
 
 // ----- structural: persist v2 -----
