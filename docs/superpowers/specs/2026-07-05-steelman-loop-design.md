@@ -14,9 +14,13 @@ re-allocates votes; this loop improves the deliverable.
 **Final-rank judging point:**
 
 1. **One independent vote round** (unchanged brief, all living judges, deterministic
-   tally, union security veto). Majority on a non-vetoed candidate → winner, done —
-   byte-identical to today's happy path.
-2. **No majority → the STEELMAN LOOP** (replaces deliberation entirely at final ranks):
+   tally, union security veto). The tally now SEEDS the final instead of crowning it:
+   it selects the TOP-2 non-vetoed finalists (majority winner = seed #1 when one exists;
+   otherwise most first-place votes, mean-rank tie-break, blind-label residual).
+2. **The STEELMAN LOOP — ALWAYS at least one round, even on a decisive majority**
+   (replaces deliberation entirely at final ranks). Every crown must be defended: both
+   finalists get one judge-guided improvement pass before anything ships, so a shipped
+   winner never carries the cons the judges already documented:
    - **Steelman** (non-voting synthesis helper, like the guidance distiller — explicitly
      not a decision-maker, never votes): reads ALL judges' verdicts + the top-2
      candidates (most first-place votes; mean-rank tie-break; blind-label residual).
@@ -33,7 +37,11 @@ re-allocates votes; this loop improves the deliverable.
      or what was suggested. Only the steelman ever sees prior-round verdicts.
    - **Tally**: majority → winner (polished). Tie → iterate: steelman reads the NEW
      verdicts, emits new change-lists, repeat.
-3. **Bound: max 5 improvement iterations.**
+3. **Bound: max 5 improvement iterations** (the first one mandatory, iterations 2-5 only
+   while tied).
+   - Degenerate case — only ONE non-vetoed finalist exists: it still gets its mandatory
+     polish round, re-judged solo against its own pre-boost version (adopt whichever the
+     cold panel ranks higher; the ratchet guarantees no regression).
 4. **After 5 rounds still tied → the ORCHESTRATOR casts the deciding vote.** The main
    agent (interactive) or grand-loop driver reads the final verdicts + both artifacts and
    picks, recording `decided_by: "orchestrator"` + one-paragraph reasoning in
@@ -84,9 +92,11 @@ CHANGELOG.
 
 ## Acceptance
 
-- Majority at the first final-rank vote → identical result to today, zero extra spend.
+- Decisive first vote → exactly ONE steelman round runs (both finalists boosted, cold
+  re-judge), then the winner ships polished.
 - Forced-tie fixture: loop runs, artifacts improve each round (change-lists traceable to
   cons), fresh letters each round, terminates at majority or hands to orchestrator at 5.
+- Lone-finalist fixture: solo polish round, ratchet adopt-better.
 - A boost that fails the verify gate reverts (ratchet) and the loop continues.
 - Vetoed candidate never wins via loop or orchestrator pick.
 - `npm run check && npm test` green; rebrand self-verify passes.
