@@ -252,6 +252,11 @@ const codexRunnerCmd = (runner, flag, ws, b) => `${cmdHead(ws, b)} && JE_TIMEOUT
 // The bundle lives OUTSIDE any candidate workspace (in ${runDir}/_context/), and staging only ever
 // copies a candidate's own workspace into its review dir, so the bundle is never exposed to the blind
 // judge. No bundle is built when contextFiles is empty.
+// HELPER_MODEL — the model for every internal engine helper agent (context bundling, worktree
+// setup/snapshot, staging validation, enrichment, persist, seed-plan copy). Sonnet, not haiku
+// (2026-07-05): Sonnet 5's agentic reliability is worth the negligible cost delta on these small
+// steps, and persist specifically corrupted artifacts on haiku (issue #33; 9/9 audited runs).
+const HELPER_MODEL = 'sonnet'
 const contextFiles = Array.isArray(A.contextFiles) ? A.contextFiles.filter(Boolean) : []
 const contextPath = contextFiles.length ? `${runDir}/_context/_context.md` : null
 // repoMode (Phase 1, worktree-per-attempt): gated OFF by default so the scratch-directory path is
@@ -278,7 +283,7 @@ async function buildContext() {
   const cmd = `mkdir -p ${q(`${runDir}/_context`)} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
   log(`Bundling ${contextFiles.length} context file(s) → ${contextPath}`)
   await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
-    { model: 'haiku', phase: 'Round 1', label: 'context' }).catch(() => null)
+    { model: HELPER_MODEL, phase: 'Round 1', label: 'context' }).catch(() => null)
 }
 
 // ---- repoMode worktree helpers (Phase 1). ALL gated on repoMode: every function below returns/falls
@@ -344,7 +349,7 @@ async function buildWorktrees(roundName, list) {
   log(`Preparing ${list.length} git worktree(s) for ${roundName} from ${baseSha}`)
   await agent(
     `Run this exact shell script in ONE Bash call. It serially creates git worktrees for the tournament attempts; do not parallelize it and do not do anything else.\n\n${script}`,
-    { model: 'haiku', phase: roundName === 'round-1' ? 'Round 1' : 'Round 2', label: `${roundName}-worktrees` }
+    { model: HELPER_MODEL, phase: roundName === 'round-1' ? 'Round 1' : 'Round 2', label: `${roundName}-worktrees` }
   ).catch(() => null)
 }
 
@@ -379,7 +384,7 @@ async function snapshotWorktrees(roundName, list) {
   log(`Snapshotting ${list.length} worktree(s) for ${roundName}`)
   await agent(
     `Run this exact shell script in ONE Bash call. It serially snapshots each worktree into at most one fixed-identity commit; do not parallelize it and do not do anything else.\n\n${script}`,
-    { model: 'haiku', phase: roundName === 'round-1' ? 'Review' : 'Final rank', label: `${roundName}-snapshot` }
+    { model: HELPER_MODEL, phase: roundName === 'round-1' ? 'Review' : 'Final rank', label: `${roundName}-snapshot` }
   ).catch(() => null)
 }
 
@@ -713,7 +718,7 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
   })).join('\n')
   const res = await agent(
     `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEV <letter> d=<0|1> p=<0|1>". Then return the structured results: for EACH printed JEV line, an entry {blind: the letter, deliverable: (d==1), provenance: (p==1)}. Report exactly what the script printed — do not infer or change values.\n\n${script}`,
-    { model: 'haiku', schema: STAGE_SCHEMA, phase: phaseTitle, label: 'stage' }
+    { model: HELPER_MODEL, schema: STAGE_SCHEMA, phase: phaseTitle, label: 'stage' }
   ).catch(() => null)
   const v = {}
   for (const r of (res && Array.isArray(res.results) ? res.results : [])) v[String(r.blind).trim()] = r
@@ -803,7 +808,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
   const script = `${perCandidate}\n${rebuild}`
   await agent(
     `Run this exact shell script in ONE Bash call. It runs blind tournament checks and atomically rebuilds the blind pool. Do not print, summarize, or expose command output; do nothing else:\n\n${script}`,
-    { model: 'haiku', phase: phaseTitle, label: 'test-lint-enrichment' }
+    { model: HELPER_MODEL, phase: phaseTitle, label: 'test-lint-enrichment' }
   ).catch(() => null)
 }
 
@@ -1400,7 +1405,7 @@ async function persist(pairs, phaseTitle) {
       // relay VERBATIM through printf quoting; haiku abbreviated/re-typed it in 9/9 audited runs,
       // silently corrupting council/verdict artifacts. Sonnet is the interim mitigation; the real fix
       // (checksum-validated, model-independent writes) is tracked in #33 and may restore haiku here.
-      { model: 'sonnet', schema: PERSIST_SCHEMA, phase: phaseTitle, label: 'persist' }
+      { model: HELPER_MODEL, schema: PERSIST_SCHEMA, phase: phaseTitle, label: 'persist' }
     ).catch(() => null)
     const seen = {}
     for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
@@ -1626,7 +1631,7 @@ async function bundlePlan(planWs, seedPath) {
   const cmd = `mkdir -p ${q(dir)} && { echo "===== APPROVED PLAN (implement this verbatim) ====="; find ${q(planWs)} -type f 2>/dev/null | sort | while IFS= read -r f; do printf '\\n----- %s -----\\n' "$f"; cat "$f" 2>/dev/null; done; } > ${q(seedPath)} && wc -c ${q(seedPath)}`
   log(`Bundling winning plan → ${seedPath}`)
   await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
-    { model: 'haiku', phase: 'Implement Round 3', label: 'seed-plan' }).catch(() => null)
+    { model: HELPER_MODEL, phase: 'Implement Round 3', label: 'seed-plan' }).catch(() => null)
 }
 
 // A round's gate: an adoptable candidate exists iff the CODE council reached a non-vetoed majority
