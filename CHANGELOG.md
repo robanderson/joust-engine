@@ -6,6 +6,21 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Standardized implement-deliverable contract (run G).** Non-repoMode implement briefs now
+  mandate ONE fixed deliverable layout — `patches/` (ordered unified diffs) + `APPLY.md` (exact,
+  ordered apply commands) + `VERIFY.md` (how to verify), with a `files/` + `APPLY.md` full-files
+  fallback — and require a bounded self-verify (fix the diff until `git apply --check` exits 0 in
+  a scratch `git init`, or fall back) before saving. The run-F mechanical gate's SAME helper call
+  now also classifies layout conformance — `patch_layout | files_layout | engine_diff (repoMode;
+  trivially conformant) | freeform | unavailable` — and stamps a judge-visible
+  `--- Contract check --- / CONTRACT: …` line into the pool, PARALLEL to (not merged into) the
+  orthogonal `MECHANICAL:` stamp; `mapping.json` records the class per candidate. v1 grandfathers:
+  a non-conforming (freeform) layout is stamped, NEVER invalidated — only the pre-existing
+  mechanical `corrupt_patch` excludes. Fail-safe degrades to UNSTAMPED (no CONTRACT block at all),
+  blind (fixed literals, letters only), deterministic (shell presence checks; no LLM judgment).
+  Plan briefs and the repoMode brief are untouched. Tests:
+  `workflows/tournament-deliverable-contract.test.mjs`.
+
 - **Judge-panel decorrelation audit** (`bin/je-council-audit.mjs`): reads every
   `review-*/council.json` across the given run dirs (or `--runs-root [<dir>]`, default
   `/tmp/de-runs`) and reports per-seat-pair first-place vote agreement + mean Spearman

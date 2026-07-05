@@ -171,6 +171,9 @@ Rules:
 - Work only in this checkout: ${ws}
 - To save a file, just write it. If a file-edit tool refuses because the file "must be read first" (a stale copy exists), do NOT spend turns reading/retrying — overwrite it directly with the shell instead, e.g. \`cat > FILE <<'EOF' ... EOF\`.`
   }
+  // Run G (non-repoMode implement only — 'plan' returned above, repoMode returned above): ONE
+  // mandated deliverable layout + a bounded git-apply self-verify. The engine's pre-council gate
+  // stamps conformance (CONTRACT:) but v1 never invalidates a freeform layout (grandfathered).
   return `You are solving a self-contained task. Produce ONE complete solution in a single focused pass.
 
 Task:
@@ -178,9 +181,15 @@ ${task}
 ${g}${ctxLine}${seedBlock}
 ${nudge}
 
+DELIVERABLE CONTRACT (mandatory layout — a deterministic engine gate checks it before judging):
+- PRIMARY (preferred): a \`patches/\` directory holding one or more ordered unified-diff files (\`patches/0001-<name>.patch\` or \`.diff\`, applied in filename order), PLUS \`APPLY.md\` (the exact, ORDERED shell commands to apply every patch, e.g. \`git apply patches/0001-<name>.patch\`), PLUS \`VERIFY.md\` (the exact commands to verify the change and the expected result).
+- SELF-VERIFY before you stop: you have no repository checkout here, so prove your diffs are well-formed — \`git init -q\` a throwaway scratch directory (seed it with your best reconstruction of the touched files from the shared context), run \`git apply --check\` (add \`--recount\` if needed) on each patch, and FIX the diff until it exits 0. This one bounded check is REQUIRED and explicitly allowed — it is NOT the forbidden run-the-tests-and-iterate loop. If you cannot reach exit 0, switch to the FALLBACK below instead of shipping a corrupt patch.
+- FALLBACK (only if you cannot produce a clean patch): a \`files/\` directory mirroring each changed file at its full repo-relative path (e.g. \`files/src/foo.js\`), PLUS \`APPLY.md\` (the exact, ordered copy commands, and any deletions). \`VERIFY.md\` is encouraged here too.
+- Use these exact directory and file names; do NOT invent another layout or leave a bare patch in the workspace root. A conforming layout lets reviewers judge your CODE instead of your packaging (a non-conforming layout is stamped but still judged in this version).
+
 Rules:
 - This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your solution.
-- Work in a SINGLE pass and then STOP: write your solution file ONCE, then stop immediately. Do NOT run it, do NOT test or inspect it, and do NOT rewrite, re-align, "improve", or polish it. Your first version is final — even if it is imperfect or not to your taste. Perfecting it is explicitly NOT wanted here and only wastes effort.
+- Work in a SINGLE pass and then STOP: write your solution file ONCE, then stop immediately. Do NOT run it, do NOT test or inspect it, and do NOT rewrite, re-align, "improve", or polish it (sole exception: the \`git apply --check\` self-verify the DELIVERABLE CONTRACT requires). Your first version is final — even if it is imperfect or not to your taste. Perfecting it is explicitly NOT wanted here and only wastes effort.
 - Your text reply is discarded; ONLY the file(s) you save are kept. You MUST save your solution to a file (an empty workspace is a total failure) — but it does NOT need to be flawless or fully working.
 - Save all deliverable files to: ${ws}
 - Work only in that directory. Create it if needed.
@@ -681,6 +690,53 @@ function mergeMechanical(staged, byBlind) {
 }
 // ---- end: mechanical patch gate --------------------------------------------------------------
 
+// ---- begin: deliverable contract gate ----------------------------------------------------------
+// Deterministic LAYOUT-conformance classification of a staged implement candidate (run G) —
+// ORTHOGONAL to the mechanical patch gate above: MECHANICAL answers "does a found patch apply?",
+// CONTRACT answers "did the candidate use the ONE mandated deliverable layout?" (patches/ +
+// APPLY.md + VERIFY.md, or the files/ + APPLY.md full-files fallback). The axes cross freely — a
+// clean_patch can sit in a freeform layout, and a full_files deliverable can conform via files/.
+// A PARALLEL `CONTRACT:` stamp was chosen over extending the MECHANICAL: vocabulary because
+// fusing two independent axes into one grammar would need a class cross-product and would edit
+// the shipped, tested run-F gate; this block is purely additive (run F stays byte-identical).
+// v1 grandfathers: a non-conforming (freeform) layout is stamped, NEVER invalidated. Every stamp
+// is a FIXED literal (no interpolated detail), so — unlike corrupt_patch — no sanitizer is needed
+// and blindness holds structurally. Classes: patch_layout | files_layout | engine_diff | freeform
+// | unavailable ('unavailable' is bookkeeping-only: see contractStampFor).
+const CONTRACT_CLASSES = new Set(['patch_layout', 'files_layout', 'engine_diff', 'freeform', 'unavailable'])
+
+// class -> the exact judge-visible stamp line. 'unavailable' is deliberately NEVER pooled: the
+// run-G fail-safe degrades to UNSTAMPED — contractStampShell emits nothing without a grammar-
+// clean contract.txt — so gate-infra noise never becomes a judge-visible signal (contrast
+// MECH_FALLBACK, which always stamps). The freeform literal carries the anti-relitigation nudge
+// so a judge cannot see the non-conforming flag without also seeing it must not gate the rank.
+function contractStampFor(cls) {
+  switch (cls) {
+    case 'patch_layout': return 'CONTRACT: conforming (patch layout: patches/ + APPLY.md + VERIFY.md)'
+    case 'files_layout': return 'CONTRACT: conforming (full-files fallback: files/ + APPLY.md)'
+    case 'engine_diff': return 'CONTRACT: conforming (engine-generated diff; repoMode)'
+    case 'freeform': return 'CONTRACT: non-conforming layout (grandfathered v1; judge code quality, not packaging)'
+    default: return 'CONTRACT: check unavailable'
+  }
+}
+
+// Merge parsed JCON tokens onto the staged list. PURELY ADDITIVE — attaches c.contract and NEVER
+// touches valid/failReason in either direction (v1 grandfathering is structural: there is no
+// invalidation branch to flip by accident). repoModeFlag is an explicit PARAMETER (not a closure
+// over the module-level const) so this block stays extract-and-eval testable; repoMode candidates
+// are engine-generated worktree diffs — trivially conformant — so their class is forced to
+// engine_diff in pure code here, immune to helper death/garbling. Missing/unknown => 'unavailable'
+// (fail-safe: an unclassifiable candidate is never penalized, merely left unstamped in the pool).
+function mergeContract(staged, byBlind, repoModeFlag) {
+  return staged.map(c => {
+    if (repoModeFlag) return { ...c, contract: { class: 'engine_diff', stamp: contractStampFor('engine_diff') } }
+    const r = byBlind && byBlind[c.blind]
+    const cls = r && CONTRACT_CLASSES.has(r.contract) ? r.contract : 'unavailable'
+    return { ...c, contract: { class: cls, stamp: contractStampFor(cls) } }
+  })
+}
+// ---- end: deliverable contract gate ------------------------------------------------------------
+
 // ---- begin: ab briefs --------------------------------------------------------------------------
 // PURE: alternate two design-brief seed paths across the implementer pool. Even index -> brief-1
 // (the final-rank winner), odd -> brief-2 (the runner-up finalist). Anything but exactly two paths
@@ -994,6 +1050,20 @@ function mechStampShell(dest) {
   const f = `${dest}/mechanical.txt`
   return `printf '\\n--- Mechanical check ---\\n'; if grep -Eq ${q(MECH_GRAMMAR)} ${q(f)} 2>/dev/null; then cat ${q(f)}; else printf '%s' ${q(MECH_FALLBACK)}; fi`
 }
+// Run G contract-stamp plumbing. CONTRACT/JCON are provider-neutral literals — like MECHANICAL/
+// JMECH they are deliberately NOT rebrand tokens and stay byte-identical in the dev copy.
+// There is NO CONTRACT fallback constant on purpose: the run-G fail-safe is DEGRADE TO UNSTAMPED —
+// a missing or grammar-violating contract.txt emits no "--- Contract check ---" block at all
+// (contrast MECH_FALLBACK, which always stamps), so a gate that could not run leaves the pool
+// exactly as it was pre-run-G and infra noise never reads as a candidate signal.
+const CONTRACT_GRAMMAR = '^CONTRACT: (conforming \\(.*\\)|non-conforming layout \\(.*\\))$'
+// Shell snippet: emit the pooled "--- Contract check ---" block for one candidate dir, grammar-
+// guarded. Shared by mechanicalPatchGate's pool rebuild AND enrichBlindPool's rebuild loop, so
+// the two pool writers can never drift (exactly mirrors mechStampShell).
+function contractStampShell(dest) {
+  const f = `${dest}/contract.txt`
+  return `if grep -Eq ${q(CONTRACT_GRAMMAR)} ${q(f)} 2>/dev/null; then printf '\\n--- Contract check ---\\n'; cat ${q(f)}; fi`
+}
 
 const MECH_SCHEMA = {
   type: 'object', additionalProperties: false,
@@ -1002,7 +1072,11 @@ const MECH_SCHEMA = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        properties: { blind: { type: 'string' }, class: { type: 'string' }, detail: { type: 'string' } },
+        // `contract` (run G): the JCON layout-conformance token, folded into the SAME entry the
+        // way stageAndValidate folds JRC into JEV entries. OPTIONAL and never in `required`, so a
+        // helper that forgets the JCON lines degrades only the contract axis (=> 'unavailable',
+        // unstamped) and can never knock out the mechanical classification with it.
+        properties: { blind: { type: 'string' }, class: { type: 'string' }, detail: { type: 'string' }, contract: { type: 'string' } },
         required: ['blind', 'class'],
       },
     },
@@ -1013,6 +1087,8 @@ const MECH_SCHEMA = {
 // Pre-council mechanical gate (run F): classify each VALID staged implement candidate's deliverable
 // BEFORE the code council convenes — one HELPER_MODEL agent, one deterministic script, once per
 // round, never per judge (retires the 5-6x duplicated apply-checks the 9-run audit observed).
+// Run G: the SAME script/call also classifies deliverable-contract layout conformance (JCON lines
+// -> the deliverable-contract-gate block) — no second helper round-trip, no new agent step.
 // Snapshot-pinned: repoMode verifies against a DETACHED scratch worktree at baseSha; without a
 // snapshot it degrades to a structure-only well-formedness check in a throwaway `git init` repo
 // (catches the audited corrupt class: malformed/truncated diffs); no git/scratch => 'unavailable'.
@@ -1029,7 +1105,7 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       `if [ -s "$dest/candidate.diff" ]; then patch="$dest/candidate.diff"; p0=1; ` +
       `else patch=$(find "$dest" -maxdepth 3 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) 2>/dev/null | head -n1); ` +
       `  if [ -z "$patch" ]; then patch=$(grep -rlE '^(diff --git |@@ -[0-9]|--- (a/|/dev/null))' "$dest" 2>/dev/null | head -n1); fi; fi; ` +
-      `nfiles=$(find "$dest" -type f ! -name mechanical.txt 2>/dev/null | grep -c .); ` +
+      `nfiles=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt 2>/dev/null | grep -c .); ` +
       `cls=''; detail=''; ` +
       `if [ "$nfiles" -eq 0 ]; then cls=empty; ` +
       `elif [ -z "$patch" ]; then cls=full_files; ` +
@@ -1057,16 +1133,42 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       `empty) printf 'MECHANICAL: no deliverable\\n' > "$mech";; ` +
       `*) printf 'MECHANICAL: check unavailable\\n' > "$mech";; esac; ` +
       `grep -Eq ${q(MECH_GRAMMAR)} "$mech" || printf '%s' ${q(MECH_FALLBACK)} > "$mech"; ` +
-      `echo "JMECH ${c.blind} $cls $detail"` +
+      // ---- contract layout detection (run G) — see the deliverable-contract-gate block. repoMode
+      // is injected as a JS literal (engine_diff by construction: the shell must never misread a
+      // candidate-authored file named candidate.diff as engine output); non-repoMode checks the
+      // fixed contract names only — presence + non-emptiness, never candidate file CONTENT, and no
+      // candidate text is ever interpolated into the stamp (fixed literals, blind letters only).
+      `ccls=${repoMode ? 'engine_diff' : `''`}; ` +
+      `if [ -z "$ccls" ]; then ` +
+        `pn=$(find "$dest/patches" -maxdepth 1 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) -size +0c 2>/dev/null | grep -c .); ` +
+        `fn=$(find "$dest/files" -type f -size +0c 2>/dev/null | grep -c .); ` +
+        `if [ "$pn" -gt 0 ] && [ -s "$dest/APPLY.md" ] && [ -s "$dest/VERIFY.md" ]; then ccls=patch_layout; ` +
+        `elif [ "$fn" -gt 0 ] && [ -s "$dest/APPLY.md" ]; then ccls=files_layout; ` +
+        `else ccls=freeform; fi; ` +
+      `fi; ` +
+      `ctr="$dest/contract.txt"; ` +
+      `case "$ccls" in ` +
+      `patch_layout) printf 'CONTRACT: conforming (patch layout: patches/ + APPLY.md + VERIFY.md)\\n' > "$ctr";; ` +
+      `files_layout) printf 'CONTRACT: conforming (full-files fallback: files/ + APPLY.md)\\n' > "$ctr";; ` +
+      `engine_diff) printf 'CONTRACT: conforming (engine-generated diff; repoMode)\\n' > "$ctr";; ` +
+      `freeform) printf 'CONTRACT: non-conforming layout (grandfathered v1; judge code quality, not packaging)\\n' > "$ctr";; ` +
+      `*) rm -f "$ctr";; esac; ` +
+      // Degrade-to-unstamped guard: anything not matching the closed grammar is DELETED, so
+      // contractStampShell emits no block for it (run-G fail-safe; no fallback stamp on purpose).
+      `grep -Eq ${q(CONTRACT_GRAMMAR)} "$ctr" 2>/dev/null || rm -f "$ctr"; ` +
+      `echo "JMECH ${c.blind} $cls $detail"; ` +
+      `echo "JCON ${c.blind} $ccls"` +
       `)`
   }).join('\n')
   const res = await agent(
-    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JMECH <letter> <class> [detail]". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}. Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
+    `Run this exact shell script in ONE Bash call. It prints two lines per candidate: "JMECH <letter> <class> [detail]" and "JCON <letter> <class>". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}; and set that same entry's contract to the class token from the matching letter's JCON line (omit contract if that line is missing). Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
     { model: HELPER_MODEL, schema: MECH_SCHEMA, phase: phaseTitle, label: 'mechanical-gate' }
   ).catch(() => null)
   const byBlind = {}
   for (const r of (res && Array.isArray(res.results) ? res.results : [])) byBlind[String(r.blind).trim()] = r
-  const merged = mergeMechanical(staged, byBlind)
+  // Run G: the contract merge runs AFTER the mechanical merge and is purely additive (attaches
+  // c.contract, never touches valid/failReason). byBlind entries carry the optional JCON token.
+  const merged = mergeContract(mergeMechanical(staged, byBlind), byBlind, repoMode)
   // Observability: a corrupt-patch invalidation records a DISTINCT :mech seat (RC 04) — the main seat
   // already recorded its staging RC; this makes the mechanical exclusion visible without double-counting.
   for (const c of merged) if (c.mechanical && c.mechanical.class === 'corrupt_patch') recordSeatOnce(`${c.label || c.blind}:mech`, phaseTitle, RC.INVALID, 'mechanical-corrupt-patch')
@@ -1077,7 +1179,7 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
     const pool = `${reviewDir}/_pool.md`
     const rebuild = [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(merged.filter(c => c.valid).map(c => {
       const dest = `${reviewDir}/${c.blind}`
-      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; echo; } >> "$tmp"`
+      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; ${contractStampShell(dest)}; echo; } >> "$tmp"`
     })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
     await agent(
       `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
@@ -1246,6 +1348,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
            `printf '\\n--- Automated checks ---\\n'; ` +
            `if grep -Eq ${grammar} ${q(`${dest}/enrichment.txt`)}; then cat ${q(`${dest}/enrichment.txt`)}; else printf '%s' ${fallback}; fi; ` +
            `${mechStampShell(dest)}; ` +
+           `${contractStampShell(dest)}; ` +
            `printf '\\n'; } >> "$tmp"`
   }), `mv -f "$tmp" ${q(pool)}`].join('\n')
   const script = `${perCandidate}\n${rebuild}`
@@ -2737,6 +2840,7 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
   const blind = staged.filter(c => c.valid)
   const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
     ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
+    ...(c.contract ? { contract: c.contract.class } : {}), // run G: layout-conformance class (audit only; never gates)
     ...(c.seedBrief ? { seedBrief: c.seedBrief } : {}), // A/B lineage — bookkeeping only, judges never see it
     ...(c.valid ? {} : { failReason: c.failReason }) }))
   if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables (post-mechanical-gate)' } }
