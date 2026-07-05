@@ -1396,7 +1396,11 @@ async function persist(pairs, phaseTitle) {
       `"FLP <path> <byte-count>". Then return the structured results: for EACH printed FLP line, an ` +
       `entry {path: the path, bytes: the integer byte-count}. Report exactly what the script printed — ` +
       `do not infer or change values. Do nothing else:\n\n${script}`,
-      { model: 'haiku', schema: PERSIST_SCHEMA, phase: phaseTitle, label: 'persist' }
+      // sonnet, not haiku (issue #33): the persist payload is large arbitrary content the model must
+      // relay VERBATIM through printf quoting; haiku abbreviated/re-typed it in 9/9 audited runs,
+      // silently corrupting council/verdict artifacts. Sonnet is the interim mitigation; the real fix
+      // (checksum-validated, model-independent writes) is tracked in #33 and may restore haiku here.
+      { model: 'sonnet', schema: PERSIST_SCHEMA, phase: phaseTitle, label: 'persist' }
     ).catch(() => null)
     const seen = {}
     for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
