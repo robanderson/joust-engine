@@ -6,6 +6,15 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Cross-run leaderboard ledger (issue #41): `bin/je-ledger.mjs`.** `record <runDir>`
+  appends one JSON line per completed run (unblinded seats, winners, rc_summary, and — when
+  `timeline.jsonl` exists — per-phase barrier + attempt durations) to an append-only ledger
+  (`$JE_LEDGER_PATH`, default `~/.joust-engine/ledger.jsonl`); `report` aggregates it to a
+  markdown leaderboard (per-model seats/valid-rate/wins/vetoes/durations, two-pass value,
+  diversity, cost-vs-contribution) with sample sizes on every row and hypothesis-only
+  phrasing below/at n>=5. Purely additive — no engine changes. Tests:
+  `bin/je-ledger.test.mjs` (synthetic fixtures, no model/network).
+
 - **Design briefs replace file-level plans (+ split-brief A/B implement rounds).** The plan phase
   deliverable is re-altituded: attempts now produce a DESIGN BRIEF — at most 10 bullets (approach
   + why, surfaces touched, risks, testable approach-neutral acceptance criteria) with a HARD
