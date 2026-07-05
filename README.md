@@ -4,13 +4,13 @@
 >
 > 🌐 **[joustengine.ai](https://joustengine.ai)** — *site coming soon*
 
-**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* **5-lens deliberating Opus council** scores them, votes, and names a winner — a deterministic majority tally in code, never an LLM "summarising the consensus". The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax, xAI Grok); the judges are always Opus, held fixed so the comparison stays honest.
+**Joust Engine is a Claude Code plugin that runs best-of-N tournaments.** You hand it a task; it produces N independent attempts in parallel, then a *blind* **6-judge council** scores them, votes once, and names a winner — a deterministic majority tally in code (councils never deliberate; ties are settled by a steelman-improvement shootout), never an LLM "summarising the consensus". The attempts can come from any mix of providers (Anthropic, GLM, on-device MLX, OpenAI Codex, MiniMax, xAI Grok); the judge panel is held fixed (Opus anchor seats + codex-xhigh cross-family seats) so the comparison stays honest.
 
 ```text
 @@JE:5  Build a CLI that flattens nested JSON to dotted keys.
 ```
 
-That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and the blind Opus council crowns a winner. Add `:2` for the full two-round plan phase, `implement` for the implementation rounds, or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
+That one line triggers the loop: it asks which model(s) to run the 5 attempts on, you answer, it fans out 5 isolated workers, and the blind council crowns a winner. Add `:2` for the full two-round plan phase, `implement` for the implementation rounds, or a `:Z` for grand loops (an unattended chain that implements each winner into a real branch and opens a PR).
 
 ---
 
@@ -43,7 +43,7 @@ A single LLM attempt at a task is one sample from a noisy distribution. The Jous
 
 1. **Generate, don't iterate.** Run **N attempts in parallel**, each a *single-pass exploration* — every attempt writes its solution **once and stops**. No attempt is told it's competing or being judged; none sees another's work. The refinement happens at the *tournament* level (many diverse one-shots → review), never inside a single attempt grinding "until it works." A rough or even failed attempt is useful signal, not a wasted slot.
 
-2. **Judge blind, with fixed strong judges.** A blind **Opus council** (five lens judges; see below) receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. Each judge reads (and where feasible runs) each one, scores it through its lens, lists concrete pros and cons, ranks them, and casts a first-place vote; code tallies the majority. Because the judges never learn which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
+2. **Judge blind, with fixed strong judges.** A blind **judging council** (six seats; see below) receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. Each judge reads (and where feasible runs) each one, scores it through its lens, lists concrete pros and cons, ranks them, and casts a first-place vote; code tallies the majority. Because the judges never learn which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
 
 The attempts are deliberately *diverse*: different model families, sampling stochasticity, and a per-attempt framing nudge ([diversity injection](#diversity-injection-pool-a--pool-b)) all push the N solutions apart so the review has genuinely different things to compare.
 
@@ -92,13 +92,14 @@ Cost scales with what you enable: plan-only two pass ≈ 2N attempts + 2 council
 
 ## The judging council
 
-Every judging point (the round-1 review and the final rank) is, by default, a **council of five blind Opus judges**, one lens each — **correctness/verification** (runs the code, cites real exit codes), **spec-compliance**, **security** (holds the veto), **robustness/edge-cases**, and **craft/efficiency**. All five are blind to model identities and must ground every verdict in a required `checks_run` evidence list.
+Every judging point (the round-1 review and the final rank) is, by default, a **council of six blind judges** — five lenses (**correctness/verification** (runs the code, cites real exit codes), **spec-compliance**, **security** (holds the veto), **robustness/edge-cases**, **craft/efficiency**) plus **security-x**, a second cross-family security gate. The completeness-class and simplicity-class seats and security-x run on **codex-xhigh** (a different model family from the models that author most attempts); the security veto and the verification-heavy lenses are always Anthropic Opus. All six are blind to model identities and must ground every verdict in a required `checks_run` evidence list.
 
-- **Round 1 is independent** — no judge sees a peer. Then the tally runs **in code**: a candidate wins with **>50% of living judges' first-place votes**, and a candidate the security judge flags `UNSAFE` (high/critical severity **with concrete evidence**) cannot win regardless of votes.
-- **No majority → bounded deliberation** (max 3 rounds): each judge sees the peers' verbatim verdicts, may run 1–2 targeted checks to settle a factual dispute, and revises. Peers can rebut a veto with evidence; a standing veto excludes the candidate.
-- **Still split → `NO_CONSENSUS`** — surfaced to you (or needs-human + HALT in a grand loop). It is never silently resolved by a score average, Borda, or a meta-judge.
+- **The vote is independent, and councils never deliberate (judging-v3)** — no judge sees a peer. The tally runs **in code**: **>50% of living judges' first-place votes** on a candidate neither security gate has flagged `UNSAFE` (high/critical severity **with concrete evidence** — a union veto).
+- **Intermediate reviews fast-tally**: a majority carries one champion into the final pool; a split carries the **top two** non-vetoed. Nothing deliberates; the round's learning goes into the round-2 guidance.
+- **Final decision points run the steelman shootout**: the vote seeds the top-2 finalists, a non-voting steelman distils the judges' cons into minimal change-lists, each finalist is boosted on a copy (validation-gated), and a **cold blind re-judge** (fresh letters, no history) votes again — tie → iterate (max 5) → the orchestrator casts the deciding vote between the two gated finalists. The winner ships with its improvements applied.
+- **All finalists vetoed → `NO_CONSENSUS`** — surfaced to you (or needs-human + HALT in a grand loop). It is never silently resolved by a score average, Borda, or a meta-judge, and a vetoed candidate can never be picked.
 - A **verdict-integrity guard** rejects schema-valid-but-junk verdicts (placeholder reasoning, collapsed pros/cons, vacuous veto evidence) at every choke point, so a degenerate judge output dies and retries instead of steering the run.
-- `judges: 1` restores the legacy single blind Opus judge (cheap runs).
+- `judges: 1` restores the legacy single blind Opus judge (cheap runs); `dualSecurity: false` drops only the security-x seat; `judgeMix: 'anthropic'` forces every seat native Opus.
 
 The design follows the LLM-as-judge research in [issue #22](https://github.com/robanderson/joust-engine/issues/22) and `docs/superpowers/specs/2026-07-02-judge-council-design.md`: diverse lenses over one generalist, independent votes before cross-talk, aggregation in code, evidence-forcing, and fail-closed no-consensus routing.
 
@@ -224,7 +225,7 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 
 ## Model providers
 
-Attempts can run on six providers. The **reviewers and final rankers are always Anthropic Opus** (the 5-lens council, or the `judges:1` single judge), dispatched via the Task tool — never anything else — so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
+Attempts can run on six providers. The **judge panel is held fixed** (the 6-seat council anchored on Anthropic Opus — the security veto and verification-heavy lenses are always Opus, three seats run codex-xhigh — or the `judges:1` single Opus judge) so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
 
 | Provider | Models (selectable axis) | Dispatch | Auth (from the **environment**) |
 |---|---|---|---|

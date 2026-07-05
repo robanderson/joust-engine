@@ -216,9 +216,9 @@ If many concurrent requests hit provider rate ceilings, run in smaller parallel 
 
 ## Phase 3: Blind Opus council review
 
-The workflow judges the first round with a **5-lens deliberating Opus council** (the default) — five blind Opus judges, one lens each (**correctness, spec, security, robustness, craft**), following `references/review-rubric.md`. Every judge is blind (candidate letters only, never model identities). The engine does all of this for you inside `workflows/tournament.mjs`; the summary here is so you can explain it and read the result:
+The workflow judges the first round with a **blind 6-seat council that votes once and never deliberates (judging-v3)** — five lenses (**correctness, spec, security, robustness, craft**) plus the `security-x` second security gate, following `references/review-rubric.md`. Every judge is blind (candidate letters only, never model identities). The engine does all of this for you inside `workflows/tournament.mjs`; the summary here is so you can explain it and read the result:
 
-1. **Round 1 — independent.** Five parallel verdicts, no peer visibility: per-candidate pros/cons through each lens, a full ranking, a first-place vote, `checks_run` evidence, and (security lens) per-candidate `safety` flags.
+1. **Round 1 — independent.** Six parallel verdicts, no peer visibility: per-candidate pros/cons through each lens, a full ranking, a first-place vote, `checks_run` evidence, and (security lens) per-candidate `safety` flags.
 2. **Deterministic tally in code** (never an LLM): a **>50% majority** of the living judges' first-place votes on a candidate the security lens has **not** vetoed wins.
 3. **No deliberation — judging-v3.** At an INTERMEDIATE review (two-pass Round-1): **fast tally** — majority carries one champion; a split carries the TOP TWO non-vetoed candidates into the final pool; all-vetoed carries none (round 2 proceeds on guidance alone). At a FINAL decision point (Final rank, implement reviews, single-pass Review): the **steelman shootout** — the vote only SEEDS the top-2 finalists; a non-voting steelman turns the judges' cons into per-finalist minimal change-lists, implementers apply them to copies (staging-gated, ratcheted), and a COLD blind re-judge (fresh letters, no history) votes again; tie → iterate (max 5) → **`needs_orchestrator_pick`** (you, the orchestrator, cast the deciding vote between the two gated finalists and record one-paragraph reasoning). See `references/review-rubric.md`.
 4. **NO_CONSENSUS** only remains for the all-vetoed case (every candidate, or both steelman finalists, vetoed UNSAFE): the run does **not** invent a winner (`no_consensus: true`, `winner: null`; full split persisted in `review-*/council.json` / `verdict.md`). In a grand loop this routes the loop to needs-human + HALT (Phase 7).
@@ -226,15 +226,15 @@ The workflow judges the first round with a **5-lens deliberating Opus council** 
 **Then the modes diverge:**
 
 - **Single pass:** the council's majority winner **is the result**. Skip Phases 4 and 5 and go straight to Phase 6 to report. (No round-two guidance is produced in single pass.)
-- **Two pass:** a **separate synthesis step** (explicitly *not* a decision-maker — it never picks a winner or merges votes) distils guidance for round two from the five final verdicts, across all candidates, phrased generically with no candidate-specific code:
+- **Two pass:** a **separate synthesis step** (explicitly *not* a decision-maker — it never picks a winner or merges votes) distils guidance for round two from the final verdicts, across all candidates, phrased generically with no candidate-specific code:
   - **Positives to consider:** patterns and choices that worked well anywhere in round one.
   - **Challenges to avoid:** pitfalls, bugs, and weaknesses seen anywhere in round one.
 
-  The engine then **saves** the council-winning round-one work product (the carried-over champion for the final pool) and **discards** the other round-one artifacts, keeping only the distilled guidance — not the losing code. Continue to Phase 4.
+  The engine then **saves** the carried champion(s) — one on a majority, the top two non-vetoed on a fast-tally split — for the final pool and **discards** the other round-one artifacts, keeping only the distilled guidance — not the losing code. Continue to Phase 4.
 
-**Mixed-family judging (default).** Two seats per council (spec/craft for code, completeness/simplicity for plan) run on **codex-xhigh** via the existing `joust-codex` agent + `codexRunner` — pass `codexRunner` even for a judge-only-mixed run, or those seats fall back to native Opus (logged once). The security veto and the verification-heavy lenses stay Opus; `judgeMix: 'anthropic'` forces every seat back to Opus, byte-for-byte. Every judge's brief (both families) is pinned to the tournament snapshot and forbidden from the live checkout. See `references/review-rubric.md`.
+**Mixed-family judging (default).** Three seats per council (spec/craft for code, completeness/simplicity for plan, plus the `security-x` second security gate) run on **codex-xhigh** via the existing `joust-codex` agent + `codexRunner` — pass `codexRunner` even for a judge-only-mixed run, or those seats fall back to native Opus (logged once). The security veto and the verification-heavy lenses stay Opus; `judgeMix: 'anthropic'` forces every seat back to Opus, byte-for-byte. Every judge's brief (both families) is pinned to the tournament snapshot and forbidden from the live checkout. See `references/review-rubric.md`.
 
-**Legacy single judge.** Passing `judges: 1` in the workflow args restores the pre-council behaviour — one blind Opus judge does the whole job (judge, rank, name the winner, and in two pass distil guidance). Council size is otherwise fixed at 5.
+**Legacy single judge.** Passing `judges: 1` in the workflow args restores the pre-council behaviour — one blind Opus judge does the whole job (judge, rank, name the winner, and in two pass distil guidance). Council size is otherwise fixed at 6 (5 with `dualSecurity: false`).
 
 ## Phase 4 (two pass only): Run round 2 with the guidance
 
