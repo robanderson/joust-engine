@@ -6,6 +6,13 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Changed
 
+- **Runner wrapper agents haiku → sonnet.** The 8 provider wrapper agents
+  (`joust-codex`, `joust-glm-*` ×4, `joust-minimax`, `joust-local`, `joust-grok`) pinned
+  `model: haiku` in their frontmatter — the last haiku sub-agents left after the
+  `HELPER_MODEL` sonnet bump. They relay runner commands/output verbatim, exactly the
+  workload haiku corrupted in issue #33, and they now also carry the council's codex
+  judge seats. All bumped to `model: sonnet`.
+
 - **Dual security gates + codex tier policy (spec addendum).** Every council now seats a
   SIXTH judge: `security-x`, a second security gate on **codex-xhigh** (cross-family — it
   resists assumptions natural to the Anthropic models that author most candidates). Veto is
