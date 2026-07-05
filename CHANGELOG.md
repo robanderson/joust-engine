@@ -6,6 +6,15 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Judge-panel decorrelation audit** (`bin/je-council-audit.mjs`): reads every
+  `review-*/council.json` across the given run dirs (or `--runs-root [<dir>]`, default
+  `/tmp/de-runs`) and reports per-seat-pair first-place vote agreement + mean Spearman
+  rank correlation (n everywhere), a ranked redundancy list (pairs at agreement ≥0.8 with
+  n≥5 flagged as ~1 effective vote), an effective-votes estimate, and hypotheses only —
+  never prescriptions below n≥5. Security seats are never pruning candidates (veto
+  redundancy is deliberate, cross-family). Basis: arXiv:2605.29800 "Nine Judges, Two
+  Effective Votes". Tests in `bin/je-council-audit.test.mjs`.
+
 - **Pool A2 angle briefs — specification-level diversity injection.** New reusable library of
   10 orthogonal one-paragraph angle briefs for design-brief rounds (minimal-diff conservative,
   refactor-first structural, data-model-led, interface/contract-led, test-harness-led,
