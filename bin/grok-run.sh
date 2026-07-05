@@ -10,8 +10,21 @@ LOG=_grok_run.log
 TIMEOUT="${JE_TIMEOUT_SECS:-600}"   # wall-clock backstop (seconds)
 MAXTURNS="${JE_MAX_TURNS:-30}"      # PRIMARY guard: cap agentic iterations (grok HAS --max-turns)
 
-[ -f _brief.txt ] || { echo "JOUST-GROK-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
-command -v grok >/dev/null 2>&1 || { echo "JOUST-GROK-ERROR grok CLI not found on PATH" | tee -a "$LOG"; exit 5; }
+# ---- JE-RC observability: append exactly one terminal `JOUST-RC <code> <reason>` line on EVERY exit
+# path (complements the JOUST-GROK-DONE/TIMEOUT markers). `JOUST-` is deliberately NOT rebranded, so
+# this marker is byte-identical prod vs dev-rebranded. `_rc_emitted` is a plain lowercase var so
+# rebrand's JE_->DE_ rule cannot touch it. Missing line parses as RC 09 in the engine (a runner bug).
+_rc_emitted=0
+emit_rc() {                     # emit_rc <code> <reason>; idempotent (first call wins)
+  [ "$_rc_emitted" = "1" ] && return 0
+  _rc_emitted=1
+  printf 'JOUST-RC %s %s\n' "$1" "$2" >> "$LOG"
+}
+trap 'emit_rc 08 signal-abort' INT TERM
+trap 'emit_rc 09 unclassified' EXIT
+
+[ -f _brief.txt ] || { echo "JOUST-GROK-ERROR _brief.txt missing" | tee -a "$LOG"; emit_rc 07 missing-brief; exit 4; }
+command -v grok >/dev/null 2>&1 || { echo "JOUST-GROK-ERROR grok CLI not found on PATH" | tee -a "$LOG"; emit_rc 07 missing-runner; exit 5; }
 
 # Auth (the grok-specific part): grok resolves its OWN credential in order
 #   model.api_key > model.env_key > active OAuth session (~/.grok/auth.json) > XAI_API_KEY (xai- prefix).
@@ -84,8 +97,15 @@ if grep -qiE '401 Unauthorized|403 Forbidden|invalid api key|model .* (not found
    && ! find . -type f ! -name '_brief.txt' ! -name '_grok_run.log' | grep -q .; then
   echo "JOUST-GROK-ERROR grok reported a model/auth/version failure (see log)" >> "$LOG"
   [ "$RC" -eq 0 ] && RC=6
+  emit_rc 02 provider-auth-endpoint
 fi
 
 [ "$RC" -eq 124 ] && echo "JOUST-GROK-TIMEOUT secs=${TIMEOUT}" >> "$LOG"
+# Classify (the 02 force-fail above, if any, already won idempotently). Grok HAS --max-turns, so a
+# turn-cap exhaustion (03) is an honest model loss; anything else non-zero is a runner-level error (09).
+if [ "$RC" -eq 0 ]; then emit_rc 00 ok
+elif [ "$RC" -eq 124 ]; then emit_rc 01 wall-clock-timeout
+elif grep -q 'Reached max turns' "$LOG"; then emit_rc 03 turn-cap
+else emit_rc 09 runner-error; fi
 echo "JOUST-GROK-DONE exit=$RC" >> "$LOG"
 tail -20 "$LOG"

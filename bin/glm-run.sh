@@ -26,8 +26,23 @@ MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (si
 RETRIES="${JE_GLM_RETRIES:-3}"       # max ADDITIONAL tries after the first (<=4 total)
 BACKOFF="${JE_GLM_BACKOFF_BASE:-15}" # first retry delay (seconds); doubles per retry
 JITTER_MAX="${JE_GLM_JITTER_MAX:-10}" # random 0..N s added to startup + each backoff
-if [ -z "${ZAI_API_KEY:-}" ]; then echo "JOUST-GLM-ERROR ZAI_API_KEY missing" | tee -a "$LOG"; exit 3; fi
-[ -f _brief.txt ] || { echo "JOUST-GLM-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
+
+# ---- JE-RC observability: append exactly one terminal `JOUST-RC <code> <reason>` line to $LOG on
+# EVERY exit path (complements, never replaces, the JOUST-GLM-DONE/TIMEOUT provenance markers). The
+# engine parses this line; its ABSENCE parses as RC 09 (a runner bug). `JOUST-` is deliberately NOT a
+# rebrand token, so this marker is byte-identical in the prod + dev-rebranded copies. `_rc_emitted` is
+# a plain lowercase var (no JE_ prefix) so rebrand's JE_->DE_ rule cannot touch it.
+_rc_emitted=0
+emit_rc() {                     # emit_rc <code> <reason>; idempotent (first call wins)
+  [ "$_rc_emitted" = "1" ] && return 0
+  _rc_emitted=1
+  printf 'JOUST-RC %s %s\n' "$1" "$2" >> "$LOG"
+}
+trap 'emit_rc 08 signal-abort' INT TERM
+trap 'emit_rc 09 unclassified' EXIT     # catch-all: no-op if an explicit emit already fired
+
+if [ -z "${ZAI_API_KEY:-}" ]; then echo "JOUST-GLM-ERROR ZAI_API_KEY missing" | tee -a "$LOG"; emit_rc 07 missing-key; exit 3; fi
+[ -f _brief.txt ] || { echo "JOUST-GLM-ERROR _brief.txt missing" | tee -a "$LOG"; emit_rc 07 missing-brief; exit 4; }
 
 # Portable random 0..N seconds (macOS has no shuf; sh has no reliable $RANDOM).
 jitter() { perl -e 'print int(rand($ARGV[0]+1))' "$1"; }
@@ -70,8 +85,8 @@ while :; do
   LINES_BEFORE=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
   run_try
   RC=$?
-  [ "$RC" -eq 0 ] && break
-  if [ "$RC" -eq 124 ]; then echo "JOUST-GLM-TIMEOUT secs=${TIMEOUT}" >> "$LOG"; break; fi
+  [ "$RC" -eq 0 ] && { emit_rc 00 ok; break; }
+  if [ "$RC" -eq 124 ]; then echo "JOUST-GLM-TIMEOUT secs=${TIMEOUT}" >> "$LOG"; emit_rc 01 wall-clock-timeout; break; fi
   # Retry ONLY on a TRANSIENT marker in THIS try's appended output — hard errors fail
   # closed immediately. Markers: a 5xx/overload status, OR (issue #31) a timeout-class
   # API error on the CLI's stable 'API Error:' line ('...timed out' / '...timeout').
@@ -83,6 +98,7 @@ while :; do
   if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'API Error: *(429|500|502|503|529)|overloaded|API Error:.*(timed out|timeout)'; then
     if [ "$TRY" -ge "$MAXTRIES" ]; then
       echo "JOUST-GLM-RETRIES-EXHAUSTED tries=${TRY}" >> "$LOG"
+      emit_rc 02 retries-exhausted
       break
     fi
     DELAY=$(( BACKOFF * (1 << (TRY - 1)) ))
@@ -91,6 +107,13 @@ while :; do
     echo "JOUST-GLM-RETRY try=${TRY}/${MAXTRIES} backoff=${DELAY}s reason=transient-overload" >> "$LOG"
     sleep "$DELAY"
     continue
+  fi
+  # Unclassified non-transient failure: derive from THIS try's appended output — a turn-cap exhaustion
+  # (03) is an honest model loss; anything else is a runner-level error (09).
+  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -q 'Reached max turns'; then
+    emit_rc 03 turn-cap
+  else
+    emit_rc 09 runner-error
   fi
   break
 done

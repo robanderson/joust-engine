@@ -423,6 +423,82 @@ const nsAgent = t => (t && !t.includes(':')) ? `joust-engine:${t}` : t
 // cause is a plugin installed/updated AFTER session start (agent types register only at
 // session start). The canonical error text is: agent type 'x' not found.
 const dispatchDrops = [] // {label, displayModel, agentType, phase} — one per unregistered-agent drop
+// ---- per-seat return-code accumulator (issue: return-codes design). Read-only bookkeeping fed at
+// existing observation points; it NEVER gates dispatch/judging/any return (observability only), so it
+// mirrors the dispatchDrops pattern. Each entry: {seat, phase, rc, reason, logPath?}. `logPath` (runner
+// seats only) lets the auto-issue hook grep a real JOUST-* marker excerpt for the evidence file.
+const seatRcs = []
+function recordSeat(seat, phase, rc, reason, logPath) { seatRcs.push({ seat, phase, rc, reason, ...(logPath ? { logPath } : {}) }) }
+
+// ---- begin: return codes ----------------------------------------------------------------------
+// Official per-seat return codes (JE-RC 00–09). RCs are OBSERVABILITY, not control flow — nothing
+// here gates dispatch, staging, judging, or any return; it only classifies signals the engine has
+// ALREADY observed. Every function below is PURE (no closures over module state, no I/O) so
+// workflows/tournament-return-codes.test.mjs can extract this marked block and eval it in isolation,
+// exactly like the verdict-integrity block above.
+//
+// LOAD-BEARING INVARIANT: the literal marker runners write is `JOUST-RC <code> <reason>`, and
+// `JOUST-` is deliberately NOT a rebrand replacement token — so this parse regex stays byte-identical
+// to the writer (emit_rc in bin/*-run.sh) in BOTH the prod and dev-rebranded copies. Do not add a
+// `JOUST-` rewrite to rebrand.config.json.
+const RC = { OK:'00', TIMEOUT:'01', UNAVAIL:'02', TURNCAP:'03', INVALID:'04',
+             NODELIV:'05', PROV:'06', ENV:'07', ABORT:'08', UNKNOWN:'09' }
+// classes that auto-file an engine-fault issue (spec §3: 01/02 after retries, 04-09; NOT 00/03).
+const ENGINE_FAULT_CLASSES = new Set(['01','02','04','05','06','07','08','09'])
+const RC_MEANING = { '00':'expected result','01':'model timeout','02':'model unavailable/throttled',
+  '03':'turn-cap exhausted','04':'invalid output','05':'no deliverable saved','06':'provenance failure',
+  '07':'environment/permission failure','08':'aborted/killed','09':'unknown/other error' }
+
+// parse the LAST `JOUST-RC <code> <reason>` line from a runner log's text. Missing line => RC 09.
+function parseRunnerRc(logText) {
+  const lines = String(logText == null ? '' : logText).split('\n')
+  let last = null
+  for (const ln of lines) { const m = /^JOUST-RC ([0-9]{2}) ?(.*)$/.exec(ln.trim()); if (m) last = m }
+  if (!last) return { rc: RC.UNKNOWN, reason: 'no-jerc-line' }
+  return { rc: last[1], reason: (last[2] || '').trim() || RC_MEANING[last[1]] || 'unclassified' }
+}
+// native anthropic attempt (no runner): derive from staging truth only.
+function deriveNativeAttemptRc({ dispatchedOk, valid, failReason }) {
+  if (!dispatchedOk) return { rc: RC.UNKNOWN, reason: 'agent-null-or-throw' }
+  if (valid) return { rc: RC.OK, reason: 'ok' }
+  const fr = String(failReason || '')
+  if (/no deliverable/i.test(fr)) return { rc: RC.NODELIV, reason: 'no-deliverable' }
+  if (/provenance/i.test(fr))     return { rc: RC.PROV,    reason: 'provenance' }
+  return { rc: RC.INVALID, reason: 'invalid-or-missing-staging' }
+}
+// runner attempt: the runner's own RC is authoritative for what happened inside it, but the engine
+// also observes staging. If the runner said 00 yet staging rejected it, reclassify to staging truth.
+function deriveRunnerAttemptRc({ runnerRc, runnerReason, valid, failReason }) {
+  if (!runnerRc) return { rc: RC.UNKNOWN, reason: 'no-jerc-line' }
+  if (runnerRc !== RC.OK) return { rc: runnerRc, reason: runnerReason || RC_MEANING[runnerRc] }
+  if (valid) return { rc: RC.OK, reason: 'ok' }
+  const fr = String(failReason || '')
+  if (/no deliverable/i.test(fr)) return { rc: RC.NODELIV, reason: 'no-deliverable' }
+  if (/provenance/i.test(fr))     return { rc: RC.PROV,    reason: 'provenance' }
+  return { rc: RC.INVALID, reason: 'invalid-output' }
+}
+// build the rc_summary from the flat seat accumulator (pure).
+function buildRcSummary(seatRcs) {
+  const seats = seatRcs.length
+  const by_code = {}
+  const non00 = []
+  for (const s of seatRcs) {
+    by_code[s.rc] = (by_code[s.rc] || 0) + 1
+    if (s.rc !== RC.OK) non00.push({ seat: s.seat, phase: s.phase, rc: s.rc, reason: s.reason })
+  }
+  return { seats, by_code, non00 }
+}
+// ---- end: return codes ------------------------------------------------------------------------
+// Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
+// fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
+const rcSummaryLive = () => buildRcSummary(seatRcs)
+// Auto-issue args (spec §3, default-ON for engine-fault classes; fail-closed + fire-and-forget):
+//   noAutoIssue:true  -> skip filing entirely
+//   issueRunner       -> absolute path to bin/je-issue.sh (absent => skip, logged once)
+//   engineRepo        -> owner/repo to pin GH_REPO to (default = the public canonical repo)
+const engineRepo = A.engineRepo || 'robanderson/joust-engine'
+const autoIssue = A.noAutoIssue !== true && !!A.issueRunner
+let autoIssueWarned = false
 // Match the canonical harness text `agent type 'x' not found` ONLY: same line, bounded gap.
 // (No /s flag and a no-newline bounded gap so a multi-line runner transcript that merely
 // mentions "agent type" somewhere and an unrelated "X not found" elsewhere is NOT misread
@@ -533,6 +609,9 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
       } else {
         log(`attempt ${a.label} (${a.displayModel}) errored: ${msg.slice(0, 100)}`) // (a) ran-but-lost; don't swallow silently
       }
+      // Observability: capture the never-staged / silently-lost seat through the parallel accumulator
+      // (RC 09) so full seat visibility survives without touching the null-filter or return shape.
+      recordSeat(a.label, phaseTitle, RC.UNKNOWN, 'dispatch-drop-or-null')
       return null
     })
 }
@@ -637,7 +716,10 @@ const STAGE_SCHEMA = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        properties: { blind: { type: 'string' }, deliverable: { type: 'boolean' }, provenance: { type: 'boolean' } },
+        // rc/rcReason (OPTIONAL, additive): the runner's terminal `JOUST-RC <code> <reason>` line,
+        // relayed from the staging grep. Native candidates have no log and simply omit them; a stale
+        // result without them is back-compatible. Never in `required`.
+        properties: { blind: { type: 'string' }, deliverable: { type: 'boolean' }, provenance: { type: 'boolean' }, rc: { type: 'string' }, rcReason: { type: 'string' } },
         required: ['blind', 'deliverable', 'provenance'],
       },
     },
@@ -722,6 +804,9 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
     // winner is wrongly dropped. provCheckShell skips ONLY the provenance grep for a carryover (P=1); the
     // deliverable requirement below (`D>0`) is still enforced, so an empty carryover is still excluded.
     const provChk = provCheckShell(log, tok, lp, !!c.carriedOver)
+    // Surface the runner's terminal JOUST-RC line (observability). Appended after the JEV line so the
+    // helper agent relays it too; native candidates (no log) emit nothing here.
+    const rcEcho = lp ? `; rcline=$(grep -a '^JOUST-RC ' ${lp} 2>/dev/null | tail -n1); echo "JRC ${c.blind} ${'${rcline:-NONE}'}"` : ''
     if (repoMode) {
       // repoMode: the blind artifact is a DIFF, not a copied workspace. Capture `git diff <baseSha> HEAD`
       // (no author/date/branch/message metadata leaks into judging) and keep the same D/P pool gate + JEV
@@ -730,22 +815,22 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
       if (c.carriedOver) {
         return `mkdir -p ${q(dest)}; if [ -s ${q(`${c.ws}/candidate.diff`)} ]; then cp ${q(`${c.ws}/candidate.diff`)} ${q(diffPath)}; D=1; else D=0; fi; ${provChk}; ` +
                `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
-               `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`
+               `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
       }
       return `mkdir -p ${q(dest)}; git -C ${q(c.ws)} diff ${q(baseSha)} HEAD --no-color --no-prefix > ${q(diffPath)} 2>/dev/null; ` +
              `if [ -s ${q(diffPath)} ]; then D=1; else D=0; fi; ${provChk}; ` +
              `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
-             `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`
+             `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
     }
     return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
            `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt ${q(dest)}/_minimax_run.log ${q(dest)}/_grok_run.log; ` +
            `find ${q(dest)} -mindepth 1 ! -type f ! -type d -delete 2>/dev/null; ` +
            `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
            `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
-           `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`
+           `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
   })).join('\n')
   const res = await agent(
-    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEV <letter> d=<0|1> p=<0|1>". Then return the structured results: for EACH printed JEV line, an entry {blind: the letter, deliverable: (d==1), provenance: (p==1)}. Report exactly what the script printed — do not infer or change values.\n\n${script}`,
+    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEV <letter> d=<0|1> p=<0|1>", and (for runner candidates only) a matching line "JRC <letter> JOUST-RC <code> <reason>" or "JRC <letter> NONE". Then return the structured results: for EACH printed JEV line, an entry {blind: the letter, deliverable: (d==1), provenance: (p==1)}; and for the matching JRC line, set that blind's rc to the two-digit <code> and rcReason to the <reason> text after "JOUST-RC" ("NONE" or no JRC line => omit rc/rcReason). Report exactly what the script printed — do not infer or change values.\n\n${script}`,
     { model: HELPER_MODEL, schema: STAGE_SCHEMA, phase: phaseTitle, label: 'stage' }
   ).catch(() => null)
   const v = {}
@@ -754,11 +839,32 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
     const r = v[c.blind]                           // FAIL CLOSED: missing/unparsed → invalid
     const valid = !!(r && r.deliverable && r.provenance)
     const failReason = valid ? '' : (!r ? 'staging result missing (failed closed)' : (!r.deliverable ? 'no deliverable saved' : 'provenance check failed (timeout/error/empty)'))
+    // ---- per-seat RC derivation (observability only; additive fields, no consumer contract change).
+    // A runner candidate carries a JOUST-RC line in its engine log; parse it and let the runner's own
+    // code win unless it said 00 while staging rejected the deliverable (then staging truth wins). A
+    // native anthropic attempt has no runner log — derive purely from staging truth. dispatchedOk is
+    // true here (it survived dispatch to reach staging; null/throw seats were recorded in dispatch()).
+    const isRunner = c.dispatch && c.dispatch !== 'anthropic'
+    const runnerLog = isRunner ? (c.dispatch === 'glm' ? '_glm_run.log'
+      : c.dispatch === 'local' ? '_local_run.log' : c.dispatch === 'codex' ? '_codex_run.log'
+      : c.dispatch === 'minimax' ? '_minimax_run.log' : c.dispatch === 'grok' ? '_grok_run.log' : '') : ''
+    const logPath = runnerLog ? engineLogPath(c, runnerLog) : ''
+    // The runner's JOUST-RC line was already relayed in the staging result when present (r.rc); when it
+    // was not captured, deriveRunnerAttemptRc falls back to staging truth (a runner with no JOUST-RC
+    // line is itself an RC-09 signal). Native seats derive from staging directly.
+    const seat = isRunner
+      ? deriveRunnerAttemptRc({ runnerRc: (r && r.rc) || (valid ? RC.OK : null), runnerReason: r && r.rcReason, valid, failReason })
+      : deriveNativeAttemptRc({ dispatchedOk: true, valid, failReason })
+    recordSeat(c.label || c.blind, phaseTitle, seat.rc, seat.reason, logPath || undefined)
     // Staging changes ws to the blind review directory. Phase 5 still needs the runnable checkout;
     // expose it only in repoMode so the legacy object shape and all legacy consumers stay unchanged.
-    return repoMode
+    // The per-seat rc/rcReason are attached AFTER construction (additive; no consumer contract change).
+    const staged = repoMode
       ? { ...c, liveWs: c.ws, ws: `${reviewDir}/${c.blind}`, valid, failReason }
       : { ...c, ws: `${reviewDir}/${c.blind}`, valid, failReason }
+    staged.rc = seat.rc
+    staged.rcReason = seat.reason
+    return staged
   })
 }
 
@@ -925,6 +1031,7 @@ function guidanceIntegrityIssue(g) {
   return null
 }
 // ---- end: verdict integrity guard ------------------------------------------------------------
+
 
 // ---- begin: codex-judge routing + verdict parsing (mixed-family council, 2026-07-05) --------------
 // Every function here is PURE (no closures over module state, no I/O) so it can be extracted and
@@ -1224,6 +1331,10 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
     const result = await askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
     if (result) return result
     log(`JE-COUNCIL-FALLBACK [${phaseTitle}] ${label} (${lens.key}): codex-xhigh seat exhausted retries — falling back to native Opus for this round so the council does not lose a seat.`)
+    // A fallback IS an existing behavioural branch, so recording a RECOVERED fault here honours the
+    // "observability, except where behaviour already branches" clause: the seat stays living (Opus) but
+    // its codex leg faulted — record RC 02 so the report shows the recovered fault (never silently dropped).
+    recordSeat(`${label}:codex`, phaseTitle, RC.UNAVAIL, 'codex-seat-fallback-to-opus')
   } else if (!LEGACY_MIX && lens.judge && lens.judge.kind === 'codex' && !codexRunner && !codexRunnerWarned) {
     log(`JE-COUNCIL-WARNING: codexRunner not supplied — codex judge seat(s) (spec/craft/completeness/simplicity) will run as native Opus this run. Pass args.codexRunner to enable mixed-family judging.`)
     codexRunnerWarned = true
@@ -1403,15 +1514,21 @@ function mergeCandidates(verdicts, labels) {
 }
 
 // Per-round persisted record: living lenses, votes, veto, winner, and each judge's blind verdict.
-function roundRecord(round, verdicts, t) {
+// `requested` (optional): the round's REQUESTED lens list — when passed, dead_seats records each
+// requested lens with no living verdict this round as a non-00 judge seat (observability).
+function roundRecord(round, verdicts, t, requested) {
+  const living = new Set(verdicts.map(v => v.lens))
+  const dead_seats = (requested || []).filter(l => !living.has(l.key)).map(l => ({ lens: l.key, rc: '09', reason: 'lens-seat-dead-after-retries' }))
   return {
     round,
     living: verdicts.map(v => v.lens),
     votes: { ...t.votes },
     vetoed: t.vetoed,
     winner: t.winner,
+    dead_seats,
     verdicts: verdicts.map(v => ({
       lens: v.lens,
+      rc: '00', // a living lens seat succeeded (observability; per-seat RC in council metadata)
       ...(LEGACY_MIX ? {} : { judge_model: v.judgeModel || 'opus' }),
       vote: v.vote,
       ranking: v.ranking,
@@ -1492,6 +1609,14 @@ Return only the two guidance lists (each item: text, conf, why).`
 async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitle, label, lenses = LENSES) {
   const labels = blindList.map(c => c.blind)
   const roundsLog = []
+  // Per-judge-seat RC (observability). A living lens seat = 00; a REQUESTED lens with no living verdict
+  // after retries = a dead seat (09). `no_consensus` is NOT a fault — it still records 00 for the living
+  // seats only. Recorded once, at the terminal decision, over the FINAL living verdicts.
+  const recordCouncilSeats = (living) => {
+    const livingKeys = new Set((living || []).map(v => v.lens))
+    for (const v of (living || [])) recordSeat(`${label}:${v.lens}`, phaseTitle, RC.OK, 'ok')
+    for (const l of lenses) if (!livingKeys.has(l.key)) recordSeat(`${label}:${l.key}`, phaseTitle, RC.UNKNOWN, 'lens-seat-dead-after-retries')
+  }
 
   // Round 1 — 5 independent verdicts, no peer visibility. Each lens gets a differently-rotated listing.
   const r1raw = await parallel(lenses.map((lens, i) => () =>
@@ -1499,6 +1624,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   let verdicts = r1raw.filter(Boolean)
   if (!verdicts.length) {
     log(`council ${label}: ALL 5 lenses died in round 1 — degrading to a __failed partial (caller lands a partial run).`)
+    recordSeat(label, phaseTitle, RC.UNKNOWN, 'all-lenses-dead')
     return { __failed: 'all council judges failed in round 1' }
   }
 
@@ -1506,7 +1632,8 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   // isolated run = proceed, but LOUD warning that veto coverage was lost.
   const securityDeadHalt = () => {
     const tt = councilTally(verdicts)
-    roundsLog.push(roundRecord(roundsLog.length + 1, verdicts, tt))
+    roundsLog.push(roundRecord(roundsLog.length + 1, verdicts, tt, lenses))
+    recordCouncilSeats(verdicts)
     return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
       humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' })
   }
@@ -1519,7 +1646,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   }
 
   let t = councilTally(verdicts)
-  roundsLog.push(roundRecord(1, verdicts, t))
+  roundsLog.push(roundRecord(1, verdicts, t, lenses))
   let winner = t.winner
   const allVetoed = () => labels.length > 0 && labels.every(l => t.vetoedSet.has(l))
 
@@ -1541,11 +1668,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       return securityDeadHalt()
     }
     t = councilTally(verdicts)
-    roundsLog.push(roundRecord(roundNum, verdicts, t))
+    roundsLog.push(roundRecord(roundNum, verdicts, t, lenses))
     winner = t.winner
   }
 
   if (winner != null) {
+    recordCouncilSeats(verdicts)
     const result = buildCouncilResult({ winner, verdicts, roundsLog, labels, lenses, no_consensus: false })
     if (guidanceWanted) result.guidance = await synthesizeGuidance(verdicts, phaseTitle, `${label}-guidance`)
     return result
@@ -1554,6 +1682,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   // by Borda or a meta-judge; routed to human review by the call site.
   const reason = allVetoed() ? 'all candidates were vetoed UNSAFE by the security lens' : 'no candidate reached a >50% majority after 3 deliberation rounds'
   log(`council ${label}: NO_CONSENSUS — ${reason}.`)
+  recordCouncilSeats(verdicts)
   return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: reason })
 }
 
@@ -1687,7 +1816,24 @@ function guidanceToMd(g) {
 
 // SUMMARY renderer. unblind=true => show models; false => letters only + genericised failReasons.
 // Join on the candidate LETTER, never on model (models repeat in Mixed presets like '2 opus').
-function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound }) {
+// Render the per-seat RC summary as a Markdown section. Blind-safe: seat ids are candidate letters /
+// `label:lens` / helper labels — never a model identity — so it is safe in both SUMMARY.md and
+// SUMMARY.blind.md. All-00 run => a one-line note and no table (the acceptance case).
+function rcSummaryMd(rcSummary) {
+  if (!rcSummary || typeof rcSummary !== 'object') return []
+  const byCode = rcSummary.by_code || {}
+  const codes = Object.keys(byCode).sort()
+  const byCodeStr = codes.map(c => `${c}×${byCode[c]}`).join(', ') || '—'
+  const L = ['## Return codes (per-seat)', '', `**Seats:** ${rcSummary.seats || 0}  •  **by code:** ${byCodeStr}`, '']
+  const non00 = Array.isArray(rcSummary.non00) ? rcSummary.non00 : []
+  if (!non00.length) { L.push('_All seats returned 00 (expected result)._', ''); return L }
+  L.push('| Seat | Phase | RC | Meaning | Reason |', '|---|---|---|---|---|')
+  for (const s of non00) L.push(`| ${s.seat} | ${s.phase} | ${s.rc} | ${RC_MEANING[s.rc] || ''} | ${s.reason || ''} |`)
+  L.push('')
+  return L
+}
+
+function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound, rcSummary }) {
   const L = [`# Joust Engine — run summary${unblind ? '' : ' (BLIND)'}`, '',
     `**Mode:** ${mode === 'two' ? 'two-pass' : 'single-pass'}  •  **N (attempts/round):** ${n}`, '',
     '## Task', '', '> ' + String(task).replace(/\n/g, '\n> '), '',
@@ -1735,7 +1881,48 @@ function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, 
       if (finalRank.council) L.push(councilTallyMd(finalRank.council), '')
     }
   }
+  for (const line of rcSummaryMd(rcSummary)) L.push(line)
   return L.join('\n') + '\n'
+}
+
+// ---- auto-filed engine issues (privacy-scrubbed, fail-closed, fire-and-forget) ----
+// At run end, for each ENGINE-FAULT RC class present in seatRcs, file ONE deduplicated dogfood issue
+// per class per run to the ENGINE repo via bin/je-issue.sh. Evidence = the RC lines + JOUST-* marker
+// excerpts ONLY; je-issue.sh's NEW scrub pass redacts host/user/env details BEFORE its guards (defense
+// in depth). Wrapped so it can NEVER crash or block a fully-paid run (log + continue). A filing FAILURE
+// is recorded as a non-00 `issue:<rc>` seat so it is never silently dropped from the report.
+async function maybeFileEngineIssues(phaseTitle) {
+  try {
+    if (!autoIssue) {
+      if (A.noAutoIssue !== true && !A.issueRunner && !autoIssueWarned) {
+        log('auto-issue: issueRunner not supplied (pass args.issueRunner = <plugin-root>/bin/je-issue.sh) — skipping engine-fault issue filing.')
+        autoIssueWarned = true
+      }
+      return
+    }
+    const faults = seatRcs.filter(s => ENGINE_FAULT_CLASSES.has(s.rc))
+    if (!faults.length) return // zero-failure run: files nothing (acceptance)
+    const byClass = new Map()
+    for (const s of faults) { if (!byClass.has(s.rc)) byClass.set(s.rc, []); byClass.get(s.rc).push(s) }
+    for (const [rc, group] of byClass) {
+      const title = `JE-RC ${rc} (${RC_MEANING[rc]}) — engine-fault (auto)`
+      const sev = (rc === '04' || rc === '06') ? 'sev1' : 'sev2'          // outcome-corrupting classes -> sev1
+      const area = (rc === '01' || rc === '02' || rc === '07') ? 'runner' : 'infra'
+      const evLines = group.map(s => `JOUST-RC ${s.rc} ${s.reason}  [seat ${s.seat} @ ${s.phase}]`)
+      const logGreps = group.filter(s => s.logPath)
+        .map(s => `printf '\\n----- %s -----\\n' ${q(s.seat)}; grep -a '^JOUST-' ${q(s.logPath)} 2>/dev/null | tail -n 20`)
+        .join('; ')
+      const ev = `${runDir}/_rc-issues/rc-${rc}.md`
+      const cmd = `mkdir -p ${q(`${runDir}/_rc-issues`)}; { printf '%s\\n' ${q(evLines.join('\n'))}; ${logGreps || 'true'}; } > ${q(ev)}; ` +
+        `GH_REPO=${q(engineRepo)} JE_ISSUE_AUTOFILE=1 bash ${q(A.issueRunner)} new --sev ${sev} --area ${area} ` +
+        `--title ${q(title)} --evidence-file ${q(ev)} --run-id ${q(safeRunId)} 2>&1; echo "JEI ${rc} rc=$?"`
+      const res = await agent(
+        `This is an approved internal step: file ONE dogfood issue for engine-fault class ${rc}. Run this exact shell command in ONE Bash call and report its stdout verbatim. Do nothing else:\n\n${cmd}`,
+        { model: HELPER_MODEL, phase: phaseTitle, label: `rc-issue-${rc}` }).catch(() => null)
+      const filed = /JEI .* rc=0\b/.test(String(res))
+      recordSeat(`issue:${rc}`, phaseTitle, filed ? RC.OK : RC.UNKNOWN, `auto-issue-${filed ? 'filed-or-drafted' : 'FAILED'}`)
+    }
+  } catch (e) { log(`auto-issue step failed (non-fatal): ${String(e).slice(0, 140)}`) }
 }
 
 // ---- begin: contribution estimation (PURE; persistence is a separate thin step) ----
@@ -1949,11 +2136,12 @@ const N = attempts.length
 if (!blind1.length) {
   // P0: no valid round-1 pool — still land the key + summaries
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: null, ...(mode === 'two' ? { winner: null } : {}) }) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null, ...(mode === 'two' ? { winner: null } : {}) }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping }) },
   ], 'Review')
-  return { mode, n: N, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
+  await maybeFileEngineIssues('Review') // failure-heavy abort: file engine-fault classes before returning
+  return { mode, n: N, rc_summary: rcSummaryLive(), error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
 }
 
 if (repoMode) await enrichBlindPool(blind1, `${runDir}/review-1`, 'Review')
@@ -1965,11 +2153,12 @@ const review = await judge('reviewer', blind1, mode === 'two', `${runDir}/review
 if (review.__failed) {
   // P1: review judge failed — land the key + summaries (no verdict exists)
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: null, ...(mode === 'two' ? { winner: null } : {}) }) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null, ...(mode === 'two' ? { winner: null } : {}) }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping }) },
   ], 'Review')
-  return { mode, n: N, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
+  await maybeFileEngineIssues('Review') // failure-heavy abort: file engine-fault classes before returning
+  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
 }
 
 if (review.no_consensus) {
@@ -1979,19 +2168,20 @@ if (review.no_consensus) {
   // and a grand loop routes this loop to needs-human + HALT (winner:null in mapping.json is the signal).
   log(`Review: council NO_CONSENSUS — ${review.reasoning}`)
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: null, no_consensus: true, ...(mode === 'two' ? { winner: null } : {}) }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null, no_consensus: true, ...(mode === 'two' ? { winner: null } : {}) }) },
     { path: `${runDir}/review-1/verdict.json`, content: json(review) },
     { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict (NO CONSENSUS)') },
     { path: `${runDir}/review-1/council.json`, content: json(review.council) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
   ], 'Review')
-  return { mode, n: N, round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
+  await maybeFileEngineIssues('Review') // abort path: RC observability must survive a NO_CONSENSUS stop
+  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
 }
 
 // P2: round-1 review is valid — incremental write BEFORE any round-2 dispatch (crash-survival linchpin)
 await persist([
-  { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner }) },
+  { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner }) },
   { path: `${runDir}/review-1/verdict.json`, content: json(review) },
   { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict') },
   ...(review.council ? [{ path: `${runDir}/review-1/council.json`, content: json(review.council) }] : []),
@@ -2002,11 +2192,12 @@ if (mode === 'single') {
   // P3: single-pass — mapping/verdict already written at P2; add the summaries
   const contributions = computeContributions({ mapping: r1mapping, review }, null, null, mode)
   await persist([
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
     { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, contributions }) },
   ], 'Review')
-  return { mode, n: N, round1: { mapping: r1mapping, review }, contributions }
+  await maybeFileEngineIssues('Review')
+  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping, review }, contributions }
 }
 
 // ---- Two pass ----
@@ -2041,11 +2232,11 @@ const carriedOverWinner = carriedEntry ? carriedEntry.candidate : null
 if (!blindF.length) {
   // P4: no valid finalists — full key (round1 + final, winner null) + summaries
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner }) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
-  return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
+  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
 }
 
 if (repoMode) await enrichBlindPool(blindF, `${runDir}/review-final`, 'Final rank')
@@ -2055,11 +2246,12 @@ const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-f
 if (finalRank.__failed) {
   // P5: final-rank judge failed — same payload as P4 (no finalRank to render)
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner }) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
-  return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+  await maybeFileEngineIssues('Final rank') // failure-heavy abort: file engine-fault classes before returning
+  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
 }
 
 if (finalRank.no_consensus) {
@@ -2068,14 +2260,15 @@ if (finalRank.no_consensus) {
   // and routes to needs-human + HALT (see SKILL Phase 7 / 7-FALLBACK).
   log(`Final rank: council NO_CONSENSUS — ${finalRank.reasoning}`)
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, no_consensus: true }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, no_consensus: true }) },
     { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
     { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict (NO CONSENSUS)') },
     { path: `${runDir}/review-final/council.json`, content: json(finalRank.council) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
   ], 'Final rank')
-  return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
+  await maybeFileEngineIssues('Final rank') // abort path: RC observability must survive a NO_CONSENSUS stop
+  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
 }
 
 // #7: resolve winnerRound against the VALID finalist set; omit the field if unresolved (no literal "undefined")
@@ -2088,14 +2281,17 @@ const contributions = computeContributions(
   mode
 )
 await persist([
-  { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, carriedOverWinner }) },
+  { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, carriedOverWinner }) },
   { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
   { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict') },
   ...(finalRank.council ? [{ path: `${runDir}/review-final/council.json`, content: json(finalRank.council) }] : []),
-  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
-  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
+  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
+  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
   { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, contributions }) },
 ], 'Final rank')
+
+// Auto-file engine-fault issues AFTER durable persistence, so a filing hang can never lose artifacts.
+await maybeFileEngineIssues('Final rank')
 
 // ===== IMPLEMENT PHASE hook — only with args.implement. =====================================
 // Reached only on a RESOLVED winning plan: a plan-phase NO_CONSENSUS / __failed / no-valid-pool
@@ -2108,8 +2304,9 @@ if (implement) {
   const impl = await implementPhase(seedPlanPath)
   await persist([
     { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...impl }) },
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, implement: true, round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+  await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   return {
     mode, n: N, implement: true,
     plan: {
@@ -2120,6 +2317,7 @@ if (implement) {
     },
     implementPhase: impl,
     contributions,
+    rc_summary: rcSummaryLive(),
   }
 }
 
@@ -2129,4 +2327,5 @@ return {
   guidance: review.guidance,
   final: { mapping: finalMapping, rank: finalRank, ...(winnerEntry ? { winnerRound: winnerEntry.round } : {}) },
   contributions,
+  rc_summary: rcSummaryLive(),
 }

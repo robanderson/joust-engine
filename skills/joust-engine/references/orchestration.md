@@ -100,6 +100,15 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
                                          // from codexTimeoutSecs, the ATTEMPT wall-clock); engine
                                          // fallback 1500 (judging reads a whole blind pool + reasons at
                                          // xhigh effort, so it gets more headroom than an attempt).
+  issueRunner: "<plugin-root>/bin/je-issue.sh", // optional but recommended — enables auto-filing of
+                                         // engine-fault RC classes (01/02 after retries, 04–09) as ONE
+                                         // deduped, privacy-scrubbed `dogfood` issue per class per run.
+                                         // Absent => auto-filing is skipped (logged once). Fire-and-forget:
+                                         // a filing failure never blocks or crashes the run.
+  engineRepo: "robanderson/joust-engine", // optional — owner/repo the auto-issues are pinned to (GH_REPO);
+                                         // default = the public canonical engine repo.
+  noAutoIssue: false,                    // optional — set true to disable auto-filing entirely (RCs are
+                                         // still derived, recorded, and reported; only the GitHub filing is off).
   attempts: [                            // one per attempt, length N
     { label: "candidate-1",
       dispatch: "anthropic",             // native, runs in-process
@@ -244,6 +253,30 @@ and overwritten files.
 Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the
 result. `repoMode:true` uses `worktreeRoot` (default `/tmp/je-worktrees/<run-id>`) for the
 same reason and in the same shape — see the repo-anchored-mode notes below.
+
+## Return codes (JE-RC) and `rc_summary`
+
+Every seat (attempt, judge lens, helper, auto-issue filing) ends with an OFFICIAL two-digit return
+code. Runner attempts self-report a terminal `JOUST-RC <code> <reason>` line in their `_*_run.log`;
+native/judge/helper seats have their RC **derived in code** from signals the engine already observes
+(a missing runner line parses as `09`). RCs are **observability, not control flow** — fail-safety is
+unchanged except where behaviour already branches (retries, fallbacks, the auto-issue hook).
+
+| RC | meaning | RC | meaning |
+|----|---------|----|---------|
+| 00 | expected result | 05 | no deliverable saved |
+| 01 | model timeout (wall-clock) | 06 | provenance failure |
+| 02 | model unavailable / throttled | 07 | environment / permission failure |
+| 03 | turn-cap exhausted | 08 | aborted / killed |
+| 04 | invalid output | 09 | unknown / other |
+
+The workflow **return value** and `mapping.json` now carry
+`rc_summary { seats, by_code: {"01":2,…}, non00: [{seat, phase, rc, reason}] }`, and `SUMMARY.md`
+renders it as a per-seat table (blind-safe: seat ids are candidate letters / `label:lens` / helper
+labels, never a model identity). Per-candidate `rc`/`rcReason` appear on each `mapping.json` row; each
+council round records `dead_seats` + a per-verdict `rc`. Engine-fault classes (01/02 after retries,
+04–09 — not 00/03) auto-file one deduped, privacy-scrubbed `dogfood` issue per class per run via
+`issueRunner` (respects `noAutoIssue`, pinned to `engineRepo`, fail-closed — see `references/dogfood.md`).
 
 ## Dispatching the attempts
 

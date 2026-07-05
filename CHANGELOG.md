@@ -4,6 +4,25 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ## Unreleased
 
+### Added
+
+- **Official per-seat return codes (JE-RC 00–09).** Every runner script appends a terminal
+  `JOUST-RC <code> <short-reason>` line to its `_*_run.log` on **every** exit path (complementing,
+  never replacing, the existing DONE/TIMEOUT provenance markers). The engine derives RCs for
+  native/judge/helper seats from signals it already observes (agent null/throw, timeout markers,
+  schema/verdict-integrity failures, empty staging — never model-self-reported; a missing
+  `JOUST-RC` line parses as RC 09), records them in `mapping.json`, council metadata, and the
+  workflow return value, and renders an `rc_summary { seats, by_code, non00 }` table in
+  `SUMMARY.md`. Engine-fault classes (01/02 after retries, 04–09 — not honest model losses or the
+  03 turn-cap) auto-file **one deduped, privacy-scrubbed dogfood issue per class per run** to the
+  engine repo via `bin/je-issue.sh` (label `dogfood`). A NEW fail-closed scrubbing pass runs
+  **before** je-issue's existing guards, redacting `$HOME`/usernames in paths, UPPER_SNAKE env-var
+  values, `*_KEY`/`*_TOKEN`/`*_SECRET` assignments, RFC1918 private IPs, `.local`/`.lan`
+  hostnames, and emails — it **never posts unscrubbed** (degrades to a scrubbed committed-inbox
+  draft or a loud log) and an issue-filing failure **never blocks or crashes a run**. Set
+  `noAutoIssue: true` to disable auto-filing. RCs are OBSERVABILITY, not new control flow —
+  fail-safety semantics are unchanged.
+
 ### Changed
 
 - **`dualSecurity: false` escape hatch** — per-run arg that drops the `security-x` seat,

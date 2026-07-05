@@ -54,6 +54,25 @@ migration scrub. The **verbatim-evidence** rule remains (it is required triage c
 enforced structurally by the form's `required` field + the helper's empty/placeholder refusal
 (exit 3) — not by convention alone.
 
+### Privacy scrub (auto-filed issues)
+
+Auto-filed RC issues (see *Recording a new issue*) run a **fail-closed scrubbing pass BEFORE** the
+exit-3/4/5 guards (`je-issue.sh scrub-evidence`). It redacts, from the evidence excerpt, everything
+that may never appear in a public issue:
+
+- `$HOME` and usernames in paths → `<HOME>` / `<USER>`
+- UPPER_SNAKE **env-var values** (`NAME=value`) → `NAME=<REDACTED>`
+- `*_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD`-shaped assignments → `<REDACTED>`
+- RFC1918 **private IPs** (10.x, 172.16–31.x, 192.168.x) → `<PRIVATE-IP>` (public IPs are kept)
+- `.local` / `.lan` **LAN hostnames** → `<LAN-HOST>`
+- **email addresses** → `<EMAIL>`
+
+It is **fail-closed**: any scrub error (or a still-refusing guard **after** scrub) **never posts or
+drafts raw** evidence — it degrades to a scrubbed committed-inbox draft or a loud log. The scrub is
+portable perl; volatile `$HOME`/`$USER` are passed via env and `quotemeta`'d so a metachar in either
+cannot corrupt the pattern. The generic env-value class is scoped to UPPER_SNAKE names so useful
+lowercase marker fields in `JOUST-*` excerpts (`endpoint=`, `exit=`, `max-turns=`) survive.
+
 ## Recording a new issue (human or tournament)
 
 - **From an `@@JE` run (preferred):**
@@ -64,6 +83,10 @@ enforced structurally by the form's `required` field + the helper's empty/placeh
   ```
   Always pass a verbatim excerpt of the offending verdict/guidance as `--evidence-file`. The helper
   refuses empty/placeholder/unblinding/secret evidence and dedups before creating.
+- **Auto-filed from an `@@JE` run.** At run end the engine files **one deduped issue per engine-fault
+  RC class** (JE-RC 01/02 after retries, 04–09 — not honest model losses or the 03 turn-cap) to the
+  engine repo, label `dogfood`, evidence = the `JOUST-RC` lines + `JOUST-*` marker excerpts only,
+  privacy-scrubbed (above) and fail-closed. Pass the workflow arg `noAutoIssue: true` to disable it.
 - **From a browser:** open an issue with the *Dogfood finding* template; required fields enforce the
   same minimum.
 

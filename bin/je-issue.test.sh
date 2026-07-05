@@ -59,5 +59,56 @@ expect_rc 0 "clean prose"      'je-parse mis-read the prose "two pass" form and 
 expect_rc 0 "prose mentions key" 'the api description was clear but the secret sauce is the ranking heuristic.'
 
 echo
+echo "je-issue.sh scrub-evidence (privacy scrub — fail-closed, runs BEFORE the guards):"
+# Fixed HOME/USER so the $HOME-path and bare-username redactions are deterministic.
+scrub_of() { printf '%s' "$1" > "$TMP/sin.md"; env HOME=/Users/tester USER=tester bash "$SUT" scrub-evidence "$TMP/sin.md" 2>/dev/null; }
+# has <name> <input> <needle>    — scrubbed output MUST contain needle
+has() { local out; out="$(scrub_of "$2")"; if printf '%s' "$out" | grep -qF "$3"; then pass=$((pass+1)); echo "  ok   [$1]"; else fail=$((fail+1)); echo "  FAIL [$1] missing '$3' in: $out"; fi; }
+# hasnot <name> <input> <needle> — scrubbed output must NOT contain needle
+hasnot() { local out; out="$(scrub_of "$2")"; if printf '%s' "$out" | grep -qF "$3"; then fail=$((fail+1)); echo "  FAIL [$1] still contains '$3'"; else pass=$((pass+1)); echo "  ok   [$1]"; fi; }
+
+# private IPs (RFC1918) -> <PRIVATE-IP>; a PUBLIC ip is left intact (negative case)
+has    "private-ip 10.x"     'host at 10.1.2.3 responded'        '<PRIVATE-IP>'
+hasnot "private-ip 10.x gone" 'host at 10.1.2.3 responded'       '10.1.2.3'
+has    "private-ip 192.168"   'gateway 192.168.0.5 up'           '<PRIVATE-IP>'
+has    "private-ip 172.20"    'node 172.20.1.9 joined'           '<PRIVATE-IP>'
+hasnot "public-ip preserved"  'dns resolver is 8.8.8.8 today'    '<PRIVATE-IP>'
+has    "public-ip intact"     'dns resolver is 8.8.8.8 today'    '8.8.8.8'
+# LAN hostnames -> <LAN-HOST>
+has    "lan-host .local"      'reached mybox.local over ssh'     '<LAN-HOST>'
+hasnot "lan-host .local gone" 'reached mybox.local over ssh'     'mybox.local'
+has    "lan-host .lan"        'router.lan refused the push'      '<LAN-HOST>'
+# $HOME path + bare username
+has    "home path"            'wrote /Users/tester/proj/out.md'  '<HOME>'
+hasnot "home path gone"       'wrote /Users/tester/proj/out.md'  '/Users/tester'
+has    "bare username"        'the user tester ran the job'      '<USER>'
+# generic UPPER_SNAKE env-value class ONLY (name NOT ending KEY/TOKEN) — proves the generic class works
+has    "env-value generic"    'ANTHROPIC_BASE_URL=https://x.example.test'  '<REDACTED>'
+hasnot "env-value generic gone" 'ANTHROPIC_BASE_URL=https://x.example.test' 'https://x.example.test'
+# key/token class ONLY (lowercase name ending _token) — proves that class independently
+has    "key/token class"      'session_token = abcdef0123456789'  '<REDACTED>'
+hasnot "key/token class gone" 'session_token = abcdef0123456789'  'abcdef0123456789'
+# email -> <EMAIL>
+has    "email"                'ping me at dev@example.test soon'  '<EMAIL>'
+hasnot "email gone"           'ping me at dev@example.test soon'  'dev@example.test'
+
+# clean excerpt passes UNMODIFIED (byte-identical in==out)
+_clean=$'JOUST-RC 04 schema-invalid\nthe verdict object failed to parse on candidate blind B.'
+printf '%s' "$_clean" > "$TMP/cin.md"
+env HOME=/Users/tester USER=tester bash "$SUT" scrub-evidence "$TMP/cin.md" > "$TMP/cout.md" 2>/dev/null
+if cmp -s "$TMP/cin.md" "$TMP/cout.md"; then pass=$((pass+1)); echo "  ok   [clean excerpt unchanged]"; else fail=$((fail+1)); echo "  FAIL [clean excerpt changed]"; fi
+
+# guards STILL fire after scrub (composition): scrub-then-check-evidence keeps the exit-3/4/5 codes
+guard_after_scrub() { # <want-rc> <name> <input>
+  printf '%s' "$3" > "$TMP/gs.md"
+  env HOME=/Users/tester USER=tester bash "$SUT" scrub-evidence "$TMP/gs.md" > "$TMP/gso.md" 2>/dev/null
+  bash "$SUT" check-evidence "$TMP/gso.md" >/dev/null 2>&1; local got=$?
+  if [ "$got" -eq "$1" ]; then pass=$((pass+1)); echo "  ok   [$2] rc=$got"; else fail=$((fail+1)); echo "  FAIL [$2] want rc=$1 got rc=$got"; fi
+}
+guard_after_scrub 5 "secret survives scrub -> exit 5"     'the log leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 oops'
+guard_after_scrub 4 "unblinding survives scrub -> exit 4" 'blind C is opus and it won'
+guard_after_scrub 3 "empty after scrub -> exit 3"         ''
+
+echo
 echo "je-issue guards: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

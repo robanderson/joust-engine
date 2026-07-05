@@ -64,6 +64,8 @@ check "T1: DONE exit=0"                             'grep -q "^JOUST-GLM-DONE ex
 check "T1: deliverable saved"                       '[ -f "$WS/solution.py" ]'
 check "T1: nonessential traffic disabled for call"  'grep -q "^CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1$" "$WS/env.txt"'
 check "T1: API_TIMEOUT_MS defaulted (3000000)"      'grep -q "^API_TIMEOUT_MS=3000000$" "$WS/env.txt"'
+check "T1: exactly one JOUST-RC line"               '[ "$(grep -c "^JOUST-RC " "$WS/_glm_run.log")" = "1" ]'
+check "T1: JOUST-RC 00 (ok)"                        'grep -q "^JOUST-RC 00 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
 # T2: hard (non-transient) error -> NO retry, fail closed, single call.
@@ -81,6 +83,8 @@ check "T3: persistent 529 exits nonzero"            '[ "$RC" -ne 0 ]'
 check "T3: exactly 3 claude calls (1 + 2 retries)"  '[ "$(cat "$WS/calls")" = "3" ]'
 check "T3: RETRIES-EXHAUSTED logged"                'grep -q "^JOUST-GLM-RETRIES-EXHAUSTED tries=3" "$WS/_glm_run.log"'
 check "T3: DONE exit nonzero"                       'grep -qE "^JOUST-GLM-DONE exit=[1-9]" "$WS/_glm_run.log"'
+check "T3: exactly one JOUST-RC line"               '[ "$(grep -c "^JOUST-RC " "$WS/_glm_run.log")" = "1" ]'
+check "T3: JOUST-RC 02 (retries-exhausted)"         'grep -q "^JOUST-RC 02 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
 # T4: retries can be disabled entirely.
@@ -94,6 +98,8 @@ rm -rf "$WS"
 WS=$(mktemp -d)
 ( cd "$WS" && env ZAI_API_KEY= bash "$RUNNER" --model opus >/dev/null 2>&1 ); RC=$?
 check "T5: missing ZAI_API_KEY exits 3"             '[ "$RC" -eq 3 ]'
+check "T5: exactly one JOUST-RC line"               '[ "$(grep -c "^JOUST-RC " "$WS/_glm_run.log")" = "1" ]'
+check "T5: JOUST-RC 07 (missing-key)"               'grep -q "^JOUST-RC 07 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
 # T6 (issue #31): one 'API Error: The operation timed out.' then success -> retried once, rc 0.
@@ -114,6 +120,8 @@ check "T7: wall-clock rc 124 propagated"              '[ "$RC" -eq 124 ]'
 check "T7: exactly 1 claude call (no retry)"          '[ "$(cat "$WS/calls")" = "1" ]'
 check "T7: TIMEOUT marker logged"                     'grep -q "^JOUST-GLM-TIMEOUT secs=" "$WS/_glm_run.log"'
 check "T7: no RETRY marker"                           '! grep -q "^JOUST-GLM-RETRY" "$WS/_glm_run.log"'
+check "T7: exactly one JOUST-RC line"                 '[ "$(grep -c "^JOUST-RC " "$WS/_glm_run.log")" = "1" ]'
+check "T7: JOUST-RC 01 (wall-clock-timeout)"          'grep -q "^JOUST-RC 01 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
 # T8: auth text on the SAME 'API Error:' prefix must NOT retry — the prefix anchor alone
@@ -123,6 +131,8 @@ run_runner FAKE_FAILS=99 FAKE_MODE=authprefixed; RC=$?
 check "T8: prefixed auth error exits nonzero"         '[ "$RC" -ne 0 ]'
 check "T8: exactly 1 claude call (no retry)"          '[ "$(cat "$WS/calls")" = "1" ]'
 check "T8: no RETRY marker"                           '! grep -q "^JOUST-GLM-RETRY" "$WS/_glm_run.log"'
+check "T8: exactly one JOUST-RC line"                 '[ "$(grep -c "^JOUST-RC " "$WS/_glm_run.log")" = "1" ]'
+check "T8: JOUST-RC 09 (unclassified runner-error)"   'grep -q "^JOUST-RC 09 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
 # T9: persistent timeout retries are CAPPED (JE_GLM_RETRIES=2 -> 3 tries), then fail closed.

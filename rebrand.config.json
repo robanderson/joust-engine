@@ -36,6 +36,11 @@
     ["node", "bin/je-parse.test.mjs"],
     ["bash", "bin/je-git.test.sh"],
     ["bash", "bin/glm-run.test.sh"],
+    ["bash", "bin/local-run.test.sh"],
+    ["bash", "bin/codex-run.test.sh"],
+    ["bash", "bin/minimax-run.test.sh"],
+    ["bash", "bin/grok-run.test.sh"],
+    ["bash", "bin/je-issue.test.sh"],
     ["glob", "workflows/*.test.mjs"]
   ]
 }
