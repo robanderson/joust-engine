@@ -6,6 +6,22 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Brief dry-run tester — `bin/je-brief-test.mjs`** (research: Anthropic's multi-agent
+  system work — exercising and rewriting a flawed tool description cut downstream task
+  time 40%; same trick applied to attempt briefs). A deterministic STATIC LINTER (no
+  model, no network) the orchestrator runs on the composed task brief BEFORE spending
+  on a wide round (SKILL.md Phase 1). Eight checks, one PASS/WARN/FAIL line each with
+  a concrete fix on failure: ambiguous deixis without an in-brief antecedent (attempts
+  have no conversation context), unresolved/nonexistent path references (missing bare
+  filenames WARN), missing deliverable contract (save/write + filename), missing
+  single-pass/hard-stop rule, conflicting directives (do-not-implement vs implement,
+  smallest-change vs comprehensive/exhaustive — WARN), design-brief altitude mixed with
+  file-level edit/code-block demands, undefined one-off repo codenames (WARN), and a
+  6000-word length budget (WARN). `-` reads stdin; `--json` for machine output;
+  `--root` overrides the path-resolution root. Exit 0 = all pass/warn, 1 = any FAIL,
+  2 = usage error. Tests in `bin/je-brief-test.test.mjs` (fixture briefs exercising
+  every rule both ways, plus CLI exit-code/JSON/stdin coverage).
+
 - **GEPA-LITE brief-evidence miner (`bin/je-evolve.mjs`)** — deterministic run-archive
   miner for reflective prompt evolution (GEPA, arXiv:2507.19457: mutate prompts from
   execution-trace evidence; WORKER prompts only, never orchestrator prose). v1 is the

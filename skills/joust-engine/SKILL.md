@@ -155,6 +155,8 @@ Handle the answer (if Phase 0 already produced an `assignment` — a prose spec 
 
 In two pass, the model assignment applies to **both rounds**: round two re-uses the same per-attempt list. If the user explicitly wants different models for round two, re-ask the gate for round two; otherwise re-use round one's assignment. Model aliases, the GLM/local dispatch mechanics, and the `--model` mappings are in `references/orchestration.md`. **Anthropic attempts dispatch via the Task tool; GLM attempts via the `glm`→z.ai runner; Local attempts via the `omlx`→on-device runner; Codex attempts via the `codex exec` runner; MiniMax attempts via the `bin/minimax-run.sh` runner (agent `joust-engine:joust-minimax`); Grok attempts via the `bin/grok-run.sh` runner (agent `joust-engine:joust-grok`)** (the non-Anthropic ones through bundled wrapper agents, per the orchestration reference). The reviewer and the final ranker are **always Anthropic Opus**, regardless of what the attempts use — the judge is held fixed so the comparison is consistent.
 
+Before dispatch, lint the composed task brief with `node <plugin-root>/bin/je-brief-test.mjs <brief-file>` (deterministic, no model; `-` reads stdin, exit 1 = any FAIL) and fix any FAIL — ambiguous references, unresolved paths, missing deliverable contract or stop rule — before spending on a wide round.
+
 ## Phase 1b: Diversity injection (default on — both modes)
 
 Independent attempts are only valuable if they actually differ. Model heterogeneity and sampling give some of that, but same-model siblings on an identical prompt tend to converge. To prevent that, give each attempt a distinct framing drawn from a modifier pool, following `references/diversity-injection.md`. In short:
