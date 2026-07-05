@@ -619,6 +619,60 @@ function attemptTimeoutSecsFor(a) {
 function lensTimeoutSecsFor(lens) {
   return (chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner) === 'codex') ? codexJudgeTimeout : null
 }
+
+// ---- begin: mechanical patch gate ------------------------------------------------------------
+// Deterministic pre-council classification of a staged implement candidate's deliverable (run F).
+// PURE — extract-and-eval'able like the return-codes block. The IMPURE runner (mechanicalPatchGate)
+// composes these onto one HELPER_MODEL shell step. Classes: clean_patch | corrupt_patch |
+// full_files | empty | unavailable. ONLY corrupt_patch invalidates (a corrupt patch cannot win a
+// code round; full files are a legitimate deliverable under the loose contract; a gate the engine
+// could not run must never shrink the field).
+const MECH_CLASSES = new Set(['clean_patch', 'corrupt_patch', 'full_files', 'empty', 'unavailable'])
+
+// Blindness hardening: strip path-shaped text (a scratch/workspace path could hint at dispatch),
+// collapse newlines, cap length. Never throws, never returns empty.
+function sanitizeMechDetail(raw) {
+  const s = String(raw == null ? '' : raw)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\/[^\s'"()<>]+/g, '<path>')
+    .trim()
+    .slice(0, 160)
+  return s || 'no further detail'
+}
+
+// class (+detail) -> the exact judge-visible stamp line. detail: 'recount' | 'structure' for
+// clean_patch nuance; the sanitized first git error line for corrupt_patch.
+function mechanicalStampFor(cls, detail) {
+  switch (cls) {
+    case 'clean_patch':
+      if (detail === 'structure') return 'MECHANICAL: patch is well-formed (structure-only; no snapshot to context-check)'
+      if (detail === 'recount') return 'MECHANICAL: patch applies cleanly (--recount)'
+      return 'MECHANICAL: patch applies cleanly'
+    case 'corrupt_patch': return `MECHANICAL: git apply --check FAILED: ${sanitizeMechDetail(detail)}`
+    case 'full_files': return 'MECHANICAL: no patch found (full-files deliverable)'
+    case 'empty': return 'MECHANICAL: no deliverable'
+    default: return 'MECHANICAL: check unavailable'
+  }
+}
+const isMechanicalInvalid = (cls) => cls === 'corrupt_patch'
+
+// Merge parsed script results onto the staged list (the routing decision lives HERE, in pure code).
+// byBlind = { <letter>: { class, detail } }; missing/unknown/null => 'unavailable' — a candidate the
+// gate could not classify is NEVER invalidated (fail-safe), and an upstream-invalid candidate is
+// never revalidated or reclassified into contention.
+function mergeMechanical(staged, byBlind) {
+  return staged.map(c => {
+    const r = byBlind && byBlind[c.blind]
+    const cls = r && MECH_CLASSES.has(r.class) ? r.class : 'unavailable'
+    const stamp = mechanicalStampFor(cls, r && r.detail)
+    if (!c.valid) return { ...c, mechanical: { class: cls, stamp } }
+    if (isMechanicalInvalid(cls)) {
+      return { ...c, valid: false, failReason: `mechanical: patch does not apply (${sanitizeMechDetail(r && r.detail)})`, mechanical: { class: cls, stamp } }
+    }
+    return { ...c, mechanical: { class: cls, stamp } }
+  })
+}
+// ---- end: mechanical patch gate --------------------------------------------------------------
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
 const rcSummaryLive = () => buildRcSummary(seatRcs)
@@ -912,6 +966,110 @@ const PERSIST_SCHEMA = {
 //  - concatenate the valid deliverables into ONE blind-labelled pool file the judge reads once (read-cost).
 // The agent returns per-candidate {deliverable, provenance} via a SCHEMA (not scraped prose) (#4), and we
 // FAIL CLOSED (#1): any candidate missing from the return, or not deliverable+provenance, is invalid.
+// Mechanical patch gate stamp plumbing (run F). MECHANICAL/JMECH are provider-neutral literals —
+// like JOUST-, they are deliberately NOT rebrand tokens and stay byte-identical in the dev copy.
+const MECH_FALLBACK = 'MECHANICAL: check unavailable\n'
+const MECH_GRAMMAR = '^MECHANICAL: (patch applies cleanly.*|patch is well-formed .*|git apply --check FAILED:.*|no patch found .*|no deliverable|check unavailable)$'
+// Shell snippet: emit the pooled "--- Mechanical check ---" block for one candidate dir, grammar-
+// guarded. Shared by mechanicalPatchGate's pool rebuild AND enrichBlindPool's rebuild loop, so the
+// two pool writers can never drift.
+function mechStampShell(dest) {
+  const f = `${dest}/mechanical.txt`
+  return `printf '\\n--- Mechanical check ---\\n'; if grep -Eq ${q(MECH_GRAMMAR)} ${q(f)} 2>/dev/null; then cat ${q(f)}; else printf '%s' ${q(MECH_FALLBACK)}; fi`
+}
+
+const MECH_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { blind: { type: 'string' }, class: { type: 'string' }, detail: { type: 'string' } },
+        required: ['blind', 'class'],
+      },
+    },
+  },
+  required: ['results'],
+}
+
+// Pre-council mechanical gate (run F): classify each VALID staged implement candidate's deliverable
+// BEFORE the code council convenes — one HELPER_MODEL agent, one deterministic script, once per
+// round, never per judge (retires the 5-6x duplicated apply-checks the 9-run audit observed).
+// Snapshot-pinned: repoMode verifies against a DETACHED scratch worktree at baseSha; without a
+// snapshot it degrades to a structure-only well-formedness check in a throwaway `git init` repo
+// (catches the audited corrupt class: malformed/truncated diffs); no git/scratch => 'unavailable'.
+// Fail-safe end to end: any infra failure degrades to 'unavailable' and invalidates nothing.
+async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
+  const targets = staged.filter(c => c.valid)
+  if (!targets.length) return staged
+  const baseArg = repoMode && baseSha ? q(baseSha) : `''`
+  const perCandidate = targets.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `(` +
+      `dest=${q(dest)}; mech=${q(`${dest}/mechanical.txt`)}; base=${baseArg}; ` +
+      `patch=''; p0=0; ` +
+      `if [ -s "$dest/candidate.diff" ]; then patch="$dest/candidate.diff"; p0=1; ` +
+      `else patch=$(find "$dest" -maxdepth 3 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) 2>/dev/null | head -n1); ` +
+      `  if [ -z "$patch" ]; then patch=$(grep -rlE '^(diff --git |@@ -[0-9]|--- (a/|/dev/null))' "$dest" 2>/dev/null | head -n1); fi; fi; ` +
+      `nfiles=$(find "$dest" -type f ! -name mechanical.txt 2>/dev/null | grep -c .); ` +
+      `cls=''; detail=''; ` +
+      `if [ "$nfiles" -eq 0 ]; then cls=empty; ` +
+      `elif [ -z "$patch" ]; then cls=full_files; ` +
+      `elif ! command -v git >/dev/null 2>&1; then cls=unavailable; ` +
+      `else ` +
+        `scratch=$(mktemp -d 2>/dev/null) || scratch=''; snapmode=''; top=''; ` +
+        `if [ -n "$scratch" ] && [ -n "$base" ] && top=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$top" ]; then ` +
+          `git -C "$top" worktree add --detach "$scratch/wt" "$base" >/dev/null 2>&1 && snapmode=snapshot; fi; ` +
+        `wt="$scratch/wt"; ` +
+        `if [ -z "$snapmode" ] && [ -n "$scratch" ]; then wt="$scratch/wt"; mkdir -p "$wt" && git init -q "$wt" >/dev/null 2>&1 && snapmode=structure; fi; ` +
+        `if [ -z "$snapmode" ]; then cls=unavailable; else ` +
+          `pflag=''; [ "$p0" -eq 1 ] && pflag='-p0'; recount=''; ` +
+          `if err=$(git -C "$wt" apply --check $pflag "$patch" 2>&1); then rc=0; ` +
+          `elif err=$(git -C "$wt" apply --check --recount $pflag "$patch" 2>&1); then rc=0; recount=1; ` +
+          `else rc=1; fi; ` +
+          `if [ "$rc" -eq 0 ]; then cls=clean_patch; if [ "$snapmode" = structure ]; then detail=structure; elif [ -n "$recount" ]; then detail=recount; fi; ` +
+          `else cls=corrupt_patch; detail=$(printf '%s' "$err" | head -n1 | cut -c1-200); fi; ` +
+        `fi; ` +
+        `if [ -n "$scratch" ]; then [ "$snapmode" = snapshot ] && git -C "$top" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$scratch"; fi; ` +
+      `fi; ` +
+      `case "$cls" in ` +
+      `clean_patch) if [ "$detail" = structure ]; then printf 'MECHANICAL: patch is well-formed (structure-only; no snapshot to context-check)\\n' > "$mech"; elif [ "$detail" = recount ]; then printf 'MECHANICAL: patch applies cleanly (--recount)\\n' > "$mech"; else printf 'MECHANICAL: patch applies cleanly\\n' > "$mech"; fi;; ` +
+      `corrupt_patch) printf 'MECHANICAL: git apply --check FAILED: %s\\n' "$detail" > "$mech";; ` +
+      `full_files) printf 'MECHANICAL: no patch found (full-files deliverable)\\n' > "$mech";; ` +
+      `empty) printf 'MECHANICAL: no deliverable\\n' > "$mech";; ` +
+      `*) printf 'MECHANICAL: check unavailable\\n' > "$mech";; esac; ` +
+      `grep -Eq ${q(MECH_GRAMMAR)} "$mech" || printf '%s' ${q(MECH_FALLBACK)} > "$mech"; ` +
+      `echo "JMECH ${c.blind} $cls $detail"` +
+      `)`
+  }).join('\n')
+  const res = await agent(
+    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JMECH <letter> <class> [detail]". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}. Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
+    { model: HELPER_MODEL, schema: MECH_SCHEMA, phase: phaseTitle, label: 'mechanical-gate' }
+  ).catch(() => null)
+  const byBlind = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) byBlind[String(r.blind).trim()] = r
+  const merged = mergeMechanical(staged, byBlind)
+  // Observability: a corrupt-patch invalidation records a DISTINCT :mech seat (RC 04) — the main seat
+  // already recorded its staging RC; this makes the mechanical exclusion visible without double-counting.
+  for (const c of merged) if (c.mechanical && c.mechanical.class === 'corrupt_patch') recordSeatOnce(`${c.label || c.blind}:mech`, phaseTitle, RC.INVALID, 'mechanical-corrupt-patch')
+  // Non-repoMode: stageAndValidate already built _pool.md and enrichBlindPool will NOT run, so rebuild
+  // the pool here from the still-valid candidates (mirrors stageAndValidate's section format exactly)
+  // + the stamp block. repoMode: enrichBlindPool's rebuild carries the stamp via mechStampShell.
+  if (!repoMode) {
+    const pool = `${reviewDir}/_pool.md`
+    const rebuild = [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(merged.filter(c => c.valid).map(c => {
+      const dest = `${reviewDir}/${c.blind}`
+      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; echo; } >> "$tmp"`
+    })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
+    await agent(
+      `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
+      { model: HELPER_MODEL, phase: phaseTitle, label: 'mechanical-pool' }
+    ).catch(() => null)
+  }
+  return merged
+}
+
 async function stageAndValidate(list, reviewDir, phaseTitle) {
   const pool = `${reviewDir}/_pool.md`
   const script = [`mkdir -p ${q(reviewDir)}; : > ${q(pool)}`].concat(list.map(c => {
@@ -1070,6 +1228,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
            `cat ${q(`${dest}/candidate.diff`)} 2>/dev/null; ` +
            `printf '\\n--- Automated checks ---\\n'; ` +
            `if grep -Eq ${grammar} ${q(`${dest}/enrichment.txt`)}; then cat ${q(`${dest}/enrichment.txt`)}; else printf '%s' ${fallback}; fi; ` +
+           `${mechStampShell(dest)}; ` +
            `printf '\\n'; } >> "$tmp"`
   }), `mv -f "$tmp" ${q(pool)}`].join('\n')
   const script = `${perCandidate}\n${rebuild}`
@@ -1162,6 +1321,17 @@ function guidanceIntegrityIssue(g) {
   })
   if (thin.length === items.length) return `all ${items.length} guidance item(s) have near-empty/placeholder text or why — looks like schema-valid junk`
   return null
+}
+// Round-2/R4 LAUNCH guard (run F fold-in): is this guidance a STUB — empty, or schema-valid junk?
+// Returns a short reason (stub) or null (usable). guidanceIntegrityIssue deliberately passes an
+// EMPTY set (legitimate for its producer: "nothing salient this round"), but an empty set is a stub
+// for SEEDING a guided round — that gap let placeholder guidance reach round-2 briefs in 3 audited
+// runs. A stub round falls back to task-only dispatch (null guidance == the round-1 shape).
+function guidanceStub(g) {
+  if (!g || typeof g !== 'object') return 'guidance missing'
+  const n = (Array.isArray(g.positives) ? g.positives.length : 0) + (Array.isArray(g.challenges) ? g.challenges.length : 0)
+  if (n === 0) return 'guidance empty (no positives or challenges)'
+  return guidanceIntegrityIssue(g)
 }
 // ---- end: verdict integrity guard ------------------------------------------------------------
 
@@ -2542,10 +2712,15 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
   { const w = dispatchDropSummary(phaseTitle, dispatchDrops, list.length, done.length); if (w) log(w) }
   await snapshotWorktrees(roundName, done)
   if (!done.length) return { blind: [], mapping: [], review: { __failed: 'no implement attempts survived dispatch' } }
-  const staged = await stageAndValidate(blindLabel(done, rot), reviewDir, phaseTitle)
+  let staged = await stageAndValidate(blindLabel(done, rot), reviewDir, phaseTitle)
+  // Run F: mechanical pre-council gate — classify/stamp every valid candidate, invalidate corrupt
+  // patches, BEFORE the code council (or legacy judge) sees the pool. Implement rounds only.
+  staged = await mechanicalPatchGate(staged, reviewDir, phaseTitle)
   const blind = staged.filter(c => c.valid)
-  const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
-  if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables' } }
+  const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
+    ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
+    ...(c.valid ? {} : { failReason: c.failReason }) }))
+  if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables (post-mechanical-gate)' } }
   if (repoMode) await enrichBlindPool(blind, reviewDir, phaseTitle)
   const review = await judge('code reviewer', blind, wantGuidance, `${reviewDir}/_pool.md`,
     wantGuidance ? REVIEW_SCHEMA : RANK_SCHEMA, phaseTitle, `${roundName}-review`, LENSES, 'final')
@@ -2579,7 +2754,9 @@ async function implementPhase(seedPlanPath) {
   // surfaced before any implement spend.
   log(`Implement Round 3 gate NOT passed (${g3.reason}); escalating to Implement Round 4 (guided retry).`)
   phase('Implement Round 4')
-  const guidance = (r3.review && r3.review.guidance) || null
+  let guidance = (r3.review && r3.review.guidance) || null
+  { const stub = guidanceStub(guidance)
+    if (stub) { log(`JE-GUIDANCE-STUB [Implement Round 4]: ${stub} — falling back to task-only guided retry (no placeholder guidance seeds a brief).`); guidance = null } }
   const r4 = await implementRound('impl-4', 'Implement Round 4', 4, seedPlanPath, guidance, `${runDir}/review-impl-4`, false)
   await persist([
     ...(r4.review && !r4.review.__failed ? [
@@ -2721,7 +2898,12 @@ phase('Round 2')
 log(`Round 2: ${attempts.length} guided attempts; carrying over ${champs.length} round-1 champion(s)${champs.length ? ` (${champs.map(c => c.displayModel).join(', ')})` : ' — none (all vetoed)'}`)
 const r2Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-2', a.label) : scratchPath('round-2', a.label) }))
 await buildWorktrees('round-2', r2Worktrees) // repoMode-only no-op otherwise
-const r2 = (await parallelQuorum(r2Worktrees, (a) => dispatch(a, a.ws, review.guidance, 'Round 2'), 'Round 2', {
+// Run F fold-in: never seed round-2 briefs with stub/placeholder guidance — fall back to task-only
+// (null guidance is the round-1 dispatch shape, a first-class path).
+let r2Guidance = review.guidance
+{ const stub = guidanceStub(r2Guidance)
+  if (stub) { log(`JE-GUIDANCE-STUB [Round 2]: ${stub} — falling back to TASK-ONLY round 2 (no priors block seeds a brief).`); r2Guidance = null } }
+const r2 = (await parallelQuorum(r2Worktrees, (a) => dispatch(a, a.ws, r2Guidance, 'Round 2'), 'Round 2', {
   timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
 })).filter(Boolean)
 { const w = dispatchDropSummary('Round 2', dispatchDrops, r2Worktrees.length, r2.length); if (w) log(w) } // #45

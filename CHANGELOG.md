@@ -6,6 +6,27 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Mechanical pre-council patch gate + guidance-stub launch gate (run F).** Before the code
+  council convenes on implement candidates, ONE deterministic helper step classifies each valid
+  staged deliverable — `clean_patch` (incl. `--recount`/structure-only nuance) | `corrupt_patch` |
+  `full_files` | `empty` | `unavailable` — by running `git apply --check` against a DETACHED
+  scratch worktree at the tournament snapshot (structure-only `git init` check when no snapshot;
+  `unavailable` when the gate itself cannot run — which never invalidates). A judge-visible
+  `--- Mechanical check --- / MECHANICAL: …` stamp (letters-only; git error text path-stripped +
+  capped) lands in `_pool.md` via one shared stamp-shell used by both pool writers, and
+  `mapping.json` records the class. ONLY a corrupt patch auto-invalidates (like a provenance
+  failure, with a distinct `:mech` RC 04 seat); full-files candidates stay judged (loose
+  deliverable contract). Retires the audited 5-6x duplicated per-judge apply-checks; corrupt
+  patches (t2/t3b/t7) and no-patch "valid" candidates (t4) no longer reach councils unflagged.
+  Fold-in: `guidanceStub` gates round-2 AND implement-round-4 launches — stub/placeholder guidance
+  (empty, or all-junk per guidanceIntegrityIssue) is nulled with a loud `JE-GUIDANCE-STUB` line and
+  the round runs task-only (the round-1 dispatch shape) instead of seeding briefs with placeholders
+  (reached round-2 briefs in 3 audited runs). Fail-safe end to end; tally/veto/judging semantics
+  unchanged. Tests: `workflows/tournament-mechanical-gate.test.mjs`. Plan: run F @@FE composite
+  (7-draft blind pool; backbone A/opus + B/sonnet's path-stripping sanitizer + C/sonnet's
+  no-snapshot edge discipline + F,G/codex-high's recount visibility; H/minimax's keep-but-flag
+  routing argued and rejected).
+
 - **Runner watchdogs, guaranteed terminal markers, retryable hangs + N-1 quorum close (run E).**
   New shared `bin/_je-run-lib.sh` (sourced by all five runners): idempotent `finish()` writes
   exactly one terminal `JOUST-<PROV>-{DONE|TIMEOUT|KILLED|ERROR}` + one `JOUST-RC` line on EVERY
