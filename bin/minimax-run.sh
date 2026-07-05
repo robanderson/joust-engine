@@ -13,7 +13,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
 
 TIMEOUT="${JE_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
-STALL="${JE_STALL_SECS:-90}"        # zero-output stall window (seconds)
+STALL="${JE_STALL_SECS:-300}"       # zero-output stall window (seconds); 300: claude -p buffers, long silent prefill != hang (live evidence 2026-07-06)
 MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 
 [ -z "${MINIMAX_API_KEY:-}" ] && { finish DONE "exit=3 (missing-key)" 07 missing-key; exit 3; }

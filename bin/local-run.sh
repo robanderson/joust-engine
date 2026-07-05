@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
 
 TIMEOUT="${JE_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
-STALL="${JE_STALL_SECS:-60}"        # zero-output stall window (seconds)
+STALL="${JE_STALL_SECS:-240}"       # zero-output stall window (seconds); 240: claude -p buffers, long silent prefill != hang
 MAXTURNS="${JE_MAX_TURNS:-20}"       # tight cap: local models tend to ignore "single pass" and loop
 
 # OMLX_AUTH_TOKEN comes from the environment — uniform key handling across every runner.

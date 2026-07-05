@@ -18,10 +18,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
 
 TIMEOUT="${JE_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds), PER TRY
-STALL="${JE_STALL_SECS:-240}"       # zero-output stall window (seconds), PER TRY. 240 not 90: z.ai
-                                    # thinks silently for minutes under plan-tier backpressure — 90s
-                                    # stall-killed BOTH glm-5.2 seats (twice each) in the first live
-                                    # run while codex/minimax seats were fine at 90-120s windows.
+STALL="${JE_STALL_SECS:-480}"       # zero-output stall window (seconds), PER TRY. 480: claude -p
+                                    # buffers output until completion, so a long silent prefill on a
+                                    # big context bundle looks like a hang (stall-killed glm at 90s AND
+                                    # 240s live). Real fix queued: stream-json liveness output.
 MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 RETRIES="${JE_GLM_RETRIES:-3}"       # max ADDITIONAL tries after the first, for 529s (<=4 total)
 BACKOFF="${JE_GLM_BACKOFF_BASE:-15}" # first retry delay (seconds); doubles per retry
