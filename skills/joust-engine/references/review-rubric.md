@@ -81,23 +81,26 @@ Vote with no visibility into your peers. Return: per-candidate pros/cons (throug
 
 **Security lens additionally** returns a `safety` entry per candidate: `{label, safety: SAFE | UNSAFE, severity: high|critical (UNSAFE only), evidence: file + concrete why (UNSAFE only)}`. Flag `UNSAFE` only with **evidence you can point to** — a real vulnerability, an injected-execution path, a secret/credential exposure, or a supply-chain/build-config risk. A standing `UNSAFE` flag (high|critical, with evidence) **excludes that candidate from winning regardless of votes**, so do not flag on suspicion alone — but when you are unsure whether something is exploitable, flag it and cite why (fail-closed). Because a veto can silently exclude the real winner, the tally code additionally requires the `evidence` string to be substantive (not empty, not a placeholder token, not a bare word or two) — a schema-valid-but-vacuous `evidence` string does **not** make the veto stand; write a real "file + why" every time.
 
-### Deliberation — bounded, at most 3 rounds
+### After the vote: judging-v3 — councils NEVER deliberate
 
-The deterministic tally runs after every round. If no candidate has a **>50% majority** of the living judges' first-place votes on a **non-vetoed** candidate, a deliberation round runs. In it:
+Peer-deliberation rounds are retired (observed live: hours of judges re-arguing FIXED artifacts with no mechanism to improve anything). What happens after the single independent vote round depends on the decision point:
 
-- You see **all peers' latest full verdicts** (verbatim JSON, blind — letters only).
-- Address the disagreements in **`response_to_peers`**: convince your peers or be convinced. Converge on the *correct* call — do not hold a position out of stubbornness, and do not cave to a majority you believe is wrong. Set `changed_this_round` / `changed_from_round1` truthfully.
-- You **may run 1-2 targeted checks** to settle a factual dispute (record them in `checks_run`).
-- **Veto rebuttal:** a peer may rebut a security veto with evidence. If it genuinely refutes the flag, the security judge **withdraws** it (drops the `UNSAFE` entry); a flag still believed **stands** and keeps excluding the candidate at the final tally.
+**Intermediate review (two-pass Round-1 review) — FAST TALLY.** One vote round, then the deterministic tally: a **>50% majority** on a non-vetoed candidate carries that single champion into the final pool (identical to before); **no majority carries the TOP TWO non-vetoed candidates** (most first-place votes, then best mean rank across living judges, then blind label). All candidates vetoed → **nothing** is carried and round 2 proceeds on guidance alone (never a halt). The intermediate review's job is distilling guidance and carrying champion(s) — forcing consensus there wasted tokens and discarded the runner-up nearly half the panel preferred. `council.json` records `fast_tally: true` + `carried: [letters]`.
 
-After **3** deliberation rounds still split (no majority, or the only would-be winner is vetoed, or *every* candidate is vetoed) → **NO_CONSENSUS**. This is never silently resolved by Borda, averaging, or a meta-judge: the run surfaces the full split (interactive) or routes the loop to needs-human + HALT (grand loop).
+**Final decision point (plan Final rank, implement-round reviews, single-pass Review) — the STEELMAN SHOOTOUT.** The vote round only **seeds** the top-2 non-vetoed finalists (a majority just means seed #1). Then, ALWAYS at least one improvement round:
+
+1. A non-voting **steelman** (a synthesis helper like the guidance distiller — never votes, never ranks) turns the judges' cited cons on each finalist into a **minimal change-list** (every item traceable to a cited con; no redesign, no new features).
+2. One implementer per finalist applies its change-list to a **copy**; a boost that fails the staging gate is discarded and that finalist re-enters at its last gated version (**ratchet** — an iteration can never worsen a candidate).
+3. **Cold re-judge:** the boosted finalists are re-pooled under fresh blind letters and judged in one independent vote round — no prior verdicts, no peer block, no iteration hints (only the steelman ever sees history).
+4. Majority → winner (its polished artifact replaces the staged original — a shipped winner never carries the cons the judges already documented). Tie → iterate, **max 5 rounds**; still tied → **`needs_orchestrator_pick`**: the orchestrator (interactive SKILL / grand-loop driver) casts the deciding vote between two gated, security-cleared finalists, recorded as `decided_by: "orchestrator"`. A **lone** non-vetoed finalist still gets one solo polish round, judged against its own pre-boost version.
+
+`council.json` records the full loop: `steelman.rounds[]` (per-iteration change-lists, gate results, runoff votes), `seeds`, `decided_by`.
 
 ### Tally & veto rules (deterministic, run in code — described here for context only)
 
-- **Majority** = strictly **>50%** of the *living* judges' first-place votes (3 of 5 when all alive; recomputed against the living count if a judge dies).
-- **Veto filter:** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from the security judge cannot win, whatever its vote count.
-- Majority on a non-vetoed candidate → that candidate wins. All candidates vetoed, or still no majority after 3 deliberation rounds → NO_CONSENSUS.
-- The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override; the winner slot is only ever filled by a majority non-vetoed winner.
+- **Majority** = strictly **>50%** of the *living* judges' first-place votes (recomputed against the living count if a judge dies).
+- **Veto filter (absolute):** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from EITHER security gate cannot win, be carried, or be picked by the orchestrator, whatever its vote count. Both steelman finalists vetoed in a runoff (or every candidate vetoed at a final-rank seed vote) → **NO_CONSENSUS** / needs-human — the only remaining NO_CONSENSUS path.
+- The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override.
 
 ## Single blind judge (`judges: 1`, legacy)
 

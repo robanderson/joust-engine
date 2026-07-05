@@ -54,8 +54,8 @@ check('(legacy) file-staging copy snippet unchanged',
   stageSrc.includes('mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null;'))
 check('(legacy) file-staging pool concat snippet unchanged',
   stageSrc.includes('find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null'))
-check('(legacy) round-1 judge call unchanged',
-  SRC.includes("const review = await judge('reviewer', blind1, mode === 'two', `${runDir}/review-1/_pool.md`,\n  mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, 'Review', 'review')"))
+check('(legacy) round-1 judge call unchanged', // judging-v3: gained explicit lenses + style args (intermediate at two-pass Review)
+  SRC.includes("const review = await judge('reviewer', blind1, mode === 'two', `${runDir}/review-1/_pool.md`,\n  mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, 'Review', 'review', defaultLensesFor('Review'), mode === 'two' ? 'intermediate' : 'final')"))
 check('(legacy) final judge call unchanged',
   SRC.includes("const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-final/_pool.md`, RANK_SCHEMA, 'Final rank', 'final-rank')"))
 
@@ -132,9 +132,9 @@ check('(enrich) staging preserves live worktree only in repoMode',
   stageSrc.includes(': { ...c, ws: `${reviewDir}/${c.blind}`, valid, failReason }'))
 check('(enrich) checks change into live candidate worktree',
   enrichSrc.includes('const ws = c.liveWs') && enrichSrc.includes('(cd "$ws" && bash "$helper" je_run_with_timeout'))
-check('(enrich) carryover reuses strict prior summary',
+check('(enrich) carryover reuses strict prior summary', // judging-v3: up to two champs carry via champs.map
   enrichSrc.includes('if (c.carriedOver)') && enrichSrc.includes('c.enrichmentSource') &&
-  SRC.includes('enrichmentSource: `${champ.ws}/enrichment.txt`'))
+  SRC.includes('enrichmentSource: `${ch.ws}/enrichment.txt`'))
 
 // (5c) blindness: fixed grammar only, no identity, command text, logs, paths, or durations in pool.
 check('(enrich) summary grammar is anchored and numeric/boolean only',

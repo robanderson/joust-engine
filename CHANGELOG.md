@@ -6,6 +6,44 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Judging-v3: councils never deliberate** (2026-07-05/06 designs; peer-deliberation rounds
+  are retired after a live run burned hours re-arguing fixed artifacts).
+  - **Fast tally at intermediate reviews** (two-pass Round-1 review): one independent vote
+    round; a >50% majority carries one champion (identical to before); a split carries the
+    **top TWO non-vetoed** candidates into the final pool (first-place votes, then mean rank,
+    then blind label); all-vetoed carries none and round 2 proceeds on guidance alone.
+    `council.json` gains `fast_tally` + `carried`; `mapping.json` gains `carriedOver` (array).
+  - **Steelman shootout at final decision points** (plan Final rank, implement reviews,
+    single-pass Review): the vote round only SEEDS the top-2 non-vetoed finalists — then
+    ALWAYS ≥1 improvement round: a non-voting **steelman** distils the judges' cited cons
+    into per-finalist minimal change-lists (every item traceable to a con; no redesign),
+    implementers apply them to copies (staging-gated, **ratcheted** — a failed boost reverts),
+    and a **cold** blind re-judge (fresh letters, no history — only the steelman sees prior
+    verdicts) votes once. Majority → the winner ships with its improvements applied (its
+    staged artifact is replaced by the boosted version). Tie → iterate, **max 5**; still
+    tied → **`needs_orchestrator_pick`** — the orchestrator casts the deciding vote between
+    two gated, security-cleared finalists (`decided_by: "orchestrator"`; the engine never
+    self-resolves; a vetoed candidate can never be picked). A lone non-vetoed finalist gets a
+    solo polish round judged against its own pre-boost version. NO_CONSENSUS remains only for
+    all-vetoed. Implement-phase steelman ties skip Round 4 and surface the pick instead.
+  - **Brief enhancements:** the plan feasibility lens now owns demand-the-proof claim
+    auditing (verify the plan's factual claims against the snapshot); every judge brief
+    (council + legacy) gains an anti-length-bias line ("thoroughness is evidence, not word
+    count").
+- **Structural persist (issue #33) — verified dataplane, bytes stop transiting models.**
+  `persist()` writes each artifact ONCE as a single quoted heredoc and verifies it in code:
+  the helper reports `wc -c` + `shasum -a 256` per file and the engine compares against a
+  pure-JS SHA-256 it computed over the exact bytes — abbreviation/mangling/truncation is a
+  verified miss, retried once (forced onto the typed+verified path), then loudly failed.
+  Derived artifacts (`verdict.md`, `council.json`, `guidance.md`) are no longer typed by a
+  model at all: the new deterministic **`bin/je-render.mjs`** renders them ON DISK from the
+  already-verified `verdict.json`, slicing the marked renderer block out of `tournament.mjs`
+  itself (engine and renderer cannot drift; byte-parity is unit-tested). The codex judge
+  VERDICT.json read-back is likewise sha-verified before parse (a corrupted relay retries,
+  then falls back per the existing ladder). Run C measured the old path at ~35 min/checkpoint
+  for ~290KB; typed bytes drop ~60% and every remaining byte is checksummed. HELPER_MODEL
+  stays `sonnet` everywhere (operator policy: no haiku until a Haiku 5.x base).
+
 - **Official per-seat return codes (JE-RC 00–09).** Every runner script appends a terminal
   `JOUST-RC <code> <short-reason>` line to its `_*_run.log` on **every** exit path (complementing,
   never replacing, the existing DONE/TIMEOUT provenance markers). The engine derives RCs for
