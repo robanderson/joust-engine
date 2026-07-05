@@ -62,6 +62,11 @@ const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 // Council size is fixed at 5 (not user-tunable): any judges value other than 1 selects the council.
 const COUNCIL = Number(A.judges) !== 1
 
+// judgeMix (mixed-family council, 2026-07-05 design). Default = the mixed assignment (codex-xhigh on
+// completeness-class/simplicity-class seats); judgeMix:'anthropic' forces every seat native Opus,
+// byte-identical to pre-feature output. Ignored when judges:1 (no council to mix).
+const LEGACY_MIX = A.judgeMix === 'anthropic'
+
 // Run-purpose summary for the live /workflows heading (issue #38). meta.name/description is a static
 // PURE LITERAL (Workflow spec — it CANNOT be dynamic per-run), so the only runtime lever into the live
 // display is an early log() narrator line rendered above the progress tree. args.title (alias args.purpose)
@@ -234,6 +239,9 @@ const minimaxTimeoutSecs = Number(A.minimaxTimeoutSecs) > 0 ? Math.floor(Number(
 // Codex exec is agentic with NO turn cap (no --max-turns flag), so the wall-clock timeout is its ONLY
 // per-attempt backstop and gets its own, roomier default. Override via args.codexTimeoutSecs.
 const codexTimeout = Number(A.codexTimeoutSecs) > 0 ? Math.floor(Number(A.codexTimeoutSecs)) : 600
+// Generous wall-clock for a codex-xhigh JUDGE seat (reasoning-heavy, reads a whole blind pool file).
+// Separate from codexTimeout (the ATTEMPT wall-clock) so raising one never silently raises the other.
+const codexJudgeTimeout = Number(A.codexJudgeTimeoutSecs) > 0 ? Math.floor(Number(A.codexJudgeTimeoutSecs)) : 1500
 // Grok is a full autonomous coding agent (like codex it gets a roomier wall-clock default), but UNLIKE
 // codex it ALSO has --max-turns, so it uses BOTH per-attempt guards via the standard runnerCmd:
 // grokMaxTurns (default = glm's 30) as the primary iteration cap + grokTimeout as the wall-clock backstop.
@@ -243,8 +251,9 @@ const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(
 // envExtra (optional): extra `KEY=VAL ` env assignments prepended to the runner call (e.g. grok's JE_GROK_WEB=1).
 const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout, envExtra = '') => `${cmdHead(ws, b)} && ${envExtra}JE_MAX_TURNS=${maxTurns} JE_TIMEOUT_SECS=${timeout} bash ${q(runner)} ${flag}`
 // Codex reuses cmdHead + the runner but overrides the wall-clock with codexTimeout (no JE_MAX_TURNS:
-// codex has no turn cap, and codex-run.sh ignores it).
-const codexRunnerCmd = (runner, flag, ws, b) => `${cmdHead(ws, b)} && JE_TIMEOUT_SECS=${codexTimeout} bash ${q(runner)} ${flag}`
+// codex has no turn cap, and codex-run.sh ignores it). The optional timeoutSecs arg lets a codex JUDGE
+// seat pass codexJudgeTimeout (its own, roomier wall-clock) without touching the attempt call site.
+const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${cmdHead(ws, b)} && JE_TIMEOUT_SECS=${timeoutSecs} bash ${q(runner)} ${flag}`
 
 // Optional shared CONTEXT BUNDLE for known-input tasks (args.contextFiles = [paths/globs]).
 // Concatenate those files ONCE into a single file that every worker reads by path — instead of
@@ -321,6 +330,13 @@ const worktreePath = (roundName, label) => repoMode ? `${worktreeRoot}/${roundNa
 // hatch, same pattern as `judges: 1`).
 const workspaceRoot = A.workspaceRoot || `/tmp/je-workspaces/${safeRunId}`
 const scratchPath = (roundName, label) => `${workspaceRoot}/${roundName}/${label}`
+// Judge scratch dirs (mixed-family council, 2026-07-05) live under the SAME outside-~/.claude/ root as
+// candidate workspaces (issue #34/#44) so a codex judge seat can actually write VERDICT.json instead of
+// fighting write denials. Keyed off the already-unique per-seat label (`<phase-label>-<lens.key>-r<round>`),
+// so concurrent codex seats (spec/craft, completeness/simplicity) get disjoint dirs even under parallel().
+const judgeWorkspaceRoot = `${workspaceRoot}/_judges`
+const judgeWs = (label) => `${judgeWorkspaceRoot}/${label}`
+let codexRunnerWarned = false // one-time (not per-seat/round) missing-runner warning
 const engineFiles = ['_brief.txt', '_glm_run.log', '_local_run.log', '_codex_run.log', '_codex_last.txt', '_minimax_run.log', '_grok_run.log']
 const engineLogPath = (c, log) => {
   if (!repoMode || !log) return log ? `${c.ws}/${log}` : ''
@@ -521,6 +537,18 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
     })
 }
 
+// Part 2 of the mixed-family spec (2026-07-05): PINS every judge (council lens AND legacy single judge) to
+// the tournament SNAPSHOT and forbids the live/current repo checkout, whose state may have moved past what
+// any candidate was actually judged against (the observed wrong-tree judging failure). Applies
+// UNCONDITIONALLY — no judgeMix/COUNCIL gate — because it is a correctness fix, not new opt-in behavior.
+function pinnedScopeBlock(poolPath, blindList) {
+  const roots = [poolPath, ...(blindList || []).map(c => c.ws)]
+  const repoNote = repoMode
+    ? ` Each candidate directory above is an ISOLATED git worktree checked out at base commit ${baseSha}; do not check out, diff against, or otherwise reference any other commit, branch, or the live working tree.`
+    : ''
+  return `\n\nPINNED EVALUATION SCOPE — read before judging: your evaluation is PINNED to this tournament's SNAPSHOT and NOTHING else. Allowed paths: ${roots.join(', ')}.${repoNote} FORBIDDEN: the live/current checkout of this repository outside the paths above (its state may have moved on since this tournament's snapshot was taken and is NOT what any candidate was judged against), and any path not listed above. If you run a verification command, run it INSIDE the listed candidate directory only, and cite that exact path in checks_run.`
+}
+
 function judgePrompt(kind, blindList, guidanceWanted, poolPath) {
   const dirs = blindList.map(c => `  Candidate ${c.blind}: ${c.ws}/`).join('\n')
   const guidanceBlock = guidanceWanted
@@ -536,7 +564,7 @@ ${poolPath}
 
 If (and only if) a candidate is runnable code you want to execute to judge the real output, its individual files are in its own directory (run with a sensible timeout):
 ${dirs}
-Judge the real output / artifact — not any self-summary. Do not read any other files.
+Judge the real output / artifact — not any self-summary. Do not read any other files.${pinnedScopeBlock(poolPath, blindList)}
 
 Score each candidate against criteria suited to the task (for code: correctness, meets stated constraints, completeness, edge cases, readability; adapt for non-code). Score against the task's STATED runtime, not an environment you cannot see: treat reliance on a capability the task did not establish is available as a risk, and treat an unfamiliar mechanism that honours the stated constraints as correct unless you can name a concrete way it fails — never reward a familiar-looking API over a constraint-honouring one on idiom alone. Give concrete, specific pros and cons per candidate. Rank them all. Name the single winner with reasoning.${guidanceBlock}
 
@@ -898,9 +926,118 @@ function guidanceIntegrityIssue(g) {
 }
 // ---- end: verdict integrity guard ------------------------------------------------------------
 
+// ---- begin: codex-judge routing + verdict parsing (mixed-family council, 2026-07-05) --------------
+// Every function here is PURE (no closures over module state, no I/O) so it can be extracted and
+// eval'd in isolation by a test, exactly like the verdict-integrity block above (which this composes
+// onto rather than re-deriving).
+
+// Which family judges this lens, this round? 'native' (Opus, today's path) or 'codex' (codex-xhigh via
+// the codex runner). legacyMix forces 'native' unconditionally (byte-identical escape hatch); a lens
+// with no `judge` field (everything except spec/craft/completeness/simplicity) always stays 'native';
+// a missing codexRunner also forces 'native' (fail-safe — never crash for a missing optional runner).
+// 6th seat (spec addendum 2026-07-05): councils carry TWO security gates — the primary Opus
+// 'security' seat plus a cross-family 'security-x' seat on codex-xhigh. Both hold veto power
+// (UNION: a standing evidenced flag from EITHER excludes the candidate). Everything that gates
+// security behaviour keys off this predicate; the fail-closed security-DEAD policy stays keyed
+// to the PRIMARY 'security' seat only (security-x already falls back to Opus like other codex seats).
+const isSecurityLens = (key) => key === 'security' || key === 'security-x'
+
+function chooseJudgeDispatch(lens, legacyMix, codexRunnerConfigured) {
+  if (legacyMix) return 'native'
+  if (lens && lens.judge && lens.judge.kind === 'codex' && codexRunnerConfigured) return 'codex'
+  return 'native'
+}
+
+// The paths a judge is allowed to cite in checks_run: the shared blind pool file, each candidate's own
+// listed directory (worktree in repoMode, scratch dir otherwise — already the right value either way),
+// and (repoMode) the shared worktree root prefix.
+function allowedRootsFor(blindList, poolPath, repoModeFlag, worktreeRootVal) {
+  const roots = [poolPath, ...(blindList || []).map((c) => c.ws)]
+  if (repoModeFlag && worktreeRootVal) roots.push(worktreeRootVal)
+  return roots
+}
+
+// Same required-key shape as LENS_R1_SCHEMA/LENS_DELIB_SCHEMA (minus the delib-only cross-talk fields,
+// which are optional/best-effort for a codex verdict — see edge case 8). `safety` is OPTIONAL here:
+// the cross-family security-x seat routes to codex and returns it; shape-check it when present.
+function verdictShapeIssue(v) {
+  if (!v || typeof v !== 'object') return 'not an object'
+  if (typeof v.lens !== 'string' || !v.lens) return 'missing/invalid "lens"'
+  if (!Array.isArray(v.candidates) || !v.candidates.every((c) => c && typeof c.label === 'string' && Array.isArray(c.pros) && Array.isArray(c.cons)))
+    return 'missing/invalid "candidates"'
+  if (!Array.isArray(v.ranking) || !v.ranking.every((r) => typeof r === 'string')) return 'missing/invalid "ranking"'
+  if (typeof v.vote !== 'string' || !v.vote) return 'missing/invalid "vote"'
+  if (typeof v.reasoning !== 'string') return 'missing/invalid "reasoning"'
+  if (!Array.isArray(v.checks_run) || !v.checks_run.every((c) => typeof c === 'string')) return 'missing/invalid "checks_run"'
+  if (v.safety !== undefined && (!Array.isArray(v.safety) || !v.safety.every((x) => x && typeof x.label === 'string' && typeof x.safety === 'string')))
+    return 'invalid "safety"'
+  return null
+}
+
+// Non-fatal (v1) telemetry: does any checks_run entry cite an absolute-path-looking token outside the
+// pinned scope? Only flags tokens that actually LOOK like a path (leading '/'); prose-only evidence
+// ("ran the build, exit 0") never trips this. Never throws, never rejects the verdict.
+function checksRunRootsIssue(checksRun, allowedRoots) {
+  if (!Array.isArray(checksRun) || !Array.isArray(allowedRoots) || !allowedRoots.length) return null
+  const PATH_RE = /(\/[^\s'"()<>]+)/g
+  const offenders = new Set()
+  for (const entry of checksRun) {
+    const s = String(entry == null ? '' : entry)
+    let m
+    PATH_RE.lastIndex = 0
+    while ((m = PATH_RE.exec(s))) {
+      const p = m[1].replace(/[.,;:]+$/, '')
+      const inScope = allowedRoots.some((root) => p === root || p.startsWith(root.endsWith('/') ? root : root + '/'))
+      if (!inScope) offenders.add(p)
+    }
+  }
+  if (!offenders.size) return null
+  return `checks_run cites path(s) outside the pinned evaluation scope: ${[...offenders].slice(0, 5).join(', ')}`
+}
+
+// Fixed sentinels the SHELL (not the LLM) emits via printf, so the engine can trust the split points
+// regardless of what the LLM relays (mirrors buildContext's contextCatCmd label pattern).
+const CODEX_JUDGE_LOG_MARK = '===JE-CODEX-JUDGE-LOG==='
+const CODEX_JUDGE_VERDICT_MARK = '===JE-CODEX-JUDGE-VERDICT==='
+
+// Parse+validate a codex judge seat's raw dump (log tail + VERDICT.json body, sentinel-joined). Pure:
+// no I/O, no agent() calls. Reuses the EXISTING guards (verdictIntegrityIssue/checksRunIssue) rather
+// than re-deriving equivalent logic. Returns {ok:true, verdict} or {ok:false, reason} — NEVER throws.
+function parseCodexJudgeDump(rawDump) {
+  const s = String(rawDump == null ? '' : rawDump)
+  const li = s.indexOf(CODEX_JUDGE_LOG_MARK)
+  const vi = s.indexOf(CODEX_JUDGE_VERDICT_MARK)
+  if (li < 0 || vi < 0 || vi < li) return { ok: false, reason: 'codex judge dump missing log/verdict markers — runner or read-back step failed' }
+  const logPart = s.slice(li + CODEX_JUDGE_LOG_MARK.length, vi)
+  const verdictPart = s.slice(vi + CODEX_JUDGE_VERDICT_MARK.length)
+  if (!/^JOUST-CODEX-PROVENANCE endpoint=/m.test(logPart)) return { ok: false, reason: 'codex judge: no PROVENANCE marker — runner never ran' }
+  if (!/^JOUST-CODEX-DONE exit=0/m.test(logPart)) return { ok: false, reason: 'codex judge: runner did not report exit=0' }
+  if (/^JOUST-CODEX-(TIMEOUT|ERROR)/m.test(logPart)) return { ok: false, reason: 'codex judge: runner reported TIMEOUT/ERROR' }
+  let parsed
+  try {
+    parsed = JSON.parse(verdictPart.trim())
+  } catch (e) {
+    return { ok: false, reason: `codex judge: VERDICT.json is not valid JSON (${String(e).slice(0, 80)})` }
+  }
+  const shapeIssue = verdictShapeIssue(parsed)
+  if (shapeIssue) return { ok: false, reason: `codex judge: VERDICT.json shape invalid — ${shapeIssue}` }
+  const integrityIssue = verdictIntegrityIssue(parsed) || checksRunIssue(parsed.checks_run)
+  if (integrityIssue) return { ok: false, reason: `codex judge verdict failed integrity check: ${integrityIssue}` }
+  return { ok: true, verdict: parsed }
+}
+// ---- end: codex-judge routing + verdict parsing -----------------------------------------------
+
+// Structured-output schema for the read-back agent: it relays the sentinel-joined raw dump VERBATIM in
+// one string field. The engine (parseCodexJudgeDump), not the LLM, is the source of truth for the bytes.
+const CODEX_JUDGE_DUMP_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { raw: { type: 'string' } },
+  required: ['raw'],
+}
+
 // #6 + #7: never silently carry the wrong artifact or trust an off-spec ranking — normalize the
 // judge's winner/ranking against the REAL candidate labels and repair to a full permutation.
-function reconcile(result, labels) {
+function reconcile(result, labels, allowedRoots) {
   // Null-guard: agent() returns null if the judge dies on a terminal API error (or is skipped). Surface
   // that as a clear, catchable error instead of a cryptic "null is not an object" — judge() retries once
   // then degrades to a clean __failed partial result rather than crashing the (fully-paid) run.
@@ -910,6 +1047,13 @@ function reconcile(result, labels) {
   // path as the null-guard above, so a genuinely dead/junk judge still degrades to a clean __failed partial.
   const integrityIssue = verdictIntegrityIssue(result) || (result.guidance ? guidanceIntegrityIssue(result.guidance) : null)
   if (integrityIssue) throw new Error(`judge verdict failed integrity check: ${integrityIssue}`)
+  // Snapshot-pinning roots check (forward-compatible; a NO-OP today — REVIEW_SCHEMA/RANK_SCHEMA have no
+  // checks_run field, so checksRunRootsIssue(undefined, ...) always returns null). Wired here so the legacy
+  // judges:1 path is covered the day the legacy schema grows a checks_run field. Non-fatal telemetry only.
+  if (allowedRoots) {
+    const rootsIssue = checksRunRootsIssue(result.checks_run, allowedRoots)
+    if (rootsIssue) log(`JE-COUNCIL-WARNING: ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
+  }
   const set = new Set(labels)
   const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
   let ranking = [...new Set((result.ranking || []).map(norm).filter(x => set.has(x)))]
@@ -935,7 +1079,7 @@ async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTit
   const prompt = judgePrompt(kind, blindList, guidanceWanted, poolPath)
   for (let i = 1; i <= 2; i++) {
     try {
-      return reconcile(await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label }), blindList.map(c => c.blind))
+      return reconcile(await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label }), blindList.map(c => c.blind), allowedRootsFor(blindList, poolPath, repoMode, worktreeRoot))
     } catch (e) {
       log(`${label} judge attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
       if (i === 2) return { __failed: String(e).slice(0, 160) }
@@ -957,10 +1101,11 @@ async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTit
 // veto lens's key is 'security' (councilTally / the veto machinery key off that literal).
 const LENSES = [
   { key: 'correctness', owns: 'does it actually work — run or trace the code, and cite the enrichment (verify/build/lint) exit codes when present', special: 'You are the evidence judge; ground every claim in something you ran or read.' },
-  { key: 'spec', owns: 'compliance and completeness — is EVERYTHING that was asked done, and are the stated constraints honoured', special: 'You catch the "works but solved the wrong task" failure.' },
+  { key: 'spec', owns: 'compliance and completeness — is EVERYTHING that was asked done, and are the stated constraints honoured', special: 'You catch the "works but solved the wrong task" failure.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
   { key: 'security', owns: 'vulnerabilities, injected execution, secret/credential exposure, supply-chain and build-config risk', special: 'You hold the council VETO.' },
   { key: 'robustness', owns: 'edge cases, failure modes, boundaries, error handling', special: 'Probe what breaks it, not just the happy path.' },
-  { key: 'craft', owns: 'readability, structure, maintainability, efficiency', special: 'Judge whether someone else could own this in a year.' },
+  { key: 'craft', owns: 'readability, structure, maintainability, efficiency', special: 'Judge whether someone else could own this in a year.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'security-x', title: 'security (cross-family)', owns: 'vulnerabilities, injected execution, secret/credential exposure, supply-chain and build-config risk', special: 'You hold a council VETO — the second, cross-family security gate.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
 ]
 
 // PLAN lenses — judge a PLAN artifact (rounds 1–2: a concrete, file-level change proposal
@@ -970,10 +1115,11 @@ const LENSES = [
 // `title || key`; every logic path (schema selection, tally, safety) still keys off `key`.
 const PLAN_LENSES = [
   { key: 'feasibility', owns: 'can this plan actually be built as written — are the named files, APIs, and mechanisms real and reachable, and does each step follow from the last', special: 'You are the reality judge; a plan that cannot be executed as written is worthless however elegant.' },
-  { key: 'completeness', owns: 'does the plan cover EVERYTHING the task asked — every requirement, edge case, migration, test, and doc update, with no silent gaps', special: 'You catch the "plans the easy 80%, hand-waves the hard 20%" failure.' },
+  { key: 'completeness', owns: 'does the plan cover EVERYTHING the task asked — every requirement, edge case, migration, test, and doc update, with no silent gaps', special: 'You catch the "plans the easy 80%, hand-waves the hard 20%" failure.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
   { key: 'risk', owns: 'what could go wrong on execution — hidden coupling, breaking changes, data/compat hazards, rollout/ordering risk, and whether the plan names and mitigates them', special: 'Probe the failure modes the plan glosses over, not just the happy path.' },
   { key: 'security', title: 'security-by-design', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold the council VETO: veto a plan that designs in a real, evidenced security hazard.' },
-  { key: 'simplicity', owns: 'simplicity and proportionality — is the plan the smallest coherent change that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the plan is proportionate to the task; reward the simplest approach that is still complete.' },
+  { key: 'simplicity', owns: 'simplicity and proportionality — is the plan the smallest coherent change that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the plan is proportionate to the task; reward the simplest approach that is still complete.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'security-x', title: 'security-by-design (cross-family)', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold a council VETO — the second, cross-family security gate: veto a plan that designs in a real, evidenced security hazard.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
 ]
 
 // Lens profiles the council can run under. Default = code lenses (unchanged behaviour).
@@ -1059,11 +1205,32 @@ function reconcileLens(v, labels) {
   return out
 }
 
-// One lens judge: opus, retry once (like judge()), reconcile. Returns { lens, ...verdict } or null (dead).
+// One lens judge — a THIN ROUTER (same external signature as before, so councilJudge's call sites are
+// byte-for-byte). Routes on chooseJudgeDispatch: a codex-xhigh seat (spec/craft, completeness/simplicity)
+// dispatches via the codex runner when configured and not overridden; everything else — and, under
+// judgeMix:'anthropic', EVERY seat — runs the native Opus path. A codex seat that exhausts its retries
+// FALLS BACK to native Opus for that round so the council never loses a seat. Returns { lens, judgeModel,
+// ...verdict } or null (dead even after fallback — council recomputes majority over the living).
 async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot) {
   const labels = blindList.map(c => c.blind)
+  const allowedRoots = allowedRootsFor(blindList, poolPath, repoMode, worktreeRoot)
+  const dispatchMode = chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner)
+  if (dispatchMode === 'codex') {
+    const result = await askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
+    if (result) return result
+    log(`JE-COUNCIL-FALLBACK [${phaseTitle}] ${label} (${lens.key}): codex-xhigh seat exhausted retries — falling back to native Opus for this round so the council does not lose a seat.`)
+  } else if (!LEGACY_MIX && lens.judge && lens.judge.kind === 'codex' && !codexRunner && !codexRunnerWarned) {
+    log(`JE-COUNCIL-WARNING: codexRunner not supplied — codex judge seat(s) (spec/craft/completeness/simplicity) will run as native Opus this run. Pass args.codexRunner to enable mixed-family judging.`)
+    codexRunnerWarned = true
+  }
+  return askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
+}
+
+// Native Opus lens judge: opus, retry once (like judge()), reconcile. Tagged judgeModel:'opus'. This is
+// today's askLens body, unchanged except for the shared roots-warning check + the judgeModel tag.
+async function askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots) {
   const prompt = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot)
-  const schema = lens.key === 'security'
+  const schema = isSecurityLens(lens.key)
     ? (roundNum === 1 ? SECURITY_R1_SCHEMA : SECURITY_DELIB_SCHEMA)
     : (roundNum === 1 ? LENS_R1_SCHEMA : LENS_DELIB_SCHEMA)
   for (let i = 1; i <= 2; i++) {
@@ -1074,10 +1241,53 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
       // and every deliberation round, since askLens() is the single call site for all of them.
       const integrityIssue = verdictIntegrityIssue(raw) || checksRunIssue(raw.checks_run)
       if (integrityIssue) throw new Error(`council lens verdict failed integrity check: ${integrityIssue}`)
-      return { lens: lens.key, ...reconcileLens(raw, labels) }
+      const rootsIssue = checksRunRootsIssue(raw.checks_run, allowedRoots)
+      if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
+      return { lens: lens.key, judgeModel: 'opus', ...reconcileLens(raw, labels) }
     } catch (e) {
       log(`council ${label} (${lens.key}) attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
       if (i === 2) return null // dead lens — council recomputes majority over the living
+    }
+  }
+}
+
+// The verbatim-run brief for the codex JUDGE dispatch agent (the joust-codex agent runs it as-is; it
+// judges NOTHING itself). Mirrors RUNVERBATIM (the attempt dispatch), scoped to a single judge seat.
+function RUNVERBATIM_JUDGE(cmd, ws) {
+  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and runs the bundled codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt). Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not judge anything yourself, do not edit the command):\n\n${cmd}\n\nThen report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
+}
+
+// Codex-xhigh lens judge: dispatch the codex runner with a brief asking for VERDICT.json, read the log
+// tail + VERDICT.json body back (sentinel-joined, engine is the source of truth for bytes), then PARSE +
+// VALIDATE in code (parseCodexJudgeDump — provenance + JSON + shape + the SAME integrity guard as native).
+// Retry once; return { lens, judgeModel, ...verdict } or null after two failures (caller falls back to Opus).
+async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots) {
+  const delibExtra = roundNum > 1
+    ? ' On this deliberation round also include response_to_peers (string), changed_this_round (boolean), and changed_from_round1 (boolean) if you can honestly assess them; omit only if you cannot.'
+    : ''
+  const briefBody = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) +
+    `\n\nWrite your verdict as VALID JSON — and NOTHING else in that file, no markdown fence, no commentary — to a file named VERDICT.json in your current working directory. Required keys: lens (must be exactly "${lens.key}"), candidates (array of {label, pros: [string], cons: [string]}), ranking (array of candidate letters, best first), vote (single candidate letter), reasoning (string), checks_run (array of strings — every command you ran or file you read, with its key result, each citing a path inside your pinned evaluation scope above)${isSecurityLens(lens.key) ? ', safety (array of {label, safety: "SAFE"|"UNSAFE", severity ("high"|"critical", UNSAFE only), evidence (UNSAFE only)} — one entry per candidate)' : ''}.${delibExtra}`
+  const seatWs = judgeWs(label)
+  const flag = CODEX_FLAG['codex-xhigh']
+  const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout)
+  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null`
+
+  for (let i = 1; i <= 2; i++) {
+    try {
+      await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), phase: phaseTitle, label: `${label}-codex-dispatch` })
+      const readRaw = await agent(
+        `Run this exact shell command in ONE Bash call and return its ENTIRE stdout, verbatim and unaltered, in the "raw" field. Do not summarize, truncate, or interpret it. Do nothing else:\n\n${dumpScript}`,
+        { model: HELPER_MODEL, schema: CODEX_JUDGE_DUMP_SCHEMA, phase: phaseTitle, label: `${label}-codex-read` }
+      )
+      const raw = (readRaw && typeof readRaw.raw === 'string') ? readRaw.raw : ''
+      const parsedResult = parseCodexJudgeDump(raw)
+      if (!parsedResult.ok) throw new Error(parsedResult.reason)
+      const rootsIssue = checksRunRootsIssue(parsedResult.verdict.checks_run, allowedRoots)
+      if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}, codex-xhigh): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
+      return { lens: lens.key, judgeModel: (lens.judge && lens.judge.displayModel) || 'codex-xhigh', ...reconcileLens(parsedResult.verdict, labels) }
+    } catch (e) {
+      log(`council ${label} (${lens.key}) codex-xhigh attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
+      if (i === 2) return null
     }
   }
 }
@@ -1089,11 +1299,11 @@ function lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) {
   const rotated = blindList.map((_, i) => blindList[(i + rot) % n])
   const dirs = rotated.map(c => `  Candidate ${c.blind}: ${c.ws}/`).join('\n')
   const letters = rotated.map(c => c.blind).join(', ')
-  const securityExtra = lens.key === 'security'
+  const securityExtra = isSecurityLens(lens.key)
     ? `\n\nYou hold the council's SECURITY VETO. For EVERY candidate also return a \`safety\` entry: {label, safety: "SAFE" | "UNSAFE", severity ("high"|"critical", UNSAFE only), evidence (file + concrete why, UNSAFE only)}. Flag UNSAFE only with EVIDENCE you can point to — a real vulnerability, injected-execution path, secret/credential exposure, or supply-chain/build-config risk. A standing UNSAFE flag (high|critical, with evidence) EXCLUDES that candidate from winning regardless of votes, so do not flag on suspicion alone — but if you are unsure whether something is exploitable, flag it and cite why (fail-closed).`
     : ''
   const delib = roundNum > 1
-    ? `\n\nThis is DELIBERATION round ${roundNum - 1} of at most 3. Your peers' latest full verdicts (blind, letters only) are below as verbatim JSON. Read them, address the disagreements in \`response_to_peers\` (convince them or be convinced — converge on the CORRECT call, do not hold a position out of stubbornness), and you MAY run 1-2 targeted checks to settle a factual dispute. Then emit your REVISED verdict and set \`changed_this_round\` / \`changed_from_round1\` truthfully.${lens.key === 'security' ? ' A peer may rebut your veto with evidence; if it genuinely refutes the flag, WITHDRAW it (drop that UNSAFE entry). A flag you still believe stands and keeps excluding the candidate.' : ''}\n\nPEER VERDICTS (JSON, verbatim):\n${peerBlock}`
+    ? `\n\nThis is DELIBERATION round ${roundNum - 1} of at most 3. Your peers' latest full verdicts (blind, letters only) are below as verbatim JSON. Read them, address the disagreements in \`response_to_peers\` (convince them or be convinced — converge on the CORRECT call, do not hold a position out of stubbornness), and you MAY run 1-2 targeted checks to settle a factual dispute. Then emit your REVISED verdict and set \`changed_this_round\` / \`changed_from_round1\` truthfully.${isSecurityLens(lens.key) ? ' A peer may rebut your veto with evidence; if it genuinely refutes the flag, WITHDRAW it (drop that UNSAFE entry). A flag you still believe stands and keeps excluding the candidate.' : ''}\n\nPEER VERDICTS (JSON, verbatim):\n${peerBlock}`
     : ''
   return `You are a blind judge on a 5-member review COUNCIL. Your lens is **${lens.title || lens.key}**: ${lens.owns}. ${lens.special}
 You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you, through YOUR lens (the other four lenses cover the rest). Apply the shared scoring method: judge the real artifact not any self-summary; score against the task's STATED runtime (treat reliance on a capability the task did not establish as a risk, and treat an unfamiliar but constraint-honouring mechanism as correct unless you can name a concrete way it fails); cite specifics (a line or behaviour, never a vibe).
@@ -1106,7 +1316,7 @@ ${poolPath}
 
 If (and only if) a candidate is runnable code you want to execute to judge the real output, its individual files are in its own directory (run with a sensible timeout). Consider the candidates in this order — ${letters}:
 ${dirs}
-Do not read any other files.
+Do not read any other files.${pinnedScopeBlock(poolPath, blindList)}
 
 Return the structured object for YOUR lens: per-candidate pros/cons (through this lens), the full ranking (best first, by candidate letter), your single first-place \`vote\` (one candidate letter), \`reasoning\`, and \`checks_run\` — the commands you ran or files you read, each with its key result (forced evidence; never leave it empty).${securityExtra}${delib}
 
@@ -1119,9 +1329,13 @@ function councilTally(verdicts) {
   const living = verdicts.length
   const votes = {}
   for (const v of verdicts) votes[v.vote] = (votes[v.vote] || 0) + 1
-  const secV = verdicts.find(v => v.lens === 'security')
+  // Dual security gates (spec addendum): the veto set is the UNION of standing flags from EVERY
+  // security-lens verdict ('security' + 'security-x'); each judge's flags stand or are withdrawn
+  // independently in deliberation.
+  const secVs = verdicts.filter(v => isSecurityLens(v.lens))
   const vetoedSet = new Set()
-  if (secV && Array.isArray(secV.safety)) {
+  for (const secV of secVs) {
+    if (!Array.isArray(secV.safety)) continue
     for (const s of secV.safety) {
       if (s && s.safety === 'UNSAFE' && (s.severity === 'high' || s.severity === 'critical')) {
         // Highest-stakes exclusion path: don't let a vacuous-but-schema-valid evidence string stand as a
@@ -1134,7 +1348,7 @@ function councilTally(verdicts) {
       }
     }
   }
-  const threshold = living / 2 // strict >50%
+  const threshold = living / 2 // strict >50% (6 alive => 4 votes; even-N 3-3 splits resolve via deliberation/NO_CONSENSUS)
   let winner = null
   const order = Object.keys(votes).sort((a, b) => (votes[b] - votes[a]) || a.localeCompare(b))
   for (const c of order) { if (votes[c] > threshold && !vetoedSet.has(c)) { winner = c; break } }
@@ -1147,7 +1361,7 @@ function councilPeerBlock(peers) {
     lens: v.lens, vote: v.vote, ranking: v.ranking, reasoning: v.reasoning,
     candidates: (v.candidates || []).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })),
     checks_run: v.checks_run || [],
-    ...(v.lens === 'security' && Array.isArray(v.safety) ? { safety: v.safety } : {}),
+    ...(isSecurityLens(v.lens) && Array.isArray(v.safety) ? { safety: v.safety } : {}),
   }))
   return JSON.stringify(compact, null, 2)
 }
@@ -1193,6 +1407,7 @@ function roundRecord(round, verdicts, t) {
     winner: t.winner,
     verdicts: verdicts.map(v => ({
       lens: v.lens,
+      ...(LEGACY_MIX ? {} : { judge_model: v.judgeModel || 'opus' }),
       vote: v.vote,
       ranking: v.ranking,
       reasoning: v.reasoning || '',
@@ -1201,7 +1416,7 @@ function roundRecord(round, verdicts, t) {
       changed_this_round: v.changed_this_round === true,
       changed_from_round1: v.changed_from_round1 === true,
       response_to_peers: v.response_to_peers || '',
-      ...(v.lens === 'security' && Array.isArray(v.safety) ? { safety: v.safety } : {}),
+      ...(isSecurityLens(v.lens) && Array.isArray(v.safety) ? { safety: v.safety } : {}),
     })),
   }
 }
@@ -1353,6 +1568,7 @@ function councilToMd(council) {
     L.push(`### Round ${r.round} verdicts`, '')
     for (const v of (r.verdicts || [])) {
       L.push(`**${v.lens}** — vote Candidate ${v.vote}; ranking ${(v.ranking || []).map(x => `Candidate ${x}`).join(' > ')}${v.changed_this_round ? ' _(changed this round)_' : ''}`)
+      if (v.judge_model && v.judge_model !== 'opus') L.push(`- judge: ${v.judge_model}`)
       if (v.reasoning) L.push(`- ${v.reasoning}`)
       for (const s of (v.safety || [])) if (s.safety === 'UNSAFE') L.push(`- VETO Candidate ${s.label} (${s.severity || '?'}): ${s.evidence || '_(no evidence)_'}`)
       if (v.response_to_peers) L.push(`- to peers: ${v.response_to_peers}`)

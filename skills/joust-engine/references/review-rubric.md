@@ -4,7 +4,7 @@ Instructions for the Opus judging at both decision points: the Phase 3 review (b
 
 Every judge — a lone judge or any council lens — applies the **shared scoring method** below. It is the constant that keeps scoring honest and comparable across attempts and rounds.
 
-**A code-level integrity guard runs on every verdict, in every path** (the legacy judge, every council lens in round 1 and every deliberation round, guidance synthesis, and the security veto's evidence). It is not a style opinion — it only catches the narrow, observed failure shape of **schema-valid junk**: a verdict whose `reasoning` is near-empty or a placeholder token (e.g. "test") *and* whose pros/cons collapse to one duplicated value across candidates. A verdict tripping it is retried once (same path as a dead/errored judge); still junk on retry, the judge/lens is dropped and the run proceeds without it (a council recomputes its majority over the living; the legacy path degrades to a clean failure). This never rejects a genuinely terse-but-real verdict — the guard requires *both* signals together, and any real sentence clears the thresholds easily. `checks_run` is checked the same way: an empty array is rejected even though it satisfies the schema, closing the gap where the forced-evidence lever could be met with zero real evidence. See `workflows/tournament.mjs` (`verdictIntegrityIssue` / `checksRunIssue` / `vetoEvidenceIssue` / `guidanceIntegrityIssue`) for the exact, named thresholds.
+**A code-level integrity guard runs on every verdict, in every path** (the legacy judge, every council lens in round 1 and every deliberation round, guidance synthesis, and the security veto's evidence). It is not a style opinion — it only catches the narrow, observed failure shape of **schema-valid junk**: a verdict whose `reasoning` is near-empty or a placeholder token (e.g. "test") *and* whose pros/cons collapse to one duplicated value across candidates. A verdict tripping it is retried once (same path as a dead/errored judge); still junk on retry, the judge/lens is dropped and the run proceeds without it (a council recomputes its majority over the living; the legacy path degrades to a clean failure). This never rejects a genuinely terse-but-real verdict — the guard requires *both* signals together, and any real sentence clears the thresholds easily. `checks_run` is checked the same way: an empty array is rejected even though it satisfies the schema, closing the gap where the forced-evidence lever could be met with zero real evidence. See `workflows/tournament.mjs` (`verdictIntegrityIssue` / `checksRunIssue` / `vetoEvidenceIssue` / `guidanceIntegrityIssue`) for the exact, named thresholds. A **codex-xhigh** seat's verdict arrives as a `VERDICT.json` file that the engine reads, JSON-parses, and shape-validates in code (`parseCodexJudgeDump` / `verdictShapeIssue`) **before** it passes through the *same* `checksRunIssue` / `verdictIntegrityIssue` guard as a native verdict — a parse, shape, or integrity failure is treated exactly like a dead judge (retry once, then the seat **falls back to Opus** for that round rather than the lens dying).
 
 ## Shared scoring method
 
@@ -40,7 +40,36 @@ The tournament runs in two phases and the council uses a **different lens table 
 | **security-by-design** | least privilege, input validation, safe secret handling, safe execution/supply-chain posture — or a designed-in vulnerability | you hold the **veto** (evidence-backed, as for code) |
 | **simplicity** | simplicity and proportionality — is this the smallest coherent change that still fully solves the task, or is it over-engineered | reward the simplest complete approach; penalise gold-plating |
 
+**Dual security gates (union veto).** Every council carries TWO security seats: the primary
+Opus security lens and a cross-family `security-x` seat on codex-xhigh with the same
+mandate. A standing evidenced high/critical `UNSAFE` flag from EITHER gate excludes the
+candidate; each judge withdraws only its own flags in deliberation. With six living judges
+the strict >50% majority is 4/6 (even-N splits resolve through deliberation/NO_CONSENSUS).
+The fail-closed security-DEAD policy keys to the primary Opus seat; the codex gate falls
+back to Opus on failure like any codex seat.
+
 The **security-by-design** lens holds the same evidence-backed veto as the code security lens: a standing `UNSAFE` (high|critical + real "file + why") flag excludes that plan from winning. Everything else in this document — the shared scoring method, `checks_run`, the deterministic >50% tally, bounded deliberation, and the NO_CONSENSUS halt — applies identically to both councils. **A plan-phase NO_CONSENSUS surfaces to the orchestrator BEFORE any implement spend** (a genuinely contested design is a human decision, not something to silently implement).
+
+### Mixed-family seats (codex-xhigh)
+
+By **default**, each council seats **six judges**: five lens seats plus a SECOND security
+gate, with three seats on **codex-xhigh** (a different model family from the Anthropic models that author most plans/implementations) via the bundled codex runner, so a non-Anthropic model checks the completeness-class and simplicity-class judgements:
+
+| Council | codex-xhigh seats | Stay Opus |
+|---|---|---|
+| **Plan** | **completeness**, **simplicity**, **security-x** (2nd security gate) | feasibility, risk, security-by-design |
+| **Code** | **spec**, **craft**, **security-x** (2nd security gate) | correctness, security, robustness |
+
+- The **security veto never moves off Anthropic** — `security` (both councils) is always a native Opus seat; no runtime flag can route the veto to codex.
+- The verification-heavy lenses (correctness/feasibility/security/risk/robustness) stay Opus — the judge-model experiment showed the codex gap concentrates exactly there.
+- A codex seat runs the **same lens prompt**, writing its verdict to `VERDICT.json`; the engine parses + shape-validates it and runs it through the same `reconcileLens` + integrity guard as a native verdict. A codex seat that fails twice **falls back to native Opus for that round** rather than dropping the seat.
+- **`judgeMix: 'anthropic'`** forces every seat back to native Opus — byte-for-byte the pre-mixed-family behaviour (and it also omits the new `judge_model` metadata field, so the emitted JSON shape is identical too).
+- Council metadata records the **actual model used per seat per round** (`judge_model` in `review-*/council.json` and `verdict.md`).
+- The tally is unchanged: **no LLM aggregates votes** regardless of which family produced a verdict — `councilTally` (code) is still the only tally.
+
+### Pinned evaluation scope (every judge)
+
+Every judge — a council lens *or* the legacy `judges: 1` judge, both families — is told its evaluation is **pinned to this tournament's snapshot**: the blind `_pool.md` and the per-candidate directories (plus, in repo-anchored mode, the isolated worktrees at the base commit SHA). A judge must **not** consult the live/current repo checkout, whose state may have moved past what any candidate was actually judged against (a real observed failure: a verifying judge checked the live checkout and penalised the true winner). If a judge runs a verification command, it runs it inside a listed candidate directory and cites that exact path in `checks_run`; a `checks_run` entry citing a path **outside** the pinned scope logs a **non-fatal warning** (v1 telemetry — `checksRunRootsIssue`), it does not fail the verdict.
 
 Every verdict — round 1 and every deliberation round — must include **`checks_run`**: the commands you ran / files you read, each with its key result. This is a forced-evidence lever; never leave it empty. Cast a single first-place **`vote`** (one candidate letter) and give a full **`ranking`**.
 

@@ -4,6 +4,17 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ## Unreleased
 
+### Changed
+
+- **Dual security gates + codex tier policy (spec addendum).** Every council now seats a
+  SIXTH judge: `security-x`, a second security gate on **codex-xhigh** (cross-family — it
+  resists assumptions natural to the Anthropic models that author most candidates). Veto is
+  the UNION of standing evidenced flags from either security seat; majority with 6 living
+  judges = 4/6 (strict >50%); the fail-closed security-DEAD policy stays keyed to the
+  primary Opus seat. Separately, **codex-xhigh is now the default codex tier everywhere**:
+  bare `codex` spec token, Top Mixed, plan/implement default pools, judge seats; codex
+  wall-clock profiles widen to 600/900/1800s.
+
 ### Fixed
 
 - **GLM runner retries timeout-class transient API errors** (issue #31). `bin/glm-run.sh`'s transient-marker matcher previously matched only `529`/`429`/`5xx`/`overloaded`, so a generic `API Error: The operation timed out.` from the z.ai endpoint killed a parallel glm-5.2 seat on first occurrence even with `retries=3` configured. The matcher now also matches `API Error: …(timed out|timeout)` on the CLI's stable `API Error:` prefix, retrying with the same bounded exponential backoff + jitter. Anchoring to the prefix keeps genuine task output, refusals, and auth text (even auth on the `API Error:` line) from self-tripping a retry, and the runner's own wall-clock SIGALRM (rc 124) still never retries. An engine-level same-provider stagger in `workflows/tournament.mjs` was evaluated and **declined** — the existing startup jitter plus this retry already address the root cause, and a stagger would mutate the shared all-provider dispatch path. `bin/glm-run.test.sh` extended with timeout-retry, wall-clock-no-retry, prefixed-auth-no-retry, and persistent-timeout-cap cases.
@@ -42,6 +53,8 @@ All notable changes to the **joust-engine** plugin are documented here.
   - Two-pass guidance is now distilled by a **separate synthesis call** (explicitly not a decision-maker; same `GUIDANCE_CAP`, schema and blind rules) — it never merges votes or picks a winner.
   - **Legacy escape:** pass `judges: 1` to keep the single blind Opus judge (byte-for-byte today's behaviour). Council size is otherwise fixed at 5 (not user-tunable).
   - Council metadata (per-judge verdicts, rounds used, vote evolution, veto events) is logged and persisted to `review-*/council.json`, and rendered in `verdict.md` / the run summaries.
+
+- **Mixed-family judging council + snapshot pinning** (2026-07-05 design). The completeness-class seat (`spec`/`completeness`) and the simplicity-class seat (`craft`/`simplicity`) in each 5-lens council now dispatch to **codex-xhigh** via the codex runner by default (brief → `VERDICT.json` → engine-side JSON-parse + shape validation → the existing `reconcileLens` + verdict-integrity guard); a seat that fails twice (parse/shape/integrity failure counts as a failed attempt) **falls back to native Opus** for that round rather than dropping the seat, logged loudly. The security veto and every verification-heavy lens (correctness/feasibility/security/risk/robustness) stay Opus. `judgeMix: 'anthropic'` forces every seat back to native Opus, **byte-identical** to pre-feature behaviour. Council metadata now records the actual model used per seat per round (`judge_model`). Separately, **every** judge's brief (council or `judges: 1` legacy) is now pinned to the tournament snapshot — the staged pool/candidate dirs, or the repoMode worktrees + base SHA — and told to never consult the live repo checkout, fixing an observed wrong-tree judging failure; a `checks_run` entry citing a path outside that scope now logs a non-fatal warning (v1 telemetry). New optional args: `judgeMix` (`'anthropic'` = all-Opus escape hatch) and `codexJudgeTimeoutSecs` (codex judge-seat wall-clock, default 1500s, separate from the attempt wall-clock).
 
 ## v0.0.1
 
