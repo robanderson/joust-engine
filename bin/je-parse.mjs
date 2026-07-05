@@ -6,14 +6,28 @@
 // explicit-N-vs-prose conflict rule, and (NEW, Feature 1) the grand-loop Z
 // parameter.
 //
+// @@FE (Fable Engine, the fast composer variant) is ALSO parsed here:
+//   @@FE[:N]  — N optional (>= 2); case-insensitive; optional spaces around ':'.
+//   Output gains fe:true + composeOnly:true. M/Z segments are INVALID for @@FE
+//   (loud error, like positional skips) — @@FE is single-pass compose-only.
+//   The marker-adjacent size word (short/medium/long) and the prose model spec
+//   work identically to @@JE (spec sum supplies/overrides N). Bare @@FE with no
+//   N and no spec expands to the skill's documented default pool
+//   (2 opus, 2 sonnet, 2 glm-5.2, 2 codex-high, 2 minimax-m3 => N=10) and sets
+//   feDefaultPool:true, needsGate:false (no interactive gate).
+//   @@FE and @@JE in ONE message is an error (never guess which engine).
+//
 // Pure & deterministic: no Date, no random, no I/O except the tiny CLI guard at
 // the bottom. NEVER throws on user input — every failure becomes an errors[]
 // entry and n/assignment are nulled so a careless caller can't run the wrong
 // tournament.
 //
-// CLI:   node je-parse.mjs "<raw user message>"
+// CLI:   node je-parse.mjs "<raw user message>"   (or --help / --size <label>)
 // Prints { task, n, mode, z, assignment, preset?, conflict?, errors?, needsGate?,
 //          repoMode, baseRef }
+//   plus, for an @@FE invocation only: { fe: true, composeOnly: true,
+//          feDefaultPool } (feDefaultPool true iff the bare-@@FE default N=10
+//          pool was applied). @@JE / prose parses carry NONE of the fe fields.
 //   repoMode : boolean — true => repo-anchored (worktree-per-attempt) grand loop;
 //               false (default) => today's self-contained tournament, byte-for-byte.
 //   baseRef  : string|null — pinned base sha for repo-anchored mode. The PARSER only
@@ -130,6 +144,15 @@ const PLAN_DEFAULT_POOL = [
 // 2026-07-03: sonnet joined the implement pool (Sonnet 5 = newer base, better value; Rob wants
 // opus >= 2 AND sonnet >= 2), trading one codex-high seat to keep M lean.
 const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'sonnet', 'sonnet', 'codex-xhigh', 'glm-5.2'];
+
+// @@FE (Fable Engine) default draft pool — the skill's documented default N=10
+// pool for a bare @@FE (no N, no spec). Codex at HIGH (not xhigh: near-equal
+// draft quality, materially faster); glm-5.2 viable because a compose round has
+// no council to gridlock. See skills/fable-engine/SKILL.md "Phase 0: Parse".
+const FE_DEFAULT_POOL = [
+  'opus', 'opus', 'sonnet', 'sonnet', 'glm-5.2', 'glm-5.2',
+  'codex-high', 'codex-high', 'minimax-m3', 'minimax-m3',
+];
 
 // Recognised model token alternatives for the SPEC scan. These match the
 // HEAD of an item (after the count); the normaliser then validates exactly.
@@ -356,6 +379,11 @@ function intSeg(raw) {
 // '@@JE:5:2' and '@@JE:5:2:3' all match.
 const SIGIL_RX = /@@je(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
 const PROSE_RX = /joust\s*:\s*(\d*)(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
+// @@FE (Fable Engine) sigil. Same segment shape as SIGIL_RX so an M/Z segment
+// is CAPTURED (and then rejected loudly) rather than silently left in the task.
+// NB: '@@FE' is deliberately brand-invariant — the rebrand map (rebrand.config.json)
+// rewrites @@JE tokens only, so this sigil survives identically in the dev channel.
+const FE_SIGIL_RX = /@@fe(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
 
 // ---------------------------------------------------------------------------
 // Prose model-spec scan (two-stage).
@@ -563,7 +591,15 @@ function parse(rawInput) {
 
   // --- 1. Find the marker (sigil preferred, else prose). ---
   const sigil = SIGIL_RX.exec(msg);
+  const feSigil = FE_SIGIL_RX.exec(msg);
   const prose = PROSE_RX.exec(msg);
+
+  // @@FE and @@JE in ONE message is ambiguous (which engine?) — NEVER guess.
+  if (sigil && feSigil) {
+    errors.push('Both @@FE and @@JE markers found in one message. Use exactly one engine sigil.');
+    result.errors = errors;
+    return result;
+  }
 
   let marker = null;       // { kind, index, length, nSeg, mSeg, zSeg }
   if (sigil) {
@@ -577,6 +613,21 @@ function parse(rawInput) {
       // raw text after '@@JE' (for positional-skip detection)
       rawTail: sigil[0],
     };
+  } else if (feSigil) {
+    // @@FE (Fable Engine, composeOnly). fe-only output fields are added HERE so
+    // every @@JE / prose parse stays byte-identical to before.
+    marker = {
+      kind: 'fe',
+      index: feSigil.index,
+      length: feSigil[0].length,
+      nSeg: intSeg(feSigil[1]),
+      mSeg: intSeg(feSigil[2]),
+      zSeg: intSeg(feSigil[3]),
+      rawTail: feSigil[0],
+    };
+    result.fe = true;
+    result.composeOnly = true;
+    result.feDefaultPool = false; // true only when the bare-@@FE default pool applies
   } else if (prose) {
     marker = {
       kind: 'prose',
@@ -606,16 +657,28 @@ function parse(rawInput) {
   const colonSegs = countColonSegments(marker.rawTail);
   // colonSegs: how many ':' separators were written. If a later segment has a
   // value but an earlier one is empty -> positional skip.
-  if (marker.zSeg.present && !marker.mSeg.present && marker.zSeg.value !== null) {
-    errors.push(
-      'Positional skip not allowed: "' + marker.rawTail.trim() +
-      '". To set Z with default M, write @@JE:N:1:Z (e.g. @@JE:5:1:3).'
-    );
-  }
-  if (marker.mSeg.present && !marker.nSeg.present && marker.nSeg.value === null &&
-      marker.kind === 'sigil' && colonSegs >= 2 && isEmptyFirstColonSeg(marker.rawTail)) {
-    // '@@JE::2' — empty N is allowed ONLY if a prose spec will supply N; we
-    // record nothing here and let the conflict/needsGate logic decide later.
+  if (marker.kind === 'fe') {
+    // @@FE takes ONLY an optional N. Any second colon segment (M or Z, even an
+    // empty one) is rejected loudly — like a positional skip — never guessed at.
+    if (colonSegs >= 2) {
+      errors.push(
+        'M/Z segments are not valid for @@FE: "' + marker.rawTail.trim() +
+        '". @@FE is single-pass compose-only and takes only an optional N (e.g. @@FE:6). ' +
+        'Use @@JE:N:M:Z for passes / grand loops.'
+      );
+    }
+  } else {
+    if (marker.zSeg.present && !marker.mSeg.present && marker.zSeg.value !== null) {
+      errors.push(
+        'Positional skip not allowed: "' + marker.rawTail.trim() +
+        '". To set Z with default M, write @@JE:N:1:Z (e.g. @@JE:5:1:3).'
+      );
+    }
+    if (marker.mSeg.present && !marker.nSeg.present && marker.nSeg.value === null &&
+        marker.kind === 'sigil' && colonSegs >= 2 && isEmptyFirstColonSeg(marker.rawTail)) {
+      // '@@JE::2' — empty N is allowed ONLY if a prose spec will supply N; we
+      // record nothing here and let the conflict/needsGate logic decide later.
+    }
   }
 
   // --- 3. Extract task = text on BOTH sides of the marker (D-0007). ---
@@ -630,7 +693,7 @@ function parse(rawInput) {
   // --- 4. M / mode (sigil :M, then a MARKER-ADJACENT prose pass directive). ---
   let mode = 1;
   let mSigil = null;                 // a VALID sigil M (1 or 2), else null
-  if (marker.mSeg.present) {
+  if (marker.kind !== 'fe' && marker.mSeg.present) {
     if (marker.mSeg.value === 1) { mode = 1; mSigil = 1; }
     else if (marker.mSeg.value === 2) { mode = 2; mSigil = 2; }
     else {
@@ -652,7 +715,15 @@ function parse(rawInput) {
     const mp = /two/i.test(pmMatch[1]) ? 2 : 1;   // 'two'->2, 'single'/'one'->1
     if (pmAfter) postMarker = postMarker.replace(PASS_AFTER_RX, ' ');
     else preMarker = preMarker.replace(PASS_BEFORE_RX, ' ');
-    if (mSigil != null) {
+    if (marker.kind === 'fe') {
+      // @@FE is single-pass compose-only: a prose 'two pass' is the M=2 spelling
+      // and is just as invalid as a sigil :2. 'single'/'one pass' is redundant
+      // but harmless (mode is already 1) — stripped, no error.
+      if (mp === 2) {
+        errors.push('"two pass" is not valid with @@FE — @@FE is single-pass compose-only. ' +
+          'Use @@JE:N:2 for a two-pass tournament.');
+      }
+    } else if (mSigil != null) {
       if (mSigil !== mp) {
         errors.push('Pass-count conflict: sigil M=' + mSigil + ' but prose says "' +
           pmMatch[1].toLowerCase() + ' pass" (M=' + mp + '). State the pass count once.');
@@ -717,7 +788,7 @@ function parse(rawInput) {
   // SKILL's grand-loop authorization + driver (NO "not yet implemented" stop).
   // Z>Z_MAX is a LOUD error that echoes the offending Z and nulls n/assignment.
   let z = 1;
-  if (marker.zSeg.present) {
+  if (marker.kind !== 'fe' && marker.zSeg.present) {
     if (marker.zSeg.value === null || marker.zSeg.value < 1) {
       errors.push('Invalid Z=' + (marker.zSeg.value === null ? '(empty)' : marker.zSeg.value) +
         '. Z must be an integer >= 1.');
@@ -743,7 +814,12 @@ function parse(rawInput) {
   // the same Z_MAX ceiling and >=1 floor apply. (GRAND_LOOP_RX is evaluated against
   //  msg, which exists here; section 7 re-strips it from the spec-scan copy.)
   const __grand = GRAND_LOOP_RX.exec(msg);
-  if (__grand) {
+  if (__grand && marker.kind === 'fe') {
+    // The prose grand-loop phrase is the Z spelling — invalid for @@FE like the
+    // sigil :Z. (The phrase is still stripped from the spec scan / task below.)
+    errors.push('grand loops (Z) are not valid with @@FE — @@FE is a single compose round. ' +
+      'Use @@JE:N:M:Z for grand loops.');
+  } else if (__grand) {
     const zp = intSeg(__grand[1]).value;
     if (zp === null || zp < 1) {
       errors.push('Invalid grand-loop count "' + __grand[0].trim() +
@@ -968,6 +1044,18 @@ function parse(rawInput) {
   // --- 9. Resolve N + assignment + gate. ---
   let n = nSpec != null ? nSpec : nMarker;
 
+  // @@FE default pool: a bare @@FE (no N, no spec, no top-mixed-needs-N, no
+  // errors so far) runs the skill's documented wide default pool (N=10) — the
+  // interactive gate is NOT used for @@FE. feDefaultPool:true tells the SKILL
+  // the default applied. An explicit @@FE:N with no spec keeps assignment:null
+  // (the SKILL resolves the pool), exactly like @@JE:N.
+  if (marker.kind === 'fe' && n == null && assignment == null &&
+      !result.needsGate && !errors.length) {
+    assignment = FE_DEFAULT_POOL.slice();
+    n = FE_DEFAULT_POOL.length;
+    result.feDefaultPool = true;
+  }
+
   if (n == null && !result.needsGate) {
     // Bare @@JE with no spec, no marker N, no top-mixed-needs-N -> interactive gate.
     result.needsGate = true;
@@ -1083,6 +1171,7 @@ export {
   TOP_MIXED_POOL,
   PLAN_DEFAULT_POOL,
   IMPLEMENT_DEFAULT_POOL,
+  FE_DEFAULT_POOL,
   SIZE_PROFILES,
   Z_MAX,
   N_MAX,
@@ -1099,6 +1188,29 @@ const isMain = (() => {
 })();
 
 if (isMain) {
+  // Subcommand: `--help` prints the grammar/usage (exit 0).
+  if (process.argv[2] === '--help' || process.argv[2] === '-h') {
+    process.stdout.write([
+      'usage: node je-parse.mjs "<raw user message>"',
+      '       node je-parse.mjs --size <short|medium|long>',
+      '       node je-parse.mjs --help',
+      '',
+      'Markers (exactly one per message):',
+      '  @@JE[:N][:M[:Z]]   tournament — N attempts (>=2), M passes (1|2), Z grand loops (<=' + Z_MAX + ')',
+      '  joust:N[:M[:Z]]    prose spelling of the @@JE marker',
+      '  @@FE[:N]           Fable Engine (composeOnly) — N drafts (>=2); M/Z are INVALID.',
+      '                     Bare @@FE (no N, no spec) = default pool ' +
+        FE_DEFAULT_POOL.join(',') + ' (N=' + FE_DEFAULT_POOL.length + '), feDefaultPool:true.',
+      '',
+      'Shared grammar (both sigils, marker-adjacent unless noted):',
+      '  prose model spec   "2 opus, 2 glm 5.2, 1 codex high" — sum supplies/overrides N (anywhere)',
+      '  size word          short | medium | long (marker-adjacent, stripped from the task)',
+      '  N ceiling          N_MAX=' + N_MAX + '; all failures land in errors[] with n/assignment nulled',
+      '',
+      'Output: JSON on stdout (see the header comment of this file for the field contract).',
+    ].join('\n') + '\n');
+    process.exit(0);
+  }
   // Subcommand: `je-parse.mjs --size <short|medium|long>` prints just that size's
   // limit profile as JSON, so the SKILL can resolve the dynamic limits deterministically
   // (one source of truth) instead of hard-coding the numbers in the procedure text.

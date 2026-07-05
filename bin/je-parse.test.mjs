@@ -11,7 +11,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { parse, normaliseModel, topMixedAssignment, expandSpec, extractPhaseSpecs, sizeProfile, SIZE_PROFILES, PLAN_DEFAULT_POOL, IMPLEMENT_DEFAULT_POOL, Z_MAX, N_MAX } from './je-parse.mjs';
+import { parse, normaliseModel, topMixedAssignment, expandSpec, extractPhaseSpecs, sizeProfile, SIZE_PROFILES, PLAN_DEFAULT_POOL, IMPLEMENT_DEFAULT_POOL, FE_DEFAULT_POOL, Z_MAX, N_MAX } from './je-parse.mjs';
 
 const JE_PARSE_CLI = fileURLToPath(new URL('./je-parse.mjs', import.meta.url));
 
@@ -637,6 +637,101 @@ unit('IMPLEMENT_DEFAULT_POOL sums to 6', IMPLEMENT_DEFAULT_POOL.length === 6);
 unit('IMPLEMENT_DEFAULT_POOL has >=2 opus and >=2 sonnet',
   IMPLEMENT_DEFAULT_POOL.filter(m => m === 'opus').length >= 2 &&
   IMPLEMENT_DEFAULT_POOL.filter(m => m === 'sonnet').length >= 2);
+
+// ===========================================================================
+// @@FE — Fable Engine sigil (composeOnly). NEW.
+// ===========================================================================
+
+// --- bare @@FE -> the documented default pool, N=10, NO interactive gate ---
+parseCase('FE bare -> default pool n=10', 'fix the parser @@FE',
+  { task: 'fix the parser', n: 10, mode: 1, z: 1, fe: true, composeOnly: true,
+    feDefaultPool: true, needsGate: false,
+    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'glm-5.2', 'glm-5.2',
+                 'codex-high', 'codex-high', 'minimax-m3', 'minimax-m3'] },
+  { noErrors: true });
+parseCase('FE bare marker-first task kept (D-0007 shape)', '@@FE fix the parser bug',
+  { task: 'fix the parser bug', n: 10, feDefaultPool: true, needsGate: false }, { noErrors: true });
+
+// --- explicit N: like @@JE:N — assignment null (SKILL resolves the pool) ---
+parseCase('FE explicit N', 'do abc @@FE:6',
+  { task: 'do abc', n: 6, mode: 1, z: 1, fe: true, composeOnly: true,
+    feDefaultPool: false, assignment: null, needsGate: false }, { noErrors: true });
+
+// --- M/Z segments are INVALID for @@FE (error, like positional skips) ---
+parseCase('FE M segment invalid', 'do abc @@FE:6:2',
+  { n: null, assignment: null, fe: true }, { errorIncludes: 'not valid for @@FE' });
+parseCase('FE Z segment invalid', 'do abc @@FE:6:1:2',
+  { n: null, assignment: null }, { errorIncludes: 'not valid for @@FE' });
+parseCase('FE empty trailing segment invalid', 'do abc @@FE:6::2',
+  { n: null }, { errorIncludes: 'not valid for @@FE' });
+
+// --- prose model spec: same grammar as @@JE, sum wins over the default pool ---
+parseCase('FE prose spec sum wins', 'build a parser with 2 opus, 2 glm 5.2, 1 codex high @@FE',
+  { task: 'build a parser', n: 5, fe: true, composeOnly: true, feDefaultPool: false,
+    assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
+parseCase('FE spec agrees with marker N', 'do x with 2 opus and 1 sonnet @@FE:3',
+  { n: 3, assignment: ['opus', 'opus', 'sonnet'], feDefaultPool: false }, { noErrors: true });
+parseCase('FE marker N vs spec conflict', 'improve X @@FE:4 with 2 opus, 2 glm, 1 codex',
+  { n: null, assignment: null, fe: true }, { hasConflict: { markerN: 4, specN: 5 } });
+parseCase('FE unknown token rejected loudly', 'do x with 2 opus and 1 gpt4 @@FE',
+  { n: null, assignment: null }, { errorIncludes: 'Unrecognised model token' });
+
+// --- size word: identical marker-adjacent grammar, stripped from the task ---
+parseCase('FE size medium after marker', 'refactor @@FE:4 medium',
+  { task: 'refactor', n: 4, size: 'medium', fe: true }, { noErrors: true });
+parseCase('FE size + default pool + comma + task', '@@FE medium, refactor the parser',
+  { task: 'refactor the parser', n: 10, size: 'medium', feDefaultPool: true }, { noErrors: true });
+parseCase('FE size before marker', 'tidy up long @@FE:4',
+  { task: 'tidy up', n: 4, size: 'long' }, { noErrors: true });
+parseCase('FE size word in task body untouched', '@@FE:3 long division solver',
+  { task: 'long division solver', n: 3, size: null }, { noErrors: true });
+
+// --- @@FE + @@JE in one message = error (never guess which engine) ---
+parseCase('FE + JE conflict', 'do abc @@FE @@JE:5',
+  { n: null, assignment: null }, { errorIncludes: 'exactly one engine sigil' });
+parseCase('FE + JE conflict either order', '@@JE:5 do abc @@FE:6',
+  { n: null }, { errorIncludes: 'exactly one engine sigil' });
+
+// --- case / space variants ---
+parseCase('FE lowercase + spaces around colon', 'do abc @@fe : 6',
+  { task: 'do abc', n: 6, fe: true, composeOnly: true }, { noErrors: true });
+parseCase('FE mixed case', 'do abc @@Fe:4',
+  { n: 4, fe: true }, { noErrors: true });
+parseCase('FE uppercase bare', 'do abc @@FE',
+  { n: 10, fe: true, feDefaultPool: true }, { noErrors: true });
+
+// --- N floor / ceiling apply as for @@JE ---
+parseCase('FE N=1 invalid', 'do abc @@FE:1',
+  { n: null }, { errorIncludes: 'N must be an integer >= 2' });
+parseCase('FE N over ceiling', 'do abc @@FE:9999',
+  { n: null, assignment: null }, { errorIncludes: 'exceeds the tournament-size ceiling' });
+
+// --- prose spellings of M / Z are invalid for @@FE too (loud, never guessed) ---
+parseCase('FE prose two pass invalid', '@@FE two pass, do abc',
+  { n: null }, { errorIncludes: 'not valid with @@FE' });
+parseCase('FE prose grand loops invalid', 'do abc, 2 grand loops @@FE',
+  { n: null }, { errorIncludes: 'not valid with @@FE' });
+
+// --- @@JE / prose parses carry NONE of the fe fields (byte-identical output) ---
+{
+  const r = parse('do abc @@JE:5');
+  unit('JE output has no fe fields',
+    r.fe === undefined && r.composeOnly === undefined && r.feDefaultPool === undefined);
+  const p = parse('do abc joust:5');
+  unit('prose output has no fe fields',
+    p.fe === undefined && p.composeOnly === undefined && p.feDefaultPool === undefined);
+}
+
+// --- unit: the exported default pool matches the skill's documented pool ---
+unit('FE_DEFAULT_POOL is the documented N=10 pool', eq(FE_DEFAULT_POOL,
+  ['opus', 'opus', 'sonnet', 'sonnet', 'glm-5.2', 'glm-5.2',
+   'codex-high', 'codex-high', 'minimax-m3', 'minimax-m3']));
+
+// --- CLI: @@FE round-trips through the CLI guard ---
+cliParseCase('CLI FE bare default pool', 'do abc @@FE',
+  { n: 10, fe: true, composeOnly: true, feDefaultPool: true });
+cliParseCase('CLI FE M segment errors, exit 0', 'do abc @@FE:6:2',
+  { n: null }, { errorIncludes: 'not valid for @@FE' });
 
 // ===========================================================================
 // report.
