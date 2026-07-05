@@ -14,9 +14,11 @@ mk_ws() {
   cat > "$WS/stub/claude" <<'STUB'
 #!/usr/bin/env bash
 TF="$WS/.tries"; n=0; [ -f "$TF" ] && n=$(cat "$TF"); n=$((n+1)); echo "$n" > "$TF"
+printf '%s\n' "$@" > "$WS/child-args.txt"
 case "${FAKE_MODE:-ok}" in
   ok)        echo done; echo "print('hi')" > solution.py; exit 0 ;;
   turncap)   echo "Reached max turns (30)"; exit 1 ;;
+  turncapjson) echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30}'; exit 1 ;;
   stall)     echo boot; sleep 30; exit 0 ;;
   stallonce) if [ "$n" -ge 2 ]; then echo done; echo x>solution.py; exit 0; else echo boot; sleep 30; fi ;;
   hang)      sleep 30; exit 0 ;;
@@ -34,6 +36,12 @@ mk_ws; run_runner FAKE_MODE=ok; RC=$?
 check "ok: exits 0"                   '[ "$RC" -eq 0 ]'
 check "ok: one JOUST-RC 00"           '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 00 ok" "$WS/_glm_run.log"'
 check "ok: one DONE exit=0"           '[ "$(grep -c "^JOUST-GLM-DONE exit=0" "$WS/_glm_run.log")" = "1" ]'
+check "ok: stream-json liveness flags passed" 'grep -qx -- "--output-format" "$WS/child-args.txt" && grep -qx "stream-json" "$WS/child-args.txt" && grep -qx -- "--verbose" "$WS/child-args.txt" && grep -qx -- "--include-partial-messages" "$WS/child-args.txt"'
+rm -rf "$WS"
+
+# stream-json turn-cap: {"subtype":"error_max_turns"} result event (no plain "Reached max turns") -> RC 03
+mk_ws; run_runner FAKE_MODE=turncapjson
+check "turncap-json: one JOUST-RC 03" '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 03 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
 mk_ws; run_runner FAKE_MODE=stallonce JE_STALL_SECS=1 JE_TIMEOUT_SECS=30; RC=$?

@@ -12,7 +12,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
 
 TIMEOUT="${JE_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
-STALL="${JE_STALL_SECS:-240}"       # zero-output stall window (seconds); 240: claude -p buffers, long silent prefill != hang
+STALL="${JE_STALL_SECS:-120}"       # zero-output stall window (seconds); 120 is safe again: stream-json
+                                    # makes claude emit incremental JSON events into $LOG during work, so
+                                    # the watchdog measures true liveness (240s interim bump reverted)
 MAXTURNS="${JE_MAX_TURNS:-20}"       # tight cap: local models tend to ignore "single pass" and loop
 
 # OMLX_AUTH_TOKEN comes from the environment — uniform key handling across every runner.
@@ -21,6 +23,9 @@ MAXTURNS="${JE_MAX_TURNS:-20}"       # tight cap: local models tend to ignore "s
 
 echo "JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000 flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s" >> "$LOG"
 
+# --verbose --output-format stream-json --include-partial-messages: stream incremental JSON events
+# (stream-json requires --verbose in -p mode; partial messages give intra-turn liveness during long
+# thinking) so $LOG grows while claude works and the stall watchdog sees real liveness.
 run_try() {
   ANTHROPIC_BASE_URL="http://127.0.0.1:8000" \
   ANTHROPIC_AUTH_TOKEN="$OMLX_AUTH_TOKEN" \
@@ -29,7 +34,7 @@ run_try() {
   ANTHROPIC_DEFAULT_HAIKU_MODEL="gemma-4-26b-a4b-it-8bit" \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1" API_TIMEOUT_MS="3000000" \
   run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
-    claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
+    claude -p "$(cat _brief.txt)" $FLAG --verbose --output-format stream-json --include-partial-messages --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
 }
 
 TIMEOUT_RETRIED=0
@@ -47,7 +52,9 @@ while :; do
     if [ "$STALL_RETRIED" -eq 0 ]; then STALL_RETRIED=1; echo "JOUST-LOCAL-RETRY reason=zero-output-stall" >> "$LOG"; continue; fi
     finish KILLED "reason=zero-output-stall (after 1 retry)" 01 zero-output-stall-retry-exhausted; break
   fi
-  if grep -q 'Reached max turns' "$LOG"; then finish DONE "exit=${RC}" 03 turn-cap; else finish DONE "exit=${RC}" 09 runner-error; fi
+  # stream-json signals turn-cap as {"type":"result","subtype":"error_max_turns",...}; the plain text
+  # is gone (verified live, CLI 2.1.201). Quoted-JSON form is mention-proof (task quotes get escaped).
+  if grep -qE 'Reached max turns|"subtype":"error_max_turns"' "$LOG"; then finish DONE "exit=${RC}" 03 turn-cap; else finish DONE "exit=${RC}" 09 runner-error; fi
   break
 done
 

@@ -62,6 +62,15 @@ run_watchdog_perl() {
     # values, and the wait is a WNOHANG poll paced by a select() sleep — so the kill fires from this
     # loop own control flow and NEVER depends on a deferred safe-signals $SIG{ALRM} handler interrupting
     # a blocked wait (which could starve that handler and reproduce the 1200s hang this exists to prevent).
+    # After a group kill the log can end MID-LINE (stream-json runners write continuously), which
+    # would glue the next runner-written marker onto a partial JSON line and break the sacred
+    # line-anchored ^JOUST- contract. Ensure the log ends with a newline before returning a kill code.
+    my $nlfix = sub {
+      return unless -s $logf;
+      open(my $fh, "<", $logf) or return; seek($fh, -1, 2); read($fh, my $c, 1); close $fh;
+      return if $c eq "\n";
+      open(my $o, ">>", $logf) or return; print $o "\n"; close $o;
+    };
     my $now = time();
     my $wall_deadline = $now + $t;
     my $stall_deadline = $stall > 0 ? $now + $stall : 0;
@@ -78,8 +87,8 @@ run_watchdog_perl() {
       $now = time();
       my $size = -s $logf; $size = 0 unless defined $size;
       if ($size != $last_size) { $last_size = $size; $stall_deadline = $stall > 0 ? $now + $stall : 0 }
-      if ($stall > 0 && $now >= $stall_deadline) { kill("TERM", -$p); sleep 2; kill("KILL", -$p); waitpid($p, 0); exit 125 }
-      if ($now >= $wall_deadline)                { kill("TERM", -$p); sleep 2; kill("KILL", -$p); waitpid($p, 0); exit 124 }
+      if ($stall > 0 && $now >= $stall_deadline) { kill("TERM", -$p); sleep 2; kill("KILL", -$p); waitpid($p, 0); $nlfix->(); exit 125 }
+      if ($now >= $wall_deadline)                { kill("TERM", -$p); sleep 2; kill("KILL", -$p); waitpid($p, 0); $nlfix->(); exit 124 }
     }
   ' "$t" "$stall" "$logf" "$@"
 }

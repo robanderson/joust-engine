@@ -18,10 +18,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
 
 TIMEOUT="${JE_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds), PER TRY
-STALL="${JE_STALL_SECS:-480}"       # zero-output stall window (seconds), PER TRY. 480: claude -p
-                                    # buffers output until completion, so a long silent prefill on a
-                                    # big context bundle looks like a hang (stall-killed glm at 90s AND
-                                    # 240s live). Real fix queued: stream-json liveness output.
+STALL="${JE_STALL_SECS:-240}"       # zero-output stall window (seconds), PER TRY. 240 is safe again:
+                                    # --output-format stream-json makes claude emit incremental JSON
+                                    # events (incl. partial-message deltas) into $LOG during work, so
+                                    # the watchdog measures TRUE liveness — a long silent prefill/think
+                                    # no longer looks like a hang (the 480s interim bump is reverted).
 MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 RETRIES="${JE_GLM_RETRIES:-3}"       # max ADDITIONAL tries after the first, for 529s (<=4 total)
 BACKOFF="${JE_GLM_BACKOFF_BASE:-15}" # first retry delay (seconds); doubles per retry
@@ -43,6 +44,10 @@ fi
 
 # One try. The perl fork+SIGALRM wrapper now lives in run_watchdog_perl (adds the stall watchdog +
 # process-group kill). </dev/null pins claude's stdin so it never stalls waiting on a non-TTY stdin.
+# --verbose --output-format stream-json --include-partial-messages: stream incremental JSON events
+# (stream-json requires --verbose in -p mode; partial messages give intra-turn liveness during long
+# thinking) so $LOG grows while claude works and the stall watchdog sees real liveness instead of the
+# old buffered-until-done text output.
 run_try() {
   ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
   ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" \
@@ -52,7 +57,7 @@ run_try() {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1" \
   API_TIMEOUT_MS="${JE_API_TIMEOUT_MS:-3000000}" \
   run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
-    claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
+    claude -p "$(cat _brief.txt)" $FLAG --verbose --output-format stream-json --include-partial-messages --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
 }
 
 TIMEOUT_RETRIED=0
@@ -86,7 +91,13 @@ while :; do
     break
   fi
   # 529/transient backpressure: retry with backoff ONLY on a transient marker in THIS try's slice.
-  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'API Error: *(429|500|502|503|529)|overloaded|API Error:.*(timed out|timeout)'; then
+  # stream-json shapes (verified live vs a local 529/400 server, CLI 2.1.201): internal retries emit
+  # {"type":"system","subtype":"api_retry",...,"error_status":529,"error":"overloaded"} events; a
+  # terminal API failure emits a result event whose "result" field still carries the plain
+  # "API Error: <code> ..." text, so the old alternatives still match. The quoted "error_status" key is
+  # mention-proof by construction: task-content text quoting it lands JSON-ESCAPED (\"error_status\")
+  # inside a string and cannot match the unescaped pattern.
+  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'API Error: *(429|500|502|503|529)|overloaded|API Error:.*(timed out|timeout)|"(api_)?error_status": *(429|500|502|503|529)'; then
     if [ "$TRY" -ge "$MAXTRIES" ]; then
       echo "JOUST-GLM-RETRIES-EXHAUSTED tries=${TRY}" >> "$LOG"
       finish DONE "exit=${RC}" 02 retries-exhausted
@@ -100,7 +111,10 @@ while :; do
     continue
   fi
   # Unclassified non-transient failure: turn-cap (03) is an honest model loss; else runner error (09).
-  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -q 'Reached max turns'; then
+  # stream-json signals turn-cap as {"type":"result","subtype":"error_max_turns",...} — the plain
+  # "Reached max turns" text is GONE (verified live, CLI 2.1.201); keep both patterns. The quoted-JSON
+  # form is mention-proof: task content quoting it gets escaped (\"subtype\") and cannot match.
+  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'Reached max turns|"subtype":"error_max_turns"'; then
     finish DONE "exit=${RC}" 03 turn-cap
   else
     finish DONE "exit=${RC}" 09 runner-error

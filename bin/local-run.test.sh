@@ -19,9 +19,11 @@ mk_ws() {
   cat > "$WS/stub/claude" <<'STUB'
 #!/usr/bin/env bash
 TF="$WS/.tries"; n=0; [ -f "$TF" ] && n=$(cat "$TF"); n=$((n+1)); echo "$n" > "$TF"
+printf '%s\n' "$@" > "$WS/child-args.txt"
 case "${FAKE_MODE:-ok}" in
   ok)        echo "fake claude: done"; echo "print('hi')" > solution.py; exit 0 ;;
   turncap)   echo "Reached max turns (20)"; exit 1 ;;
+  turncapjson) echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":20}'; exit 1 ;;
   hang)      sleep 30; exit 0 ;;                                   # never writes -> wall clock (stall disabled in test)
   hangonce)  if [ "$n" -ge 2 ]; then echo done; echo "x" > solution.py; exit 0; else sleep 30; fi ;;
   stall)     echo boot; sleep 30; exit 0 ;;                        # writes once then silent -> stall watchdog
@@ -43,6 +45,7 @@ check "ok: exits 0"                 '[ "$RC" -eq 0 ]'
 check "ok: exactly one JOUST-RC"    '[ "$(rc_count)" = "1" ]'
 check "ok: JOUST-RC 00"             'grep -q "^JOUST-RC 00 " "$WS/_local_run.log"'
 check "ok: one DONE exit=0"         '[ "$(grep -c "^JOUST-LOCAL-DONE exit=0" "$WS/_local_run.log")" = "1" ]'
+check "ok: stream-json liveness flags passed" 'grep -qx -- "--output-format" "$WS/child-args.txt" && grep -qx "stream-json" "$WS/child-args.txt" && grep -qx -- "--verbose" "$WS/child-args.txt" && grep -qx -- "--include-partial-messages" "$WS/child-args.txt"'
 rm -rf "$WS"
 
 # missing key -> 07 (exit 3)
@@ -65,6 +68,12 @@ rm -rf "$WS"
 mk_ws; run_runner FAKE_MODE=turncap; RC=$?
 check "turncap: one JOUST-RC"       '[ "$(rc_count)" = "1" ]'
 check "turncap: JOUST-RC 03"        'grep -q "^JOUST-RC 03 " "$WS/_local_run.log"'
+rm -rf "$WS"
+
+# stream-json turn-cap: {"subtype":"error_max_turns"} result event (no plain "Reached max turns") -> 03
+mk_ws; run_runner FAKE_MODE=turncapjson
+check "turncap-json: one JOUST-RC"  '[ "$(rc_count)" = "1" ]'
+check "turncap-json: JOUST-RC 03"   'grep -q "^JOUST-RC 03 " "$WS/_local_run.log"'
 rm -rf "$WS"
 
 # stall-then-success: try1 goes silent (stall kill 125), retry once, try2 succeeds -> RC 00, NO terminal KILLED
