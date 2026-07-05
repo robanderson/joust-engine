@@ -194,3 +194,21 @@ test('je-render renders steelman + fast-tally metadata into verdict.md', () => {
   assert.match(md, /Fast tally \(intermediate review\)/)
   assert.match(md, /Decided by:\*\* majority/)
 })
+
+// ----- structural: composeOnly (@@FE Fable Engine) -----
+test('(structural) composeOnly stops after the staged pool — no council, no round 2', () => {
+  // flag exists and is implement-exclusive
+  assert.match(SRC, /const composeOnly = A\.composeOnly === true && !implement/)
+  // the branch returns the pool BEFORE the round-1 judge call and never judges
+  const seam = SRC.indexOf('if (composeOnly) {')
+  const firstJudgeCall = SRC.indexOf("await judge('reviewer'")
+  assert.ok(seam > -1 && firstJudgeCall > -1 && seam < firstJudgeCall,
+    'composeOnly early-return must sit before the round-1 council')
+  const branch = SRC.slice(seam, SRC.indexOf('// Plan Round 1 review', seam))
+  assert.match(branch, /poolPath: `\$\{runDir\}\/review-1\/_pool\.md`/)
+  assert.match(branch, /mode: 'composeOnly'/)
+  assert.doesNotMatch(branch, /await judge\(/)
+  // it still persists the unblinding key + summary and files engine issues
+  assert.match(branch, /mapping\.json/)
+  assert.match(branch, /maybeFileEngineIssues\('Review'\)/)
+})

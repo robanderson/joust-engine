@@ -51,6 +51,10 @@ if (!Array.isArray(attempts) || attempts.length === 0) {
 // 'two' under `implement`. A plan-only run keeps its @@JE:N:M single/two semantics unchanged.
 const implement = A.implement === true
 const implementAttempts = (Array.isArray(A.implementAttempts) && A.implementAttempts.length) ? A.implementAttempts : attempts
+// composeOnly (@@FE Fable Engine): run Round 1 + stage/validate/pool, then STOP — no councils,
+// no round 2, no implement. The caller (the orchestrating model) reads the blind pool and
+// composes/implements itself. Mutually exclusive with implement.
+const composeOnly = A.composeOnly === true && !implement
 const mode = implement ? 'two' : A.mode
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 
@@ -2472,6 +2476,22 @@ if (!blind1.length) {
 }
 
 if (repoMode) await enrichBlindPool(blind1, `${runDir}/review-1`, 'Review')
+
+// composeOnly (@@FE): the pool is the product. Persist the key + summaries and return the
+// staged blind pool for the orchestrating model to review/compose from. No council spend.
+if (composeOnly) {
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode: 'composeOnly', n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping }) },
+  ], 'Review')
+  await maybeFileEngineIssues('Review')
+  return {
+    mode: 'composeOnly', n: N, rc_summary: rcSummaryLive(),
+    poolPath: `${runDir}/review-1/_pool.md`,
+    round1: { mapping: r1mapping },
+    candidates: blind1.map(c => ({ blind: c.blind, stagedDir: `${runDir}/review-1/${c.blind}` })),
+  }
+}
 
 // Plan Round 1 review — judged by the PLAN-lens council (feasibility/completeness/risk/
 // security-by-design/simplicity), selected by phaseTitle inside judge(). Plans never touch the repo.
