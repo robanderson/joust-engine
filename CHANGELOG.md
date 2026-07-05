@@ -6,6 +6,30 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Runner watchdogs, guaranteed terminal markers, retryable hangs + N-1 quorum close (run E).**
+  New shared `bin/_je-run-lib.sh` (sourced by all five runners): idempotent `finish()` writes
+  exactly one terminal `JOUST-<PROV>-{DONE|TIMEOUT|KILLED|ERROR}` + one `JOUST-RC` line on EVERY
+  exit path (TERM/INT→KILLED/08, uncaught EXIT→ERROR/09), and `run_watchdog_perl` adds a
+  zero-output stall watchdog (kills the child's process GROUP; exit 125) alongside the existing
+  wall clock (124). Wall-clock hangs and stalls are each retryable ONCE via a non-terminal
+  `JOUST-<PROV>-RETRY` line (a successful retry never leaves a terminal failure word; the staging
+  gate's reject set gains `KILLED`, stays mention-proof). Stall windows: `JE_STALL_SECS`
+  (defaults: glm/minimax/grok 90s, local 60s, codex 120s). Engine: `parallelQuorum` lets a round
+  close when all but one seat returned and the straggler exceeded 2x its wall clock + grace
+  (`quorumGraceSecs`, default 90; `quorumClose:false` to disable) — NEVER over a security-gate
+  seat, never over a native seat (no engine-known clock), capability-gated on the runtime having
+  timers + a usable clock (this workflow sandbox does not; inert there with one log line).
+  Fold-ins: codex judge VERDICT read-back failures reclassified RC 02→04 (structural
+  dispatch/readback split in `askLensCodex`); runners `unset ANTHROPIC_API_KEY` so the Anthropic
+  key never reaches a non-Anthropic child (each provider injects only its own credential). Tests:
+  `bin/je-run-lib.test.sh` (13), `bin/runners-source-lib.test.sh`, KILLED/watchdog/retry/scrub
+  cases in all five `bin/*-run.test.sh` suites, quorum + reclass cases in
+  `workflows/tournament-return-codes.test.mjs`. Plan authored by the run E tournament (winner
+  A/opus, steelman-boosted); implementation adapted from implementer draft impl-1/opus with one
+  real bug found and fixed in review: a child that exited during a poll tick could be
+  misclassified as stalled (kill-after-success race) — the watchdog now re-reaps after each sleep
+  before any deadline judgment.
+
 - **Fable Engine (`@@FE[:N]`)** — fast composer variant (new `fable-engine` skill + engine
   `composeOnly: true` flag). One WIDE blind round (default N=10: `2 opus, 2 sonnet,
   2 glm-5.2, 2 codex-high, 2 minimax-m3`), staged/validated exactly like @@JE but with NO

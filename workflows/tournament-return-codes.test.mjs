@@ -1,9 +1,9 @@
 // workflows/tournament-return-codes.test.mjs
-// Unit tests for the engine-side return-code (JE-RC) derivation. The logic lives inside the
-// `// ---- begin: return codes ----` marked block in workflows/tournament.mjs (a top-level-return
-// sandbox script, not an importable ES module), so — following this repo's precedent
-// (tournament-verdict-integrity.test.mjs / tournament.contributions.test.mjs) — we extract the marked
-// block from the shipped source and eval it, rather than hand-copying logic that would drift.
+// Unit tests for the engine-side return-code (JE-RC) derivation, the fold-in-A codex-judge failure
+// reclassification (02->04), and the engine-side N-1 quorum-close decision logic. All three live inside
+// MARKED blocks in workflows/tournament.mjs (a top-level-return sandbox script, not an importable ES
+// module), so — following this repo's precedent — we extract the marked blocks from the shipped source
+// and eval them, rather than hand-copying logic that would drift.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -13,12 +13,16 @@ import { dirname, resolve } from 'node:path'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = readFileSync(resolve(HERE, 'tournament.mjs'), 'utf8')
 
+function extractBlock(begin, end) {
+  const i = SRC.indexOf(begin)
+  const j = SRC.indexOf(end, i >= 0 ? i : 0)
+  if (i < 0 || j < 0) throw new Error(`block markers not found: ${begin}`)
+  return SRC.slice(i, j)
+}
+
 const BEGIN = '// ---- begin: return codes ----------------------------------------------------------------------'
 const END = '// ---- end: return codes ------------------------------------------------------------------------'
-const i = SRC.indexOf(BEGIN)
-const j = SRC.indexOf(END, i >= 0 ? i : 0)
-if (i < 0 || j < 0) throw new Error('return-codes block markers not found in workflows/tournament.mjs')
-const block = SRC.slice(i, j)
+const block = extractBlock(BEGIN, END)
 
 const sandbox = {}
 new Function('sandbox', `
@@ -31,12 +35,30 @@ new Function('sandbox', `
     sandbox.deriveNativeAttemptRc = deriveNativeAttemptRc
     sandbox.deriveRunnerAttemptRc = deriveRunnerAttemptRc
     sandbox.buildRcSummary = buildRcSummary
+    sandbox.classifyCodexJudgeFailure = classifyCodexJudgeFailure
   }
 `)(sandbox)
-const { RC, ENGINE_FAULT_CLASSES, parseRunnerRc, deriveNativeAttemptRc, deriveRunnerAttemptRc, buildRcSummary } = sandbox
+const { RC, ENGINE_FAULT_CLASSES, parseRunnerRc, deriveNativeAttemptRc, deriveRunnerAttemptRc, buildRcSummary, classifyCodexJudgeFailure } = sandbox
 
-for (const fn of ['parseRunnerRc', 'deriveNativeAttemptRc', 'deriveRunnerAttemptRc', 'buildRcSummary']) {
+for (const fn of ['parseRunnerRc', 'deriveNativeAttemptRc', 'deriveRunnerAttemptRc', 'buildRcSummary', 'classifyCodexJudgeFailure']) {
   assert.equal(typeof sandbox[fn], 'function', `${fn} must be a function`)
+}
+
+// Quorum-close block (new): pure decision arithmetic.
+const QBEGIN = '// ---- begin: quorum close ------------------------------------------------------------------------'
+const QEND = '// ---- end: quorum close --------------------------------------------------------------------------'
+const qblock = extractBlock(QBEGIN, QEND)
+const qsandbox = {}
+new Function('sandbox', `
+  with (sandbox) {
+    ${qblock}
+    sandbox.quorumDeadlineSecs = quorumDeadlineSecs
+    sandbox.shouldQuorumClose = shouldQuorumClose
+  }
+`)(qsandbox)
+const { quorumDeadlineSecs, shouldQuorumClose } = qsandbox
+for (const fn of ['quorumDeadlineSecs', 'shouldQuorumClose']) {
+  assert.equal(typeof qsandbox[fn], 'function', `${fn} must be a function`)
 }
 
 // ----- parseRunnerRc -----
@@ -132,7 +154,7 @@ test('buildRcSummary: a mixed field yields counts + non00 rows', () => {
   assert.deepEqual(s.non00[0], { seat: 'B', phase: 'Round 1', rc: '05', reason: 'no-deliverable' })
 })
 
-// ----- ENGINE_FAULT_CLASSES: 00 and 03 are NEVER auto-filed; 01,02,04-09 are -----
+// ----- ENGINE_FAULT_CLASSES -----
 test('ENGINE_FAULT_CLASSES excludes 00 (success) and 03 (honest turn-cap loss)', () => {
   assert.equal(ENGINE_FAULT_CLASSES.has('00'), false)
   assert.equal(ENGINE_FAULT_CLASSES.has('03'), false)
@@ -142,4 +164,56 @@ test('ENGINE_FAULT_CLASSES includes 01, 02, and 04-09', () => {
   for (const c of ['01', '02', '04', '05', '06', '07', '08', '09']) {
     assert.equal(ENGINE_FAULT_CLASSES.has(c), true, `${c} must be an engine-fault class`)
   }
+})
+
+// ----- fold-in A: codex judge VERDICT read-back reclassification (02 dispatch/unavail -> 04 readback/invalid) -----
+test('classifyCodexJudgeFailure: dispatch stage => 02 codex-seat-unavailable', () => {
+  assert.deepEqual(classifyCodexJudgeFailure('dispatch'), { rc: RC.UNAVAIL, reason: 'codex-seat-unavailable' })
+  assert.equal(classifyCodexJudgeFailure('dispatch').rc, '02')
+})
+
+test('classifyCodexJudgeFailure: readback stage => 04 codex-verdict-readback-failed', () => {
+  assert.deepEqual(classifyCodexJudgeFailure('readback'), { rc: RC.INVALID, reason: 'codex-verdict-readback-failed' })
+  assert.equal(classifyCodexJudgeFailure('readback').rc, '04')
+})
+
+test('classifyCodexJudgeFailure: unrecognized/undefined stage fails toward the pre-existing 02 branch', () => {
+  assert.equal(classifyCodexJudgeFailure(undefined).rc, '02')
+  assert.equal(classifyCodexJudgeFailure('weird').rc, '02')
+})
+
+// ----- item 4: quorum-close arithmetic -----
+test('quorumDeadlineSecs: null / non-positive timeout => null (never eligible)', () => {
+  assert.equal(quorumDeadlineSecs(null, 90), null)
+  assert.equal(quorumDeadlineSecs(0, 90), null)
+  assert.equal(quorumDeadlineSecs(-5, 90), null)
+})
+
+test('quorumDeadlineSecs: 2x timeout + grace (and the zero-grace edge)', () => {
+  assert.equal(quorumDeadlineSecs(300, 90), 690)
+  assert.equal(quorumDeadlineSecs(300, 0), 600)
+})
+
+test('shouldQuorumClose: a single-seat round never closes (totalCount < 2)', () => {
+  assert.equal(shouldQuorumClose({ settledCount: 0, totalCount: 1, straggler: { timeoutSecs: 300, graceSecs: 90, elapsedSecs: 99999 } }), false)
+})
+
+test('shouldQuorumClose: false unless EXACTLY one seat is unsettled', () => {
+  assert.equal(shouldQuorumClose({ settledCount: 3, totalCount: 5, straggler: { timeoutSecs: 300, graceSecs: 90, elapsedSecs: 99999 } }), false)
+})
+
+test('shouldQuorumClose: NEVER over a security-gate seat (neverClose) even past deadline', () => {
+  assert.equal(shouldQuorumClose({ settledCount: 4, totalCount: 5, straggler: { neverClose: true, timeoutSecs: 300, graceSecs: 90, elapsedSecs: 99999 } }), false)
+})
+
+test('shouldQuorumClose: false for a native seat with no engine-known deadline', () => {
+  assert.equal(shouldQuorumClose({ settledCount: 4, totalCount: 5, straggler: { timeoutSecs: null, graceSecs: 90, elapsedSecs: 99999 } }), false)
+})
+
+test('shouldQuorumClose: false while still within the deadline', () => {
+  assert.equal(shouldQuorumClose({ settledCount: 4, totalCount: 5, straggler: { timeoutSecs: 300, graceSecs: 90, elapsedSecs: 100 } }), false)
+})
+
+test('shouldQuorumClose: true once strictly past the deadline for an eligible straggler', () => {
+  assert.equal(shouldQuorumClose({ settledCount: 4, totalCount: 5, straggler: { timeoutSecs: 300, graceSecs: 90, elapsedSecs: 691 } }), true)
 })

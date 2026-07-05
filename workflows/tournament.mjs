@@ -26,6 +26,8 @@ export const meta = {
 //   codexTimeoutSecs: number,             // optional wall-clock backstop for codex (default 600)
 //   grokTimeoutSecs: number,              // optional wall-clock backstop for grok (default 600); grok ALSO honours grokMaxTurns
 //   grokWebSearch: boolean,               // optional — true enables grok's web search (default false = hermetic, like the other providers)
+//   quorumClose: boolean,                 // optional — false disables N-1 quorum close (default on where the runtime has timers+clock)
+//   quorumGraceSecs: number,              // optional — grace buffer added to 2x a seat's wall clock (default 90)
 //   attempts: [ {                         // one per attempt, length N
 //      label: 'candidate-1',
 //      dispatch: 'anthropic' | 'glm' | 'local' | 'codex' | 'minimax' | 'grok',
@@ -264,6 +266,31 @@ const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${c
 // (2026-07-05): Sonnet 5's agentic reliability is worth the negligible cost delta on these small
 // steps, and persist specifically corrupted artifacts on haiku (issue #33; 9/9 audited runs).
 const HELPER_MODEL = 'sonnet'
+// Quorum close (run E): capability-gated on BOTH host timer APIs it needs — setTimeout AND a usable
+// clock. Neither is core-ECMAScript-guaranteed here: this sandbox deliberately makes Date.now() THROW
+// (resume-safety), so we PROBE by calling it, not by typeof. When either is missing, rounds block on
+// every seat exactly as before this feature (one log line, fail-safety unaffected). `quorumClose:false`
+// is the operator-reversible escape hatch, independent of capability.
+const HAS_TIMERS = typeof setTimeout === 'function'
+let HAS_CLOCK = false
+try { Date.now(); HAS_CLOCK = true } catch { /* sandbox clock disabled — quorum close stays inert */ }
+const QUORUM_ENABLED = HAS_TIMERS && HAS_CLOCK && A.quorumClose !== false
+const QUORUM_GRACE_SECS = Number(A.quorumGraceSecs) > 0 ? Number(A.quorumGraceSecs) : 90
+const QUORUM_POLL_MS = 5000
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+let quorumCapabilityWarned = false
+
+// Idempotent seat-record guard: a quorum-closed straggler is written to seatRcs synthetically when the
+// round closes, but its real promise may STILL resolve later and record the same seat again.
+// recordSeatOnce keys on `${label} ${phaseTitle}` and lets only the FIRST write per key win —
+// a no-op for every normal seat (each records its label+phase exactly once).
+const _seatRecorded = new Set()
+function recordSeatOnce(label, phaseTitle, rc, reason) {
+  const key = `${label} ${phaseTitle}`
+  if (_seatRecorded.has(key)) return
+  _seatRecorded.add(key)
+  recordSeat(label, phaseTitle, rc, reason)
+}
 const contextFiles = Array.isArray(A.contextFiles) ? A.contextFiles.filter(Boolean) : []
 const contextPath = contextFiles.length ? `${runDir}/_context/_context.md` : null
 // repoMode (Phase 1, worktree-per-attempt): gated OFF by default so the scratch-directory path is
@@ -486,7 +513,112 @@ function buildRcSummary(seatRcs) {
   }
   return { seats, by_code, non00 }
 }
+// Codex judge VERDICT read-back failure classification (fold-in A, run E). STRUCTURAL, not
+// message-sniffing: a 'dispatch'-stage failure means the codex runner never produced a verdict at all
+// (never ran / not registered / genuine throttle) -> RC 02 (unavailable, unchanged meaning). A
+// 'readback'-stage failure means the dispatch agent() call ALREADY succeeded and something AFTER that
+// was bad — sha-verified relay corruption, non-JSON, wrong shape, or a failed integrity check — which
+// is the same class RC 04 already covers for every other seat. Only the class was wrong before.
+function classifyCodexJudgeFailure(stage) {
+  return stage === 'readback'
+    ? { rc: RC.INVALID, reason: 'codex-verdict-readback-failed' }
+    : { rc: RC.UNAVAIL, reason: 'codex-seat-unavailable' }
+}
 // ---- end: return codes ------------------------------------------------------------------------
+
+// ---- begin: quorum close ------------------------------------------------------------------------
+// Pure decision logic for engine-side N-1 quorum close (run E item 4). The async orchestration that
+// calls these (parallelQuorum) is impure and exercised by system testing; only the arithmetic here,
+// where an off-by-one or a missed fail-closed check would matter, is unit tested.
+
+// A seat's total "must-still-be-alive" budget in seconds: 2x its per-try wall clock (one original try
+// + the runner's own one built-in stall/timeout retry, see bin/_je-run-lib.sh) plus a grace buffer.
+// timeoutSecs == null (a seat with NO engine-known wall clock — every native Anthropic attempt/judge)
+// returns null: NEVER eligible, by construction. NOTE: the 2x factor is tied to the runner's
+// retry-once policy — if that policy changes, revisit this together with bin/_je-run-lib.sh.
+function quorumDeadlineSecs(timeoutSecs, graceSecs) {
+  if (timeoutSecs == null || !(timeoutSecs > 0)) return null
+  return 2 * timeoutSecs + (graceSecs > 0 ? graceSecs : 0)
+}
+
+// Should the round close now, leaving exactly `straggler` behind? Fail-closed on every axis: requires
+// >=2 seats, EXACTLY one unsettled, never a security-gate seat (neverClose), never a no-deadline seat,
+// and only once elapsed is STRICTLY past the deadline.
+function shouldQuorumClose({ settledCount, totalCount, straggler }) {
+  if (totalCount < 2) return false
+  if (settledCount !== totalCount - 1) return false
+  if (!straggler || straggler.neverClose) return false
+  const deadline = quorumDeadlineSecs(straggler.timeoutSecs, straggler.graceSecs)
+  if (deadline == null) return false
+  return (straggler.elapsedSecs || 0) > deadline
+}
+// ---- end: quorum close --------------------------------------------------------------------------
+
+// parallelQuorum(entries, thunkFor, phaseTitle, opts): drop-in for
+// `parallel(entries.map((e, i) => () => thunkFor(e, i)))` that additionally allows the round to close
+// when all but one seat have returned and that seat has blown its budget (shouldQuorumClose). It NEVER
+// forks a competing scheduler: the same thunks go to the real parallel() (individually instrumented for
+// start/settle time), and this only RACES that call's resolution against a side-channel poll. Returns
+// the SAME array shape (aligned to entries; a quorum-closed straggler's slot is null, like dispatch()'s
+// own dropped-seat null, so every existing .filter(Boolean) call site is unaffected).
+// opts: { timeoutSecsFor(entry)->number|null, neverClose(entry)->boolean, seatLabelFor(entry)->string,
+//         graceSecs (default QUORUM_GRACE_SECS) }
+async function parallelQuorum(entries, thunkFor, phaseTitle, opts) {
+  const { timeoutSecsFor, neverClose = () => false, seatLabelFor = (e) => String((e && (e.label || e.key)) || '?'), graceSecs = QUORUM_GRACE_SECS } = opts
+  if (!QUORUM_ENABLED || entries.length < 2) {
+    if (!(HAS_TIMERS && HAS_CLOCK) && !quorumCapabilityWarned) {
+      log('JE-QUORUM-DISABLED: this runtime lacks setTimeout and/or a usable clock — rounds block on every seat exactly as before this feature; fail-safety is unaffected.')
+      quorumCapabilityWarned = true
+    }
+    return parallel(entries.map((e, i) => () => thunkFor(e, i)))
+  }
+  const state = entries.map((e, i) => ({
+    index: i, settled: false, startedAt: null, result: null,
+    timeoutSecs: timeoutSecsFor(e), neverClose: !!neverClose(e), graceSecs, label: seatLabelFor(e),
+  }))
+  const thunks = state.map((st, i) => () => {
+    st.startedAt = Date.now()
+    return Promise.resolve(thunkFor(entries[i], i))
+      .then((r) => { st.settled = true; st.result = r; return r })
+      .catch(() => { st.settled = true; st.result = null; return null }) // dispatch()/askLens() never throw; belt-and-suspenders
+  })
+  const allPromise = parallel(thunks)
+  for (;;) {
+    const unsettled = state.filter((s) => !s.settled)
+    if (!unsettled.length) return await allPromise
+    if (unsettled.length === 1) {
+      const s = unsettled[0]
+      const elapsedSecs = s.startedAt ? (Date.now() - s.startedAt) / 1000 : 0
+      if (shouldQuorumClose({ settledCount: state.length - 1, totalCount: state.length, straggler: { ...s, elapsedSecs } })) {
+        const deadline = quorumDeadlineSecs(s.timeoutSecs, s.graceSecs)
+        recordSeatOnce(s.label, phaseTitle, RC.TIMEOUT, `quorum-close: exceeded ${deadline}s (2x timeout + ${s.graceSecs}s grace) with the round otherwise complete`)
+        log(`JE-QUORUM-CLOSE [${phaseTitle}]: ${state.length - 1}/${state.length} seats returned — '${s.label}' exceeded ${deadline}s; closing the round without it. Its process is NOT killed by this decision (the engine has no handle into a sub-agent's subprocess) and may keep running until the runner's own watchdog/timeout ends it.`)
+        s.settled = true; s.result = null
+        allPromise.catch(() => {}) // the abandoned background wait must never surface an unhandled rejection
+        return state.map((x) => x.result)
+      }
+    }
+    await sleepMs(QUORUM_POLL_MS)
+  }
+}
+
+// attempt/lens -> engine-known per-try timeout (null = no engine-known wall clock => never
+// quorum-closable). Function declarations: they reference module consts defined later in the file
+// (glmTimeoutSecs, codexJudgeTimeout, chooseJudgeDispatch, ...) but are only CALLED at await time,
+// long after module evaluation.
+function attemptTimeoutSecsFor(a) {
+  switch (a.dispatch) {
+    case 'glm': return glmTimeoutSecs
+    case 'local': return attemptTimeout
+    case 'codex': return codexTimeout
+    case 'minimax': return minimaxTimeoutSecs
+    case 'grok': return grokTimeout
+    default: return null // native anthropic: agent() exposes no timeout primitive
+  }
+}
+function lensTimeoutSecsFor(lens) {
+  return (chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner) === 'codex') ? codexJudgeTimeout : null
+}
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
 const rcSummaryLive = () => buildRcSummary(seatRcs)
@@ -748,7 +880,10 @@ const ENRICHMENT_GRAMMAR = '^automated_checks: enrichment_ok=[01] checks_ok=[01]
 function provCheckShell(log, tok, lp, carriedOver) {
   if (!log) return `P=1`              // native Anthropic: no provenance log, unchanged
   if (carriedOver) return `P=1`       // already validated in round 1; do NOT re-grep the stripped dir
-  return `if [ -f ${lp} ]; then if grep -q '^JOUST-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^JOUST-${tok}-DONE exit=0' ${lp} && ! grep -q '^JOUST-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
+  // KILLED added to the reject set (run E, belt-and-suspenders): only finish() ever writes it, on a
+  // genuine watchdog/external kill — never on a log that ends in success (the interim -RETRY word is
+  // non-terminal and deliberately NOT matched here, so a try that succeeds after a retry still passes).
+  return `if [ -f ${lp} ]; then if grep -q '^JOUST-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^JOUST-${tok}-DONE exit=0' ${lp} && ! grep -q '^JOUST-${tok}-\\(TIMEOUT\\|ERROR\\|KILLED\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
 }
 
 // Persist-verification schema: the write-agent reports, per FINAL target path, the byte count
@@ -1328,12 +1463,14 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
   const dispatchMode = chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner)
   if (dispatchMode === 'codex') {
     const result = await askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
-    if (result) return result
+    if (result && !result.__codexFail) return result
+    const fail = (result && result.__codexFail) || classifyCodexJudgeFailure('dispatch')
     log(`JE-COUNCIL-FALLBACK [${phaseTitle}] ${label} (${lens.key}): codex-xhigh seat exhausted retries — falling back to native Opus for this round so the council does not lose a seat.`)
     // A fallback IS an existing behavioural branch, so recording a RECOVERED fault here honours the
     // "observability, except where behaviour already branches" clause: the seat stays living (Opus) but
-    // its codex leg faulted — record RC 02 so the report shows the recovered fault (never silently dropped).
-    recordSeat(`${label}:codex`, phaseTitle, RC.UNAVAIL, 'codex-seat-fallback-to-opus')
+    // its codex leg faulted. Fold-in A: a dispatch-stage failure records the pre-existing RC 02; a
+    // readback-stage failure (codex RAN, its verdict arrived corrupt/unparseable) records RC 04.
+    recordSeat(`${label}:codex`, phaseTitle, fail.rc, fail.rc === RC.INVALID ? 'codex-seat-fallback-to-opus (verdict-readback-failed)' : 'codex-seat-fallback-to-opus')
   } else if (!LEGACY_MIX && lens.judge && lens.judge.kind === 'codex' && !codexRunner && !codexRunnerWarned) {
     log(`JE-COUNCIL-WARNING: codexRunner not supplied — codex judge seat(s) (spec/craft/completeness/simplicity) will run as native Opus this run. Pass args.codexRunner to enable mixed-family judging.`)
     codexRunnerWarned = true
@@ -1387,9 +1524,21 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
   const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout)
   const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null | cut -d' ' -f1`
 
+  // Two-stage try/catch per try (fold-in A): the classification is STRUCTURAL — a dispatch-stage
+  // failure (codex never produced a verdict) stays RC 02; anything past a successful dispatch
+  // (relay corruption, non-JSON, wrong shape, integrity reject) is RC 04. On exhaustion the caller
+  // receives { __codexFail } instead of null so it can record the right class.
+  let lastFail = classifyCodexJudgeFailure('dispatch')
   for (let i = 1; i <= 2; i++) {
     try {
       await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), phase: phaseTitle, label: `${label}-codex-dispatch` })
+    } catch (e) {
+      log(`council ${label} (${lens.key}) codex-xhigh dispatch attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
+      lastFail = classifyCodexJudgeFailure('dispatch')
+      if (i === 2) return { __codexFail: lastFail }
+      continue
+    }
+    try {
       const readRaw = await agent(
         `Run this exact shell command in ONE Bash call and return its ENTIRE stdout, verbatim and unaltered, in the "raw" field. Do not summarize, truncate, or interpret it. Do nothing else:\n\n${dumpScript}`,
         { model: HELPER_MODEL, schema: CODEX_JUDGE_DUMP_SCHEMA, phase: phaseTitle, label: `${label}-codex-read` }
@@ -1418,8 +1567,9 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
       if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}, codex-xhigh): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
       return { lens: lens.key, judgeModel: (lens.judge && lens.judge.displayModel) || 'codex-xhigh', ...reconcileLens(parsedResult.verdict, labels) }
     } catch (e) {
-      log(`council ${label} (${lens.key}) codex-xhigh attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
-      if (i === 2) return null
+      log(`council ${label} (${lens.key}) codex-xhigh readback attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
+      lastFail = classifyCodexJudgeFailure('readback')
+      if (i === 2) return { __codexFail: lastFail }
     }
   }
 }
@@ -1697,8 +1847,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   }
 
   // Round 1 — 5 independent verdicts, no peer visibility. Each lens gets a differently-rotated listing.
-  const r1raw = await parallel(lenses.map((lens, i) => () =>
-    askLens(lens, blindList, poolPath, phaseTitle, `${label}-${lens.key}-r1`, 1, null, i)))
+  const r1raw = await parallelQuorum(lenses, (lens, i) =>
+    askLens(lens, blindList, poolPath, phaseTitle, `${label}-${lens.key}-r1`, 1, null, i), phaseTitle, {
+    timeoutSecsFor: lensTimeoutSecsFor,
+    neverClose: (lens) => isSecurityLens(lens.key), // NEVER close over a security-gate seat
+    seatLabelFor: (lens) => `${label}:${lens.key}`,
+  })
   let verdicts = r1raw.filter(Boolean)
   if (!verdicts.length) {
     log(`council ${label}: ALL 5 lenses died in round 1 — degrading to a __failed partial (caller lands a partial run).`)
@@ -1805,8 +1959,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     if (!stagedR.length) { log(`steelman ${label} i${iter}: runoff staging produced no valid candidates — ending loop on seed result.`); break }
     if (repoMode) await enrichBlindPool(stagedR, runoffDir, phaseTitle)
     const runoffPool = `${runoffDir}/_pool.md`
-    const rRaw = await parallel(lenses.map((lens, i) => () =>
-      askLens(lens, stagedR, runoffPool, phaseTitle, `${label}-runoff${iter}-${lens.key}-r1`, 1, null, i)))
+    const rRaw = await parallelQuorum(lenses, (lens, i) =>
+      askLens(lens, stagedR, runoffPool, phaseTitle, `${label}-runoff${iter}-${lens.key}-r1`, 1, null, i), phaseTitle, {
+      timeoutSecsFor: lensTimeoutSecsFor,
+      neverClose: (lens) => isSecurityLens(lens.key), // NEVER close over a security-gate seat
+      seatLabelFor: (lens) => `${label}:runoff${iter}:${lens.key}`,
+    })
     const rVerdicts = rRaw.filter(Boolean)
     if (!rVerdicts.length) { log(`steelman ${label} i${iter}: all runoff judges died — ending loop on seed result.`); break }
     const rt = councilTally(rVerdicts)
@@ -2377,7 +2535,9 @@ function implGatePassed(r) {
 async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance, reviewDir, wantGuidance) {
   const list = implementAttempts.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
   await buildWorktrees(roundName, list)
-  const doneRaw = (await parallel(list.map(a => () => dispatch(a, a.ws, guidance, phaseTitle, 'implement', seedPlanPath)))).filter(Boolean)
+  const doneRaw = (await parallelQuorum(list, (a) => dispatch(a, a.ws, guidance, phaseTitle, 'implement', seedPlanPath), phaseTitle, {
+    timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
+  })).filter(Boolean)
   const done = doneRaw.map(c => ({ ...c, roundName }))
   { const w = dispatchDropSummary(phaseTitle, dispatchDrops, list.length, done.length); if (w) log(w) }
   await snapshotWorktrees(roundName, done)
@@ -2449,7 +2609,9 @@ await buildContext() // shared context bundle (no-op unless args.contextFiles gi
 const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label) }))
 await buildWorktrees('round-1', r1Worktrees) // repoMode-only no-op otherwise
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
-const r1 = (await parallel(r1Worktrees.map(a => () => dispatch(a, a.ws, null, 'Round 1')))).filter(Boolean)
+const r1 = (await parallelQuorum(r1Worktrees, (a) => dispatch(a, a.ws, null, 'Round 1'), 'Round 1', {
+  timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
+})).filter(Boolean)
 { const w = dispatchDropSummary('Round 1', dispatchDrops, r1Worktrees.length, r1.length); if (w) log(w) } // #45
 if (!r1.length) {
   const unreg = [...new Set(dispatchDrops.filter(d => d.phase === 'Round 1').map(d => d.agentType))]
@@ -2559,7 +2721,9 @@ phase('Round 2')
 log(`Round 2: ${attempts.length} guided attempts; carrying over ${champs.length} round-1 champion(s)${champs.length ? ` (${champs.map(c => c.displayModel).join(', ')})` : ' — none (all vetoed)'}`)
 const r2Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-2', a.label) : scratchPath('round-2', a.label) }))
 await buildWorktrees('round-2', r2Worktrees) // repoMode-only no-op otherwise
-const r2 = (await parallel(r2Worktrees.map(a => () => dispatch(a, a.ws, review.guidance, 'Round 2')))).filter(Boolean)
+const r2 = (await parallelQuorum(r2Worktrees, (a) => dispatch(a, a.ws, review.guidance, 'Round 2'), 'Round 2', {
+  timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
+})).filter(Boolean)
 { const w = dispatchDropSummary('Round 2', dispatchDrops, r2Worktrees.length, r2.length); if (w) log(w) } // #45
 await snapshotWorktrees('round-2', r2) // repoMode-only no-op otherwise
 

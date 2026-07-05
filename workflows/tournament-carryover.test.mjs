@@ -150,7 +150,9 @@ check('(pure) native snippet is exactly "P=1"', provCheckShell('', '', '', false
   check('(pure) non-carryover runner snippet still greps the anchored success contract',
     normal.includes("grep -q '^JOUST-CODEX-PROVENANCE endpoint='") &&
     normal.includes("grep -q '^JOUST-CODEX-DONE exit=0'") &&
-    normal.includes("! grep -q '^JOUST-CODEX-\\(TIMEOUT\\|ERROR\\)'"))
+    // run E: KILLED joined the fail-closed reject set (watchdog kills); -RETRY is non-terminal and
+    // deliberately NOT rejected, so a try that succeeds after a retry still passes the gate.
+    normal.includes("! grep -q '^JOUST-CODEX-\\(TIMEOUT\\|ERROR\\|KILLED\\)'"))
 }
 
 console.log(failed ? `\n${failed} check(s) FAILED` : '\nAll checks passed')
