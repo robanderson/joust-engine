@@ -147,7 +147,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 }
 ```
 
-**Plan/Implement args (2026-07-03 round split).** The tournament is a **Plan phase** (Plan Round 1 + Plan Round 2, always — plans are cheap to produce/judge) plus an optional **Implement phase** (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate). `attempts` seat the plan rounds; two extra args seat the implement rounds:
+**Plan/Implement args (2026-07-03 round split).** The tournament is a **Plan phase** (Plan Round 1 + Plan Round 2, always — attempts produce **design briefs**, cheap to produce/judge) plus an optional **Implement phase** (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate). `attempts` seat the plan rounds; two extra args seat the implement rounds:
 
 ```
   implement: true,                        // optional (default false). Enables Implement Round 3 (+ 4).
@@ -156,9 +156,15 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   implementAttempts: [ ... ],             // optional: the implement-phase pool (SAME per-attempt shape
                                           // as `attempts`; a small strong pool). Defaults to `attempts`
                                           // when omitted. From je-parse's `implementAssignment`.
+  abBriefs: true,                         // optional (default false). A/B briefs: when the final rank
+                                          // leaves a second non-vetoed steelman finalist, implementers
+                                          // seed ALTERNATELY from the top-2 finalists' briefs. Judges
+                                          // stay blind to lineage; the readout is derived from mapping
+                                          // (`seedBrief` per implementer; `implement.json` gains
+                                          // `ab: {brief-1, brief-2}`), never from votes.
 ```
 
-- When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
+- When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning design brief is refined before any expensive implementation, then bundles the winning brief verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer as an **approach + acceptance-criteria contract** (the deliberate seed exception; implementation details belong to the implementers).
 - **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
 - **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`), and a plan-final steelman tie returns `needs_orchestrator_pick` the same way. The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`, `needs_orchestrator_pick?`).
 

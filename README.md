@@ -55,9 +55,9 @@ The tournament is a **cheap, wide planning phase** (always) followed by an **opt
 
 | Round | Runs | What happens | Pool default |
 |---|---|---|---|
-| **Plan Round 1** | always | N parallel, isolated plan attempts, one diversity nudge each → the blind plan-lens council reviews, votes a round-1 winner, **and distils guidance** | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
-| **Plan Round 2** | always (two-pass; `:1` stops after Round 1) | winner's plan **saved**, every other artifact discarded; N **fresh** attempts get the task + guidance (never round-1 content); final pool = N + the carried winner, re-labelled blind → the council ranks and elects the **winning plan** | same pool, fresh nudges |
-| **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning plan verbatim** (a deliberate exception to "never seed prior artifacts" — the plan *is* the specification); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
+| **Plan Round 1** | always | N parallel, isolated attempts each produce a **design brief** (≤10 bullets: approach, surfaces, risks, testable acceptance criteria — never code or diffs), one diversity nudge each → the blind plan-lens council reviews, votes a round-1 winner, **and distils guidance** | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
+| **Plan Round 2** | always (two-pass; `:1` stops after Round 1) | winner's brief **saved**, every other artifact discarded; N **fresh** attempts get the task + guidance (never round-1 content); final pool = N + the carried winner, re-labelled blind → the council ranks and elects the **winning design brief** | same pool, fresh nudges |
+| **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning design brief** (a deliberate exception to "never seed prior artifacts" — the brief is the spec: approach + acceptance criteria, implementation details are theirs); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
 | **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate (no council majority, all vetoed, or verify failure) | M fresh implementers, guided by the R3 review; still no consensus → **needs-human**, never a silently-picked winner | same pool |
 
 ```text
@@ -71,10 +71,10 @@ PLAN (always)
            final plan pool = N round-2 + saved winner ◀──────────┘
                              │
                              ▼
-                  plan council rank ──▶ WINNING PLAN ✓        (no implement flag → done)
+                  plan council rank ──▶ WINNING BRIEF ✓       (no implement flag → done)
 
 IMPLEMENT (only with the `implement` keyword)
-  winning plan ──▶ [M implementers, plan seeded verbatim] ──▶ code council + gate ──▶ winner ✓
+  winning brief ──▶ [M implementers, brief seeded] ──▶ code council + gate ──▶ winner ✓
                                                                     │ gate fails
                                                                     ▼
                    [M fresh implementers + R3 guidance] ──▶ code council + gate ──▶ winner ✓ / needs-human
