@@ -354,9 +354,13 @@ je_verify_sandbox_exec() {
 #     no background process leaks — including on the common EARLY-COMPLETION path
 #     where the command finishes well under the timeout and the watchdog is torn
 #     down mid-sleep (a naive `( sleep N; kill ) &` orphans that sleep to init).
-# NOTE: a sub-~10ms command has a benign residual orphan-sleep race (the parent
-#   can tear the watchdog down before its TERM trap is installed) — out of scope;
-#   real verify commands (node/bash/pytest) are >=50ms and never leak.
+#   - tears the watchdog down as a PROCESS GROUP (#28/#40): the old TERM-trap-only
+#     teardown had a bash-3.2 race — a TERM whose trap handling is deferred (signal
+#     landing pre-trap-install, or in the wait builtin's check-then-block window)
+#     left the watchdog parked in `wait` for the FULL timeout, and the caller parked
+#     in `wait $watch_pid` behind it (the intermittent 10s/12s $()-path CI stall).
+#     Group-kill signals the inner sleep DIRECTLY, so the watchdog's `wait` always
+#     wakes on child death regardless of trap timing.
 # Usage: je_run_with_timeout 600 -- npm run build --if-present
 # --------------------------------------------------------------------------
 JE_VERIFY_KILL_GRACE="${JE_VERIFY_KILL_GRACE:-2}"
@@ -369,15 +373,22 @@ je_run_with_timeout() {
   "$@" &
   local cmd_pid=$!
 
-  # Watchdog: background ITS OWN sleep separately and remember that sleep's PID,
-  # so tearing the watchdog down also stops the sleep (no orphaned sleep on the
-  # fast-success path). The grace sleep is short and inline (only reached when the
-  # timeout has already fired, i.e. the leak window does not exist there).
-  ( sleep "$secs" &
-    local sleep_pid=$!
+  # Watchdog: spawned under `set -m` so the subshell LEADS ITS OWN PROCESS GROUP
+  # (its sleep joins it via the inner `set +m`). Teardown then group-kills
+  # `-$watch_pid`, hitting subshell AND sleep atomically — no reliance on the TERM
+  # trap firing promptly (#28/#40: bash 3.2 can defer trap handling past a full
+  # `wait`, which stalled the caller one whole timeout). The trap is installed
+  # BEFORE the sleep is spawned, so a pre-trap TERM also means no sleep exists yet
+  # (no orphan possible). The grace sleep is short and inline (only reached when
+  # the timeout has already fired, i.e. the leak window does not exist there).
+  local had_m=0; case "$-" in *m*) had_m=1 ;; esac
+  set -m
+  ( set +m   # children must JOIN this group, not lead their own
     # When the watchdog is killed early (command finished first), reap the sleep
     # too, then exit without touching the (already-gone) command.
-    trap 'kill "$sleep_pid" 2>/dev/null; exit 0' TERM
+    trap 'kill "${sleep_pid:-}" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    sleep_pid=$!
     wait "$sleep_pid" 2>/dev/null
     # Timeout fired: escalate TERM -> (grace) -> KILL on the command.
     kill -TERM "$cmd_pid" 2>/dev/null
@@ -386,18 +397,20 @@ je_run_with_timeout() {
   # #46: the watchdog subshell (and the `sleep` it backgrounds) is detached from the caller's
   # stdout/stderr (`>/dev/null 2>&1`). The watchdog never writes output, but it would otherwise
   # INHERIT fd 1 — and when je_run_with_timeout (or run_verify) is invoked inside command
-  # substitution `$( ... )`, fd 1 is the capture pipe. The residual instant-command race can orphan
-  # the inner `sleep`; if that orphan still held the pipe, `$()` would block until the sleep ended
-  # (the full timeout). Detaching the watchdog's fds means an orphaned sleep can never hold the
-  # `$()` pipe, so `$()` returns as soon as the command itself finishes. The command (`"$@"` above)
-  # keeps fd 1, so captured command output is unchanged.
+  # substitution `$( ... )`, fd 1 is the capture pipe; a watchdog child holding it would block
+  # `$()` until that child exited. Detaching the watchdog's fds means no watchdog child can ever
+  # hold the `$()` pipe, so `$()` returns as soon as the command itself finishes. The command
+  # (`"$@"` above) keeps fd 1, so captured command output is unchanged.
   local watch_pid=$!
+  [ "$had_m" -eq 1 ] || set +m
 
   # Wait for the command; capture its REAL rc.
   wait "$cmd_pid" 2>/dev/null; local rc=$?
 
-  # Tear down the watchdog (and, via its TERM trap, its sleep) and reap it so it
-  # never leaks regardless of which side won the race.
+  # Tear down the whole watchdog PROCESS GROUP (subshell + its sleep) so nothing
+  # leaks and nothing stalls, regardless of trap timing; direct pid kill is
+  # belt-and-braces for the (never-observed) case the group was not created.
+  kill -TERM -- "-$watch_pid" 2>/dev/null
   kill -TERM "$watch_pid" 2>/dev/null
   wait "$watch_pid" 2>/dev/null
 
