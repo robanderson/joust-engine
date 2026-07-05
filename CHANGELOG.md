@@ -6,6 +6,17 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Prompt Lab (`docs/superpowers/prompt-lab/`)** — a document library of 70 optimised
+  drop-in variants (10 per family) for every worker sub-agent prompt: plan design brief,
+  implement brief, judge lens brief, steelman, boost implementer, guidance synthesis, and
+  the @@FE composer. Each family file quotes the current production prompt verbatim with
+  its `tournament.mjs`/SKILL.md anchor; each variant carries a variation-axis rationale
+  and a testable metric prediction, and preserves every engine-contract invariant (blind
+  letters, `checks_run`, single-pass + save contract, design-brief altitude, no model
+  identities, JOUST literals). `INDEX.md` holds the A/B protocol (one variable, n>=5,
+  je-ledger/je-evolve/je-council-audit comparison) and a top-10 test-first list. Docs
+  only — no production prompt changed.
+
 - **Brief dry-run tester — `bin/je-brief-test.mjs`** (research: Anthropic's multi-agent
   system work — exercising and rewriting a flawed tool description cut downstream task
   time 40%; same trick applied to attempt briefs). A deterministic STATIC LINTER (no
