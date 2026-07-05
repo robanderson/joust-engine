@@ -67,7 +67,7 @@ ghi() { gh "$@" --repo "$JE_REPO"; }   # gh, pinned to the resolved repo
 # check_evidence FILE -> 0 ok | 3 empty/placeholder | 4 unblinding | 5 secret
 check_evidence() {
   local f="${1:?check_evidence: evidence file required}" ev stripped
-  [ -f "$f" ] || { echo "REFUSE: evidence file not found: $f" >&2; return 3; }
+  [ -f "$f" ] && [ -r "$f" ] || { echo "REFUSE: evidence file not found or unreadable: $f" >&2; return 3; }
   ev="$(cat "$f")"
   stripped="$(printf '%s' "$ev" | tr -d '[:space:]')"
   case "$stripped" in
@@ -92,6 +92,36 @@ check_evidence() {
     echo "REFUSE: possible secret/token in evidence." >&2
     return 5
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# scrub_evidence — FAIL-CLOSED privacy scrubbing pass (runs BEFORE check_evidence).
+# Redacts host/user/env details that must NEVER appear in a PUBLIC issue, per the privacy contract in
+# references/dogfood.md. Composable + separate from check_evidence (the proven exit-3/4/5 guards are left
+# byte-for-byte and run over the SCRUBBED text as a second net).
+#   scrub_evidence <in-file> <out-file>
+#     -> 0 ok (out written, scrubbed) | 1 scrub failed (out NOT trusted — callers must NOT post/write it)
+# Portability: perl (ships on macOS, already the timeout engine in every runner). No `sed -i`, no
+# GNU-only word-boundary tricks. Volatile $HOME/$USER are passed via ENV and quotemeta'd, never
+# interpolated into the program text, so a regex metachar in either cannot corrupt the pattern.
+scrub_evidence() {
+  local in="$1" out="$2"
+  [ -f "$in" ] && [ -r "$in" ] || { echo "REFUSE: scrub input not found or unreadable: $in" >&2; return 1; }
+  JE_SCRUB_HOME="${HOME:-}" JE_SCRUB_USER="${USER:-${LOGNAME:-}}" \
+  perl -0777 -pe '
+    my $home = quotemeta($ENV{JE_SCRUB_HOME}//"");
+    my $user = quotemeta($ENV{JE_SCRUB_USER}//"");
+    # order matters: specific (key/token, env-value) before generic path/user.
+    s/\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]\s*\S+/$1=<REDACTED>/gi; # key/token class
+    s/\b([A-Z][A-Z0-9_]{2,})=\S+/$1=<REDACTED>/g;                                            # generic UPPER_SNAKE env-value class
+    s/\b(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2})\b/<PRIVATE-IP>/g; # RFC1918
+    s/\b[A-Za-z0-9._-]+\.(?:local|lan)\b/<LAN-HOST>/gi;                                       # .local/.lan hostnames
+    s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<EMAIL>/g;                               # email
+    s/$home/<HOME>/g if length $ENV{JE_SCRUB_HOME};                                           # $HOME path
+    s{/(?:Users|home)/$user}{/$1/<USER>}g if length $ENV{JE_SCRUB_USER};                      # username in path
+    s/\b$user\b/<USER>/g if length $ENV{JE_SCRUB_USER};                                       # bare username
+  ' "$in" > "$out" || return 1
   return 0
 }
 
@@ -193,14 +223,38 @@ cmd_new() {
   : "${AREA:?new: --area required (review|runner|parse|git|skill|docs|infra)}"
   : "${EVIDENCE_FILE:?new: --evidence-file required}"
   case "$SEV" in sev1|sev2|sev3) ;; *) die "new: --sev must be sev1|sev2|sev3";; esac
-  local rc; check_evidence "$EVIDENCE_FILE"; rc=$?; [ $rc -ne 0 ] && return $rc
+  # FAIL-CLOSED pipeline: scrub FIRST, then run the proven guards over the SCRUBBED text, then
+  # file/dedup/degrade — everything downstream uses ONLY scrubbed text, so no raw evidence ever
+  # reaches gh or disk. A scrub failure NEVER posts/drafts raw (return 6, a distinct code).
+  local scrubbed; scrubbed="$(mktemp)"
+  if ! scrub_evidence "$EVIDENCE_FILE" "$scrubbed"; then
+    rm -f "$scrubbed"
+    echo "REFUSE: scrub pass failed — refusing to file/draft UNSCRUBBED evidence." >&2
+    return 6
+  fi
+  EVIDENCE_FILE="$scrubbed"                     # everything downstream now uses ONLY scrubbed text
+  local rc; check_evidence "$EVIDENCE_FILE"; rc=$?
+  if [ "$rc" -ne 0 ]; then                      # post-scrub guard STILL refused
+    if [ "${JE_ISSUE_AUTOFILE:-0}" = "1" ]; then
+      local body; body="$(render_body)"         # render from the SCRUBBED evidence
+      fallback_inbox "$TITLE" "$body"           # degrade to committed inbox DRAFT (scrubbed) — never dropped
+      echo "REFUSE-DEGRADED: guard rc=$rc after scrub; wrote scrubbed inbox draft instead of posting." >&2
+      rm -f "$scrubbed"
+      return 0                                  # finding preserved on disk; caller records a non-00 filing outcome
+    fi
+    rm -f "$scrubbed"
+    return "$rc"                                # human caller: surface the guard code (now over scrubbed text)
+  fi
   local body; body="$(render_body)"
-  if ! gh_ok; then fallback_inbox "$TITLE" "$body"; return 0; fi
+  if ! gh_ok; then fallback_inbox "$TITLE" "$body"; rm -f "$scrubbed"; return 0; fi
   resolve_repo
   local dup; dup="$(find_dup "$TITLE")"
-  if [ -n "$dup" ]; then info "duplicate of #$dup — not filing (comment there if new info)."; echo "$dup"; return 0; fi
+  if [ -n "$dup" ]; then info "duplicate of #$dup — not filing (comment there if new info)."; echo "$dup"; rm -f "$scrubbed"; return 0; fi
   ghi issue create --title "${TITLE_PREFIX}${TITLE}" \
     --label "$MARKER" --label "$SEV" --label "area:$AREA" --body "$body"
+  local crc=$?
+  rm -f "$scrubbed"
+  return $crc
 }
 
 # ---------------------------------------------------------------------------
@@ -282,6 +336,7 @@ main() {
     bootstrap)       cmd_bootstrap "$@";;
     new)             cmd_new "$@";;
     check-evidence)  check_evidence "$@";;
+    scrub-evidence)  scrub_evidence "${1:?scrub-evidence: evidence file required}" /dev/stdout || die "scrub failed";;
     next)            cmd_next "$@";;
     claim)           cmd_claim "$@";;
     release)         cmd_release "$@";;

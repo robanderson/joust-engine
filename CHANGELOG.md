@@ -4,6 +4,89 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ## Unreleased
 
+### Added
+
+- **Judging-v3: councils never deliberate** (2026-07-05/06 designs; peer-deliberation rounds
+  are retired after a live run burned hours re-arguing fixed artifacts).
+  - **Fast tally at intermediate reviews** (two-pass Round-1 review): one independent vote
+    round; a >50% majority carries one champion (identical to before); a split carries the
+    **top TWO non-vetoed** candidates into the final pool (first-place votes, then mean rank,
+    then blind label); all-vetoed carries none and round 2 proceeds on guidance alone.
+    `council.json` gains `fast_tally` + `carried`; `mapping.json` gains `carriedOver` (array).
+  - **Steelman shootout at final decision points** (plan Final rank, implement reviews,
+    single-pass Review): the vote round only SEEDS the top-2 non-vetoed finalists — then
+    ALWAYS ≥1 improvement round: a non-voting **steelman** distils the judges' cited cons
+    into per-finalist minimal change-lists (every item traceable to a con; no redesign),
+    implementers apply them to copies (staging-gated, **ratcheted** — a failed boost reverts),
+    and a **cold** blind re-judge (fresh letters, no history — only the steelman sees prior
+    verdicts) votes once. Majority → the winner ships with its improvements applied (its
+    staged artifact is replaced by the boosted version). Tie → iterate, **max 5**; still
+    tied → **`needs_orchestrator_pick`** — the orchestrator casts the deciding vote between
+    two gated, security-cleared finalists (`decided_by: "orchestrator"`; the engine never
+    self-resolves; a vetoed candidate can never be picked). A lone non-vetoed finalist gets a
+    solo polish round judged against its own pre-boost version. NO_CONSENSUS remains only for
+    all-vetoed. Implement-phase steelman ties skip Round 4 and surface the pick instead.
+  - **Brief enhancements:** the plan feasibility lens now owns demand-the-proof claim
+    auditing (verify the plan's factual claims against the snapshot); every judge brief
+    (council + legacy) gains an anti-length-bias line ("thoroughness is evidence, not word
+    count").
+- **Structural persist (issue #33) — verified dataplane, bytes stop transiting models.**
+  `persist()` writes each artifact ONCE as a single quoted heredoc and verifies it in code:
+  the helper reports `wc -c` + `shasum -a 256` per file and the engine compares against a
+  pure-JS SHA-256 it computed over the exact bytes — abbreviation/mangling/truncation is a
+  verified miss, retried once (forced onto the typed+verified path), then loudly failed.
+  Derived artifacts (`verdict.md`, `council.json`, `guidance.md`) are no longer typed by a
+  model at all: the new deterministic **`bin/je-render.mjs`** renders them ON DISK from the
+  already-verified `verdict.json`, slicing the marked renderer block out of `tournament.mjs`
+  itself (engine and renderer cannot drift; byte-parity is unit-tested). The codex judge
+  VERDICT.json read-back is likewise sha-verified before parse (a corrupted relay retries,
+  then falls back per the existing ladder). Run C measured the old path at ~35 min/checkpoint
+  for ~290KB; typed bytes drop ~60% and every remaining byte is checksummed. HELPER_MODEL
+  stays `sonnet` everywhere (operator policy: no haiku until a Haiku 5.x base).
+
+- **Official per-seat return codes (JE-RC 00–09).** Every runner script appends a terminal
+  `JOUST-RC <code> <short-reason>` line to its `_*_run.log` on **every** exit path (complementing,
+  never replacing, the existing DONE/TIMEOUT provenance markers). The engine derives RCs for
+  native/judge/helper seats from signals it already observes (agent null/throw, timeout markers,
+  schema/verdict-integrity failures, empty staging — never model-self-reported; a missing
+  `JOUST-RC` line parses as RC 09), records them in `mapping.json`, council metadata, and the
+  workflow return value, and renders an `rc_summary { seats, by_code, non00 }` table in
+  `SUMMARY.md`. Engine-fault classes (01/02 after retries, 04–09 — not honest model losses or the
+  03 turn-cap) auto-file **one deduped, privacy-scrubbed dogfood issue per class per run** to the
+  engine repo via `bin/je-issue.sh` (label `dogfood`). A NEW fail-closed scrubbing pass runs
+  **before** je-issue's existing guards, redacting `$HOME`/usernames in paths, UPPER_SNAKE env-var
+  values, `*_KEY`/`*_TOKEN`/`*_SECRET` assignments, RFC1918 private IPs, `.local`/`.lan`
+  hostnames, and emails — it **never posts unscrubbed** (degrades to a scrubbed committed-inbox
+  draft or a loud log) and an issue-filing failure **never blocks or crashes a run**. Set
+  `noAutoIssue: true` to disable auto-filing. RCs are OBSERVABILITY, not new control flow —
+  fail-safety semantics are unchanged.
+
+### Changed
+
+- **`dualSecurity: false` escape hatch** — per-run arg that drops the `security-x` seat,
+  restoring the 5-seat odd panel (an even panel can 3-3 gridlock through every
+  deliberation round; observed live, hours of final-rank deliberation). Originally an
+  interim measure for that gridlock; judging-v3 (above) retires deliberation entirely and
+  makes ties cheap (a tie just seeds the steelman shootout), so the **dual gates are the
+  default again** and the flag remains only as an explicit escape hatch. The PRIMARY
+  security veto seat cannot be disabled by any flag.
+
+- **Runner wrapper agents haiku → sonnet.** The 8 provider wrapper agents
+  (`joust-codex`, `joust-glm-*` ×4, `joust-minimax`, `joust-local`, `joust-grok`) pinned
+  `model: haiku` in their frontmatter — the last haiku sub-agents left after the
+  `HELPER_MODEL` sonnet bump. They relay runner commands/output verbatim, exactly the
+  workload haiku corrupted in issue #33, and they now also carry the council's codex
+  judge seats. All bumped to `model: sonnet`.
+
+- **Dual security gates + codex tier policy (spec addendum).** Every council now seats a
+  SIXTH judge: `security-x`, a second security gate on **codex-xhigh** (cross-family — it
+  resists assumptions natural to the Anthropic models that author most candidates). Veto is
+  the UNION of standing evidenced flags from either security seat; majority with 6 living
+  judges = 4/6 (strict >50%); the fail-closed security-DEAD policy stays keyed to the
+  primary Opus seat. Separately, **codex-xhigh is now the default codex tier everywhere**:
+  bare `codex` spec token, Top Mixed, plan/implement default pools, judge seats; codex
+  wall-clock profiles widen to 600/900/1800s.
+
 ### Fixed
 
 - **GLM runner retries timeout-class transient API errors** (issue #31). `bin/glm-run.sh`'s transient-marker matcher previously matched only `529`/`429`/`5xx`/`overloaded`, so a generic `API Error: The operation timed out.` from the z.ai endpoint killed a parallel glm-5.2 seat on first occurrence even with `retries=3` configured. The matcher now also matches `API Error: …(timed out|timeout)` on the CLI's stable `API Error:` prefix, retrying with the same bounded exponential backoff + jitter. Anchoring to the prefix keeps genuine task output, refusals, and auth text (even auth on the `API Error:` line) from self-tripping a retry, and the runner's own wall-clock SIGALRM (rc 124) still never retries. An engine-level same-provider stagger in `workflows/tournament.mjs` was evaluated and **declined** — the existing startup jitter plus this retry already address the root cause, and a stagger would mutate the shared all-provider dispatch path. `bin/glm-run.test.sh` extended with timeout-retry, wall-clock-no-retry, prefixed-auth-no-retry, and persistent-timeout-cap cases.
@@ -42,6 +125,8 @@ All notable changes to the **joust-engine** plugin are documented here.
   - Two-pass guidance is now distilled by a **separate synthesis call** (explicitly not a decision-maker; same `GUIDANCE_CAP`, schema and blind rules) — it never merges votes or picks a winner.
   - **Legacy escape:** pass `judges: 1` to keep the single blind Opus judge (byte-for-byte today's behaviour). Council size is otherwise fixed at 5 (not user-tunable).
   - Council metadata (per-judge verdicts, rounds used, vote evolution, veto events) is logged and persisted to `review-*/council.json`, and rendered in `verdict.md` / the run summaries.
+
+- **Mixed-family judging council + snapshot pinning** (2026-07-05 design). The completeness-class seat (`spec`/`completeness`) and the simplicity-class seat (`craft`/`simplicity`) in each 5-lens council now dispatch to **codex-xhigh** via the codex runner by default (brief → `VERDICT.json` → engine-side JSON-parse + shape validation → the existing `reconcileLens` + verdict-integrity guard); a seat that fails twice (parse/shape/integrity failure counts as a failed attempt) **falls back to native Opus** for that round rather than dropping the seat, logged loudly. The security veto and every verification-heavy lens (correctness/feasibility/security/risk/robustness) stay Opus. `judgeMix: 'anthropic'` forces every seat back to native Opus, **byte-identical** to pre-feature behaviour. Council metadata now records the actual model used per seat per round (`judge_model`). Separately, **every** judge's brief (council or `judges: 1` legacy) is now pinned to the tournament snapshot — the staged pool/candidate dirs, or the repoMode worktrees + base SHA — and told to never consult the live repo checkout, fixing an observed wrong-tree judging failure; a `checks_run` entry citing a path outside that scope now logs a non-fatal warning (v1 telemetry). New optional args: `judgeMix` (`'anthropic'` = all-Opus escape hatch) and `codexJudgeTimeoutSecs` (codex judge-seat wall-clock, default 1500s, separate from the attempt wall-clock).
 
 ## v0.0.1
 

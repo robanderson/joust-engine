@@ -1,10 +1,10 @@
 # Review and ranking rubric
 
-Instructions for the Opus judging at both decision points: the Phase 3 review (both modes) and the Phase 5 final rank (two pass only). Judging is a **5-lens deliberating council** (the default) or, with `judges: 1`, a **single blind Opus judge** (legacy). In every case you receive candidate solutions to one task, labelled Candidate A, B, C, and so on. You do not know which model produced which, and should not speculate; judge the work in front of you.
+Instructions for the Opus judging at both decision points: the Phase 3 review (both modes) and the Phase 5 final rank (two pass only). Judging is a **blind 6-seat council that votes once and never deliberates (judging-v3)** — the default — or, with `judges: 1`, a **single blind Opus judge** (legacy). In every case you receive candidate solutions to one task, labelled Candidate A, B, C, and so on. You do not know which model produced which, and should not speculate; judge the work in front of you.
 
 Every judge — a lone judge or any council lens — applies the **shared scoring method** below. It is the constant that keeps scoring honest and comparable across attempts and rounds.
 
-**A code-level integrity guard runs on every verdict, in every path** (the legacy judge, every council lens in round 1 and every deliberation round, guidance synthesis, and the security veto's evidence). It is not a style opinion — it only catches the narrow, observed failure shape of **schema-valid junk**: a verdict whose `reasoning` is near-empty or a placeholder token (e.g. "test") *and* whose pros/cons collapse to one duplicated value across candidates. A verdict tripping it is retried once (same path as a dead/errored judge); still junk on retry, the judge/lens is dropped and the run proceeds without it (a council recomputes its majority over the living; the legacy path degrades to a clean failure). This never rejects a genuinely terse-but-real verdict — the guard requires *both* signals together, and any real sentence clears the thresholds easily. `checks_run` is checked the same way: an empty array is rejected even though it satisfies the schema, closing the gap where the forced-evidence lever could be met with zero real evidence. See `workflows/tournament.mjs` (`verdictIntegrityIssue` / `checksRunIssue` / `vetoEvidenceIssue` / `guidanceIntegrityIssue`) for the exact, named thresholds.
+**A code-level integrity guard runs on every verdict, in every path** (the legacy judge, every council lens in the seed vote and every steelman re-judge round, guidance synthesis, and the security veto's evidence). It is not a style opinion — it only catches the narrow, observed failure shape of **schema-valid junk**: a verdict whose `reasoning` is near-empty or a placeholder token (e.g. "test") *and* whose pros/cons collapse to one duplicated value across candidates. A verdict tripping it is retried once (same path as a dead/errored judge); still junk on retry, the judge/lens is dropped and the run proceeds without it (a council recomputes its majority over the living; the legacy path degrades to a clean failure). This never rejects a genuinely terse-but-real verdict — the guard requires *both* signals together, and any real sentence clears the thresholds easily. `checks_run` is checked the same way: an empty array is rejected even though it satisfies the schema, closing the gap where the forced-evidence lever could be met with zero real evidence. See `workflows/tournament.mjs` (`verdictIntegrityIssue` / `checksRunIssue` / `vetoEvidenceIssue` / `guidanceIntegrityIssue`) for the exact, named thresholds. A **codex-xhigh** seat's verdict arrives as a `VERDICT.json` file that the engine reads, JSON-parses, and shape-validates in code (`parseCodexJudgeDump` / `verdictShapeIssue`) **before** it passes through the *same* `checksRunIssue` / `verdictIntegrityIssue` guard as a native verdict — a parse, shape, or integrity failure is treated exactly like a dead judge (retry once, then the seat **falls back to Opus** for that round rather than the lens dying).
 
 ## Shared scoring method
 
@@ -28,7 +28,7 @@ Five blind Opus judges, **one lens each**. Each lens owns a slice of the judgeme
 
 ### Two lens tables: plan vs code
 
-The tournament runs in two phases and the council uses a **different lens table for each** (same engine — same deterministic tally, veto, bounded deliberation, and NO_CONSENSUS rules; only the five lenses change). The engine selects the table by judging point: the **Plan phase** (Plan Round 1 review + Plan Final rank) uses the **plan lenses**; the **Implement phase** (Implement Round 3/4) uses the **code lenses** above.
+The tournament runs in two phases and the council uses a **different lens table for each** (same engine — same deterministic tally, veto, judging-v3 fast-tally/shootout resolution, and NO_CONSENSUS rules; only the five lenses change). The engine selects the table by judging point: the **Plan phase** (Plan Round 1 review + Plan Final rank) uses the **plan lenses**; the **Implement phase** (Implement Round 3/4) uses the **code lenses** above.
 
 **Plan council** — judges a PLAN artifact (a concrete, file-level change proposal that never touches the repo):
 
@@ -40,11 +40,41 @@ The tournament runs in two phases and the council uses a **different lens table 
 | **security-by-design** | least privilege, input validation, safe secret handling, safe execution/supply-chain posture — or a designed-in vulnerability | you hold the **veto** (evidence-backed, as for code) |
 | **simplicity** | simplicity and proportionality — is this the smallest coherent change that still fully solves the task, or is it over-engineered | reward the simplest complete approach; penalise gold-plating |
 
-The **security-by-design** lens holds the same evidence-backed veto as the code security lens: a standing `UNSAFE` (high|critical + real "file + why") flag excludes that plan from winning. Everything else in this document — the shared scoring method, `checks_run`, the deterministic >50% tally, bounded deliberation, and the NO_CONSENSUS halt — applies identically to both councils. **A plan-phase NO_CONSENSUS surfaces to the orchestrator BEFORE any implement spend** (a genuinely contested design is a human decision, not something to silently implement).
+**Dual security gates (union veto).** Every council carries TWO security seats: the primary
+Opus security lens and a cross-family `security-x` seat on codex-xhigh with the same
+mandate. A standing evidenced high/critical `UNSAFE` flag from EITHER gate excludes the
+candidate; under judging-v3 there is no deliberation, so a standing evidenced round-1 flag
+is final for that vote round. With six living judges the strict >50% majority is 4/6 (an
+even-panel split is cheap now — it simply seeds or iterates the steelman shootout).
+The fail-closed security-DEAD policy keys to the primary Opus seat; the codex gate falls
+back to Opus on failure like any codex seat.
 
-Every verdict — round 1 and every deliberation round — must include **`checks_run`**: the commands you ran / files you read, each with its key result. This is a forced-evidence lever; never leave it empty. Cast a single first-place **`vote`** (one candidate letter) and give a full **`ranking`**.
+The **security-by-design** lens holds the same evidence-backed veto as the code security lens: a standing `UNSAFE` (high|critical + real "file + why") flag excludes that plan from winning. Everything else in this document — the shared scoring method, `checks_run`, the deterministic >50% tally, the judging-v3 fast-tally/shootout resolution, and the NO_CONSENSUS halt — applies identically to both councils. **A plan-phase NO_CONSENSUS surfaces to the orchestrator BEFORE any implement spend** (a genuinely contested design is a human decision, not something to silently implement).
 
-**You never tally.** Do NOT count votes, average rankings, "reach consensus", or name an overall council winner. The winner is computed **deterministically in code** from all five votes plus the veto. Your only job is to cast the most honest vote your lens supports and to argue it well.
+### Mixed-family seats (codex-xhigh)
+
+By **default**, each council seats **six judges**: five lens seats plus a SECOND security
+gate, with three seats on **codex-xhigh** (a different model family from the Anthropic models that author most plans/implementations) via the bundled codex runner, so a non-Anthropic model checks the completeness-class and simplicity-class judgements:
+
+| Council | codex-xhigh seats | Stay Opus |
+|---|---|---|
+| **Plan** | **completeness**, **simplicity**, **security-x** (2nd security gate) | feasibility, risk, security-by-design |
+| **Code** | **spec**, **craft**, **security-x** (2nd security gate) | correctness, security, robustness |
+
+- The **security veto never moves off Anthropic** — `security` (both councils) is always a native Opus seat; no runtime flag can route the veto to codex.
+- The verification-heavy lenses (correctness/feasibility/security/risk/robustness) stay Opus — the judge-model experiment showed the codex gap concentrates exactly there.
+- A codex seat runs the **same lens prompt**, writing its verdict to `VERDICT.json`; the engine parses + shape-validates it and runs it through the same `reconcileLens` + integrity guard as a native verdict. A codex seat that fails twice **falls back to native Opus for that round** rather than dropping the seat.
+- **`judgeMix: 'anthropic'`** forces every seat back to native Opus — byte-for-byte the pre-mixed-family behaviour (and it also omits the new `judge_model` metadata field, so the emitted JSON shape is identical too).
+- Council metadata records the **actual model used per seat per round** (`judge_model` in `review-*/council.json` and `verdict.md`).
+- The tally is unchanged: **no LLM aggregates votes** regardless of which family produced a verdict — `councilTally` (code) is still the only tally.
+
+### Pinned evaluation scope (every judge)
+
+Every judge — a council lens *or* the legacy `judges: 1` judge, both families — is told its evaluation is **pinned to this tournament's snapshot**: the blind `_pool.md` and the per-candidate directories (plus, in repo-anchored mode, the isolated worktrees at the base commit SHA). A judge must **not** consult the live/current repo checkout, whose state may have moved past what any candidate was actually judged against (a real observed failure: a verifying judge checked the live checkout and penalised the true winner). If a judge runs a verification command, it runs it inside a listed candidate directory and cites that exact path in `checks_run`; a `checks_run` entry citing a path **outside** the pinned scope logs a **non-fatal warning** (v1 telemetry — `checksRunRootsIssue`), it does not fail the verdict.
+
+Every verdict — the seed vote and every steelman re-judge round — must include **`checks_run`**: the commands you ran / files you read, each with its key result. This is a forced-evidence lever; never leave it empty. Cast a single first-place **`vote`** (one candidate letter) and give a full **`ranking`**.
+
+**You never tally.** Do NOT count votes, average rankings, "reach consensus", or name an overall council winner. The winner is computed **deterministically in code** from the living judges' votes plus the veto. Your only job is to cast the most honest vote your lens supports and to argue it well.
 
 ### Round 1 — independent
 
@@ -52,23 +82,26 @@ Vote with no visibility into your peers. Return: per-candidate pros/cons (throug
 
 **Security lens additionally** returns a `safety` entry per candidate: `{label, safety: SAFE | UNSAFE, severity: high|critical (UNSAFE only), evidence: file + concrete why (UNSAFE only)}`. Flag `UNSAFE` only with **evidence you can point to** — a real vulnerability, an injected-execution path, a secret/credential exposure, or a supply-chain/build-config risk. A standing `UNSAFE` flag (high|critical, with evidence) **excludes that candidate from winning regardless of votes**, so do not flag on suspicion alone — but when you are unsure whether something is exploitable, flag it and cite why (fail-closed). Because a veto can silently exclude the real winner, the tally code additionally requires the `evidence` string to be substantive (not empty, not a placeholder token, not a bare word or two) — a schema-valid-but-vacuous `evidence` string does **not** make the veto stand; write a real "file + why" every time.
 
-### Deliberation — bounded, at most 3 rounds
+### After the vote: judging-v3 — councils NEVER deliberate
 
-The deterministic tally runs after every round. If no candidate has a **>50% majority** of the living judges' first-place votes on a **non-vetoed** candidate, a deliberation round runs. In it:
+Peer-deliberation rounds are retired (observed live: hours of judges re-arguing FIXED artifacts with no mechanism to improve anything). What happens after the single independent vote round depends on the decision point:
 
-- You see **all peers' latest full verdicts** (verbatim JSON, blind — letters only).
-- Address the disagreements in **`response_to_peers`**: convince your peers or be convinced. Converge on the *correct* call — do not hold a position out of stubbornness, and do not cave to a majority you believe is wrong. Set `changed_this_round` / `changed_from_round1` truthfully.
-- You **may run 1-2 targeted checks** to settle a factual dispute (record them in `checks_run`).
-- **Veto rebuttal:** a peer may rebut a security veto with evidence. If it genuinely refutes the flag, the security judge **withdraws** it (drops the `UNSAFE` entry); a flag still believed **stands** and keeps excluding the candidate at the final tally.
+**Intermediate review (two-pass Round-1 review) — FAST TALLY.** One vote round, then the deterministic tally: a **>50% majority** on a non-vetoed candidate carries that single champion into the final pool (identical to before); **no majority carries the TOP TWO non-vetoed candidates** (most first-place votes, then best mean rank across living judges, then blind label). All candidates vetoed → **nothing** is carried and round 2 proceeds on guidance alone (never a halt). The intermediate review's job is distilling guidance and carrying champion(s) — forcing consensus there wasted tokens and discarded the runner-up nearly half the panel preferred. `council.json` records `fast_tally: true` + `carried: [letters]`.
 
-After **3** deliberation rounds still split (no majority, or the only would-be winner is vetoed, or *every* candidate is vetoed) → **NO_CONSENSUS**. This is never silently resolved by Borda, averaging, or a meta-judge: the run surfaces the full split (interactive) or routes the loop to needs-human + HALT (grand loop).
+**Final decision point (plan Final rank, implement-round reviews, single-pass Review) — the STEELMAN SHOOTOUT.** The vote round only **seeds** the top-2 non-vetoed finalists (a majority just means seed #1). Then, ALWAYS at least one improvement round:
+
+1. A non-voting **steelman** (a synthesis helper like the guidance distiller — never votes, never ranks) turns the judges' cited cons on each finalist into a **minimal change-list** (every item traceable to a cited con; no redesign, no new features).
+2. One implementer per finalist applies its change-list to a **copy**; a boost that fails the staging gate is discarded and that finalist re-enters at its last gated version (**ratchet** — an iteration can never worsen a candidate).
+3. **Cold re-judge:** the boosted finalists are re-pooled under fresh blind letters and judged in one independent vote round — no prior verdicts, no peer block, no iteration hints (only the steelman ever sees history).
+4. Majority → winner (its polished artifact replaces the staged original — a shipped winner never carries the cons the judges already documented). Tie → iterate, **max 5 rounds**; still tied → **`needs_orchestrator_pick`**: the orchestrator (interactive SKILL / grand-loop driver) casts the deciding vote between two gated, security-cleared finalists, recorded as `decided_by: "orchestrator"`. A **lone** non-vetoed finalist still gets one solo polish round, judged against its own pre-boost version.
+
+`council.json` records the full loop: `steelman.rounds[]` (per-iteration change-lists, gate results, runoff votes), `seeds`, `decided_by`.
 
 ### Tally & veto rules (deterministic, run in code — described here for context only)
 
-- **Majority** = strictly **>50%** of the *living* judges' first-place votes (3 of 5 when all alive; recomputed against the living count if a judge dies).
-- **Veto filter:** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from the security judge cannot win, whatever its vote count.
-- Majority on a non-vetoed candidate → that candidate wins. All candidates vetoed, or still no majority after 3 deliberation rounds → NO_CONSENSUS.
-- The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override; the winner slot is only ever filled by a majority non-vetoed winner.
+- **Majority** = strictly **>50%** of the *living* judges' first-place votes (recomputed against the living count if a judge dies).
+- **Veto filter (absolute):** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from EITHER security gate cannot win, be carried, or be picked by the orchestrator, whatever its vote count. Both steelman finalists vetoed in a runoff (or every candidate vetoed at a final-rank seed vote) → **NO_CONSENSUS** / needs-human — the only remaining NO_CONSENSUS path.
+- The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override.
 
 ## Single blind judge (`judges: 1`, legacy)
 
@@ -132,6 +165,6 @@ Keep each list to **at most five** corroborated, sharp items — fewer is better
 
 ## Phase 5: final rank (two pass only)
 
-The final pool is N fresh round-two attempts plus one carried-over winner from round one, all blind-labelled together. The council (or the lone judge) ranks them on the merits using the shared scoring method, with the **same tally, veto, deliberation, and NO_CONSENSUS rules** as Phase 3. Do not try to guess which one is the carryover; it competes like any other. A carried-over champion competes blind on the merits — it produced no worse work for not having seen the guidance, and a genuinely better guided round-two attempt should win.
+The final pool is N fresh round-two attempts plus up to TWO carried-over champions from round one (the fast tally carries the top two non-vetoed on a split), all blind-labelled together. The council (or the lone judge) ranks them on the merits using the shared scoring method, with the **same tally, veto, steelman-shootout, and NO_CONSENSUS rules** as Phase 3. Do not try to guess which are the carryovers; they compete like any other. A carried-over champion competes blind on the merits — it produced no worse work for not having seen the guidance, and a genuinely better guided round-two attempt should win.
 
 Be fair and specific in every pass. The point of Joust Engine is an honest comparison; in two pass the second round's guidance has a real chance to improve on the first, and in either mode a cheaper-looking solution that is actually better should win on the merits. The council does not exist to manufacture agreement — an honest NO_CONSENSUS that reaches a human beats a rubber-stamped winner.

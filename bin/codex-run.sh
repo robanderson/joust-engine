@@ -9,8 +9,22 @@ FLAG="${*:--m gpt-5.5 -c model_reasoning_effort=medium}"
 LOG=_codex_run.log
 LAST=_codex_last.txt
 TIMEOUT="${JE_TIMEOUT_SECS:-600}"   # wall-clock backstop (seconds) — the only per-attempt guard
-[ -f _brief.txt ] || { echo "JOUST-CODEX-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
-command -v codex >/dev/null 2>&1 || { echo "JOUST-CODEX-ERROR codex CLI not found on PATH" | tee -a "$LOG"; exit 5; }
+
+# ---- JE-RC observability: append exactly one terminal `JOUST-RC <code> <reason>` line on EVERY exit
+# path (complements the JOUST-CODEX-DONE/TIMEOUT markers). `JOUST-` is deliberately NOT rebranded, so
+# this marker is byte-identical prod vs dev-rebranded. `_rc_emitted` is a plain lowercase var so
+# rebrand's JE_->DE_ rule cannot touch it. Missing line parses as RC 09 in the engine (a runner bug).
+_rc_emitted=0
+emit_rc() {                     # emit_rc <code> <reason>; idempotent (first call wins)
+  [ "$_rc_emitted" = "1" ] && return 0
+  _rc_emitted=1
+  printf 'JOUST-RC %s %s\n' "$1" "$2" >> "$LOG"
+}
+trap 'emit_rc 08 signal-abort' INT TERM
+trap 'emit_rc 09 unclassified' EXIT
+
+[ -f _brief.txt ] || { echo "JOUST-CODEX-ERROR _brief.txt missing" | tee -a "$LOG"; emit_rc 07 missing-brief; exit 4; }
+command -v codex >/dev/null 2>&1 || { echo "JOUST-CODEX-ERROR codex CLI not found on PATH" | tee -a "$LOG"; emit_rc 07 missing-runner; exit 5; }
 
 # Write the PROVENANCE marker UNCONDITIONALLY, up front: a missing log at this path proves the runner
 # never ran (a native-solve spoof or refusal) and must fail closed (P=0) downstream.
@@ -62,8 +76,14 @@ RC=$?
 if [ ! -s "$LAST" ] && grep -qiE 'requires a newer version of Codex|is not supported when using Codex with a|invalid_api_key|401 Unauthorized|403 Forbidden' "$LOG"; then
   echo "JOUST-CODEX-ERROR codex reported a model/auth/version failure (see log)" >> "$LOG"
   [ "$RC" -eq 0 ] && RC=6
+  emit_rc 02 provider-auth-endpoint
 fi
 
 [ "$RC" -eq 124 ] && echo "JOUST-CODEX-TIMEOUT secs=${TIMEOUT}" >> "$LOG"
+# Classify (the 02 force-fail above, if any, already won idempotently). Codex has no --max-turns, so
+# turn-cap (03) is N/A here.
+if [ "$RC" -eq 0 ]; then emit_rc 00 ok
+elif [ "$RC" -eq 124 ]; then emit_rc 01 wall-clock-timeout
+else emit_rc 09 runner-error; fi
 echo "JOUST-CODEX-DONE exit=$RC" >> "$LOG"
 tail -20 "$LOG"

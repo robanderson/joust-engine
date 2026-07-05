@@ -35,7 +35,7 @@ The `--model opus/sonnet/haiku` aliases resolve to GLM models only because the `
 
 **Grok models (xAI, via the `grok` headless CLI)** — dispatched by shelling out to `grok -p` through `bin/grok-run.sh`. TWO variants on a **`-m` model axis**: `grok-build` (xAI's own agentic-coding model; `grok-code-fast-1` is an alias; 256K context) and `grok-composer-2.5-fast` (Cursor Composer 2.5, Kimi K2.5 lineage; the CLI default). The `displayModel` **is** the dispatch key: `GROK_FLAG[displayModel]` → `-m <id>`. Auth is the operator's grok.com **OAuth session** (`~/.grok/auth.json`, `auth_mode=oidc`); `XAI_API_KEY` (prefix `xai-`) is the headless/CI fallback — the runner injects **neither** and requires **neither** (grok resolves its own credential, exactly like codex reads `~/.codex/auth.json`, so — unlike glm/minimax — it does NOT hard-fail on a missing env key). Default inference flows over `cli-chat-proxy.grok.com` (NOT `api.x.ai`). **One generic worker agent (`joust-grok`) handles both variants**; the provenance marker is `JOUST-GROK-PROVENANCE endpoint=cli-chat-proxy.grok.com` in `_grok_run.log`. Unlike codex, grok **HAS `--max-turns`**, so it uses **both** per-attempt guards (`grokMaxTurns`, default 30, via `JE_MAX_TURNS`; `grokTimeoutSecs`, default 600, via `JE_TIMEOUT_SECS`) through the standard `runnerCmd`. Grok bills the operator's SuperGrok / X Premium+ plan.
 
-The Phase 3 reviewer (single pass and two pass) and the final ranker (Phase 5, two pass only) are **always Anthropic Opus**, dispatched via the Task tool — never GLM. By default each is a **5-lens deliberating council** of blind Opus judges (see "Dispatching the Opus passes" below); `judges: 1` selects the legacy single blind Opus judge. Holding the judge model fixed on Opus keeps scoring consistent across attempts and across rounds.
+The Phase 3 reviewer (single pass and two pass) and the final ranker (Phase 5, two pass only) are **always Anthropic Opus**, dispatched via the Task tool — never GLM. By default each is a **blind 6-seat council that votes once and never deliberates (judging-v3)** (see "Dispatching the Opus passes" below); `judges: 1` selects the legacy single blind Opus judge. Holding the judge model fixed on Opus keeps scoring consistent across attempts and across rounds.
 
 ## Dynamic-workflow dispatch (preferred backend)
 
@@ -66,7 +66,11 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   contextFiles: ["<path>", ...],         // optional: known input files all workers need (see below)
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
-  codexRunner: "<plugin-root>/bin/codex-run.sh",  // REQUIRED if any attempt is Codex
+  codexRunner: "<plugin-root>/bin/codex-run.sh",  // REQUIRED if any attempt is Codex — AND now also
+                                          // used by the judging council's codex-xhigh seats (spec/craft,
+                                          // completeness/simplicity) by default; pass it even if no
+                                          // attempt is Codex, or those seats silently run native Opus
+                                          // (logged once) instead of mixed-family judging.
   minimaxRunner: "<plugin-root>/bin/minimax-run.sh", // REQUIRED if any attempt is MiniMax
   grokRunner: "<plugin-root>/bin/grok-run.sh",    // REQUIRED if any attempt is Grok
   // Per-attempt guards — SET FROM THE TASK-SIZE PROFILE (SKILL Phase 1c). Resolve the whole set with
@@ -83,10 +87,33 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   codexTimeoutSecs: 600,                 // wall-clock backstop for Codex; engine fallback 600 (codex has no turn cap)
   grokTimeoutSecs: 600,                  // wall-clock backstop for Grok; engine fallback 600 (grok ALSO honours grokMaxTurns)
   grokWebSearch: false,                  // optional — true enables grok web search (default false = hermetic, like the other providers)
-  judges: 5,                             // optional — judging council size. DEFAULT (omit) = the 5-lens deliberating
-                                         // Opus council at both decision points. Set `1` for the LEGACY single blind
-                                         // Opus judge (byte-for-byte the pre-council behaviour). Any value other than
-                                         // 1 selects the 5-lens council (council size is fixed at 5, not tunable).
+  judges: 5,                             // optional — judging council size. DEFAULT (omit) = the blind 6-seat
+                                         // judging-v3 council (5 lenses + security-x; votes once, never deliberates)
+                                         // at both decision points. Set `1` for the LEGACY single blind Opus judge
+                                         // (byte-for-byte the pre-council behaviour). Any value other than 1 selects
+                                         // the council (size fixed at 6, or 5 with dualSecurity: false — not tunable).
+  judgeMix: 'anthropic',                 // optional — forces every council seat to native Opus,
+                                         // byte-identical to pre-mixed-family behaviour. DEFAULT (omit)
+                                         // = the mixed assignment (codex-xhigh on the completeness-class
+                                         // /simplicity-class seats: spec+craft for code, completeness+
+                                         // simplicity for plan). Ignored when judges:1.
+  codexJudgeTimeoutSecs: 1500,           // optional — wall-clock for a codex-xhigh JUDGE seat (separate
+                                         // from codexTimeoutSecs, the ATTEMPT wall-clock); engine
+                                         // fallback 1500 (judging reads a whole blind pool + reasons at
+                                         // xhigh effort, so it gets more headroom than an attempt).
+  issueRunner: "<plugin-root>/bin/je-issue.sh", // optional but recommended — enables auto-filing of
+                                         // engine-fault RC classes (01/02 after retries, 04–09) as ONE
+                                         // deduped, privacy-scrubbed `dogfood` issue per class per run.
+                                         // Absent => auto-filing is skipped (logged once). Fire-and-forget:
+                                         // a filing failure never blocks or crashes the run.
+  engineRepo: "robanderson/joust-engine", // optional — owner/repo the auto-issues are pinned to (GH_REPO);
+                                         // default = the public canonical engine repo.
+  noAutoIssue: false,                    // optional — set true to disable auto-filing entirely (RCs are
+                                         // still derived, recorded, and reported; only the GitHub filing is off).
+  // STRUCTURAL PERSIST (#33): passing ANY runner path also enables on-disk artifact derivation —
+  // persist() writes each JSON once (single quoted heredoc, engine-side SHA-256 verified, retried on
+  // mismatch) and derives verdict.md / council.json / guidance.md ON DISK via bin/je-render.mjs, so
+  // report bytes never transit a model. A run with no runner paths degrades to typed+verified writes.
   attempts: [                            // one per attempt, length N
     { label: "candidate-1",
       dispatch: "anthropic",             // native, runs in-process
@@ -133,7 +160,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 
 - When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
 - **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
-- **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`). The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`).
+- **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`), and a plan-final steelman tie returns `needs_orchestrator_pick` the same way. The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`, `needs_orchestrator_pick?`).
 
 **Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `joust-engine:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):
 
@@ -231,6 +258,30 @@ and overwritten files.
 Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and that is the
 result. `repoMode:true` uses `worktreeRoot` (default `/tmp/je-worktrees/<run-id>`) for the
 same reason and in the same shape — see the repo-anchored-mode notes below.
+
+## Return codes (JE-RC) and `rc_summary`
+
+Every seat (attempt, judge lens, helper, auto-issue filing) ends with an OFFICIAL two-digit return
+code. Runner attempts self-report a terminal `JOUST-RC <code> <reason>` line in their `_*_run.log`;
+native/judge/helper seats have their RC **derived in code** from signals the engine already observes
+(a missing runner line parses as `09`). RCs are **observability, not control flow** — fail-safety is
+unchanged except where behaviour already branches (retries, fallbacks, the auto-issue hook).
+
+| RC | meaning | RC | meaning |
+|----|---------|----|---------|
+| 00 | expected result | 05 | no deliverable saved |
+| 01 | model timeout (wall-clock) | 06 | provenance failure |
+| 02 | model unavailable / throttled | 07 | environment / permission failure |
+| 03 | turn-cap exhausted | 08 | aborted / killed |
+| 04 | invalid output | 09 | unknown / other |
+
+The workflow **return value** and `mapping.json` now carry
+`rc_summary { seats, by_code: {"01":2,…}, non00: [{seat, phase, rc, reason}] }`, and `SUMMARY.md`
+renders it as a per-seat table (blind-safe: seat ids are candidate letters / `label:lens` / helper
+labels, never a model identity). Per-candidate `rc`/`rcReason` appear on each `mapping.json` row; each
+council round records `dead_seats` + a per-verdict `rc`. Engine-fault classes (01/02 after retries,
+04–09 — not 00/03) auto-file one deduped, privacy-scrubbed `dogfood` issue per class per run via
+`issueRunner` (respects `noAutoIssue`, pinned to `engineRepo`, fail-closed — see `references/dogfood.md`).
 
 ## Dispatching the attempts
 
@@ -339,16 +390,18 @@ Each judge's returned winner/ranking is reconciled against the real blind-label 
 
 **Residual blindness caveats (advisory, not enforced).** Two things the prompt asks for but cannot mechanically guarantee: (a) each judge has `Read`/`Bash` and the absolute `runDir`, so it *could* walk to a sibling `round-*/candidate-*/` and read a provenance log — the prompt tells it not to read anything outside the pool, but that is honour-system; (b) the blind letter is decorrelated from dispatch order by a constant rotation, and each council lens additionally gets a *differently-rotated* candidate listing (position-bias control), but the *presentation order* in the shared `_pool.md` is fixed — so any residual positional bias is uncorrected (and reproducible) — weight on merits, not order.
 
-**The judging council (default) — the shape at both decision points.** Judging is a **5-lens deliberating Opus council** unless `judges: 1` is passed. All five lenses read the same staged blind `_pool.md`; the pipeline is:
+**The judging council (default) — the shape at both decision points.** Judging is a **blind 6-seat council that votes once and never deliberates (judging-v3)** unless `judges: 1` is passed. All lenses read the same staged blind `_pool.md`; the pipeline is:
 
 1. **Round 1 (independent).** Five Opus judges — **correctness, spec, security, robustness, craft** — run in parallel with no peer visibility. Each returns per-candidate pros/cons through its lens, a full ranking, a first-place `vote`, `reasoning`, and a required `checks_run[]`. The **security** lens also returns per-candidate `safety` (`SAFE`/`UNSAFE` + severity + evidence).
+   - **Seat routing (mixed-family, default).** The completeness-class seat (spec for code, completeness for plan) and the simplicity-class seat (craft for code, simplicity for plan) dispatch to **codex-xhigh** via the codex runner by default (brief → `VERDICT.json` → engine-side parse/shape validation → the same `reconcileLens` + integrity guard as a native verdict). A seat that fails twice falls back to native Opus for that round so the council never loses a seat. The security veto and the verification-heavy lenses stay Opus, and no runtime flag moves the PRIMARY veto off Anthropic. Each council also seats a SIXTH judge — `security-x`, a second cross-family security gate on codex-xhigh with the same mandate and its own veto (UNION: a standing evidenced flag from either gate excludes; 6 living judges => majority 4/6). `judgeMix: 'anthropic'` disables this and forces every seat native, byte-for-byte. `dualSecurity: false` drops ONLY the `security-x` seat (restoring the 5-seat odd panel; an escape hatch — under judging-v3 a tied even panel is cheap, it just seeds the steelman shootout, so the dual gates run by default); the primary security veto seat cannot be disabled.
 2. **Tally (plain code, every round).** Majority = strictly **>50%** of the *living* judges' first-place votes on a candidate the security lens has **not** vetoed. No LLM ever aggregates votes — the tally and the veto are deterministic code in `tournament.mjs` (`councilTally`).
-3. **Deliberation (max 3 rounds).** No majority (or the leader is vetoed) → each judge sees peers' verbatim verdicts, addresses disagreements in `response_to_peers`, may run 1–2 checks, and revises (`changed_this_round`/`changed_from_round1`). Peers may rebut a veto with evidence; a refuted flag is withdrawn, a standing one keeps excluding the candidate.
-4. **NO_CONSENSUS.** Still split after 3 deliberation rounds, or every candidate vetoed → the workflow returns `no_consensus: true` with `winner: null` (never a synthesised/averaged winner). Interactive runs surface the split; a grand loop routes the loop to needs-human + HALT.
-5. **Judge death.** Each lens retries once; a still-dead lens drops and the majority recomputes over the living. Exception: the security lens dying in repo-anchored mode is unresolvable veto coverage → fail closed to NO_CONSENSUS; an isolated run proceeds with a loud logged warning.
-6. **Guidance (two pass).** A *separate* synthesis call (explicitly not a decision-maker) distils the round-2 guidance from the five final verdicts under the same cap/schema/blind rules — it never picks or changes a winner.
+3. **Resolution (judging-v3 — councils never deliberate).** Intermediate reviews FAST-TALLY (majority carries 1; split carries the top-2 non-vetoed into the final pool — `carried` in the result + `carriedOver` in mapping.json). Final decision points run the STEELMAN SHOOTOUT (seed top-2 → boost from judges' cons → cold blind re-judge; max 5 rounds); a 5-round tie returns `needs_orchestrator_pick: {finalists, gated_ws, verdicts}` — the ORCHESTRATOR picks between the gated, security-cleared finalists (never the engine, never an LLM aggregation; a vetoed candidate can never be picked). `no_consensus: true` with `winner: null` remains ONLY for all-vetoed (interactive: surface the split; grand loop: needs-human + HALT).
+4. **Judge death.** Each lens retries once; a still-dead lens drops and the majority recomputes over the living. Exception: the security lens dying in repo-anchored mode is unresolvable veto coverage → fail closed to NO_CONSENSUS; an isolated run proceeds with a loud logged warning.
+5. **Guidance (two pass).** A *separate* synthesis call (explicitly not a decision-maker) distils the round-2 guidance from the final verdicts under the same cap/schema/blind rules — it never picks or changes a winner.
 
-Council metadata (per-judge verdicts, per-round tally, vote evolution, veto events, `no_consensus`) is logged and persisted (`review-*/council.json`, `verdict.md`, the run summaries). The consolidated `ranking` downstream consumers read is derived in code (winner first, then remaining by first-place votes, average rank, blind label); it is bookkeeping, not a consensus override — the winner slot is only ever a majority non-vetoed candidate.
+Council metadata (per-judge verdicts, per-round tally, vote evolution, veto events, `no_consensus`) is logged and persisted (`review-*/council.json`, `verdict.md`, the run summaries), including, per verdict, the actual judge model used that round (`judge_model` — `opus` or `codex-xhigh`). The consolidated `ranking` downstream consumers read is derived in code (winner first, then remaining by first-place votes, average rank, blind label); it is bookkeeping, not a consensus override — the winner slot is only ever a majority non-vetoed candidate.
+
+**Snapshot pinning (every judge).** Every judge brief — council lens or legacy `judges: 1`, native Opus or codex-xhigh — pins the evaluation to the tournament snapshot: the staged `_pool.md` + the per-candidate directories (plus, in repo-anchored mode, the isolated worktrees at the base commit SHA), and explicitly forbids consulting the live/current repo checkout (whose state may have moved past what any candidate was judged against — the observed wrong-tree judging failure). The pinned scope is built by `pinnedScopeBlock` (wired into both `lensPrompt` and `judgePrompt`). A `checks_run` entry citing a path outside that scope logs a **non-fatal** warning (v1 telemetry — `checksRunRootsIssue`); it never fails the verdict.
 
 **Legacy single judge (`judges: 1`).** One blind Opus agent does the whole job at each point — the pre-council path, byte-for-byte. Spawn it with the candidates and `references/review-rubric.md`: it returns per-candidate pros/cons, ranking, and winner (and in two pass the two guidance lists). Do not pass model identities to it. The final ranker (Phase 5) builds the pool of N round-two attempts plus the one saved round-one winner, re-labelled blind, and ranks it the same way.
 

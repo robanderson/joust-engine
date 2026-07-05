@@ -11,12 +11,25 @@ LOG=_minimax_run.log
 TIMEOUT="${JE_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
 MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 
+# ---- JE-RC observability: append exactly one terminal `JOUST-RC <code> <reason>` line on EVERY exit
+# path (complements the JOUST-MINIMAX-DONE/TIMEOUT markers). `JOUST-` is deliberately NOT rebranded, so
+# this marker is byte-identical prod vs dev-rebranded. `_rc_emitted` is a plain lowercase var so
+# rebrand's JE_->DE_ rule cannot touch it. Missing line parses as RC 09 in the engine (a runner bug).
+_rc_emitted=0
+emit_rc() {                     # emit_rc <code> <reason>; idempotent (first call wins)
+  [ "$_rc_emitted" = "1" ] && return 0
+  _rc_emitted=1
+  printf 'JOUST-RC %s %s\n' "$1" "$2" >> "$LOG"
+}
+trap 'emit_rc 08 signal-abort' INT TERM
+trap 'emit_rc 09 unclassified' EXIT
+
 # MINIMAX_API_KEY comes from the environment — exactly like glm-run.sh reads ZAI_API_KEY. The user's
 # ~/.zshrc exports it (alongside ZAI_API_KEY / OMLX_AUTH_TOKEN) and the Claude Code session inherits it
 # at launch. If it is missing, the session predates the export: relaunch from a shell that has it. Do
 # NOT add bespoke key-loading (sourcing/grepping rc files) here — keep every provider runner uniform.
-if [ -z "${MINIMAX_API_KEY:-}" ]; then echo "JOUST-MINIMAX-ERROR MINIMAX_API_KEY missing (export in ~/.zshrc and relaunch)" | tee -a "$LOG"; exit 3; fi
-[ -f _brief.txt ] || { echo "JOUST-MINIMAX-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
+if [ -z "${MINIMAX_API_KEY:-}" ]; then echo "JOUST-MINIMAX-ERROR MINIMAX_API_KEY missing (export in ~/.zshrc and relaunch)" | tee -a "$LOG"; emit_rc 07 missing-key; exit 3; fi
+[ -f _brief.txt ] || { echo "JOUST-MINIMAX-ERROR _brief.txt missing" | tee -a "$LOG"; emit_rc 07 missing-brief; exit 4; }
 
 echo "JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io model=MiniMax-M3 max-turns=${MAXTURNS} timeout=${TIMEOUT}s" >> "$LOG"
 # Portable hard timeout (no coreutils `timeout` on macOS): fork the call, SIGALRM -> TERM/KILL.
@@ -41,5 +54,9 @@ perl -e '
 ' "$TIMEOUT" claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
 RC=$?
 [ "$RC" -eq 124 ] && echo "JOUST-MINIMAX-TIMEOUT secs=${TIMEOUT}" >> "$LOG"
+if [ "$RC" -eq 0 ]; then emit_rc 00 ok
+elif [ "$RC" -eq 124 ]; then emit_rc 01 wall-clock-timeout
+elif grep -q 'Reached max turns' "$LOG"; then emit_rc 03 turn-cap
+else emit_rc 09 runner-error; fi
 echo "JOUST-MINIMAX-DONE exit=$RC" >> "$LOG"
 tail -20 "$LOG"

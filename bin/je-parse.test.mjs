@@ -150,8 +150,8 @@ parseCase('prose marker upper', 'refactor this JOUST:5',
 // --- prose model spec (Feature 2) ---
 parseCase('spec headline', 'build a parser with 2 opus, 2 glm 5.2, 1 codex high @@JE',
   { n: 5, mode: 1, z: 1, assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
-parseCase('spec bare codex -> medium', 'do abc, 1 opus and 1 sonnet and 1 codex joust:3',
-  { n: 3, mode: 1, z: 1, assignment: ['opus', 'sonnet', 'codex-medium'] }, { noErrors: true });
+parseCase('spec bare codex -> xhigh (2026-07-05 tier policy)', 'do abc, 1 opus and 1 sonnet and 1 codex joust:3',
+  { n: 3, mode: 1, z: 1, assignment: ['opus', 'sonnet', 'codex-xhigh'] }, { noErrors: true });
 parseCase('spec bare glm -> 5.2', 'do x with 3 glm @@JE',
   { n: 3, z: 1, assignment: ['glm-5.2', 'glm-5.2', 'glm-5.2'] }, { noErrors: true });
 parseCase('spec minimax', 'do y with 2 minimax @@JE',
@@ -171,9 +171,9 @@ parseCase('spec grok strips spec from task', '@@JE 2 grok improve the parser',
 
 // --- Top Mixed preset ---
 parseCase('top mixed N=6', 'do abc top mixed @@JE:6',
-  { n: 6, z: 1, preset: 'top-mixed', assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high', 'codex-high'] }, { noErrors: true });
+  { n: 6, z: 1, preset: 'top-mixed', assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-xhigh', 'codex-xhigh'] }, { noErrors: true });
 parseCase('top mixed leadcount 5', 'do abc 5 top mixed @@JE',
-  { n: 5, z: 1, preset: 'top-mixed', assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
+  { n: 5, z: 1, preset: 'top-mixed', assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-xhigh'] }, { noErrors: true });
 parseCase('top mixed N=2', 'do abc with top-mix @@JE:2',
   { n: 2, z: 1, preset: 'top-mixed', assignment: ['opus', 'glm-5.2'] }, { noErrors: true });
 
@@ -300,7 +300,7 @@ parseCase('Nx chained spec', 'build a parser with 2x opus and 1x codex high @@JE
   { task: 'build a parser', n: 3, z: 1, assignment: ['opus', 'opus', 'codex-high'] }, { noErrors: true });
 parseCase('Nx chained four with M=2', 'build x with 2x opus, 2x sonnet, 2x codex, 2x minimax @@JE:8:2',
   { n: 8, mode: 2, z: 1,
-    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-medium', 'codex-medium', 'minimax-m3', 'minimax-m3'] },
+    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-xhigh', 'codex-xhigh', 'minimax-m3', 'minimax-m3'] },
   { noErrors: true });
 // 'Nx' agrees with an explicit marker N -> no conflict.
 parseCase('Nx agrees with marker N', 'do x with 2x opus and 1x sonnet @@JE:3',
@@ -402,8 +402,8 @@ unit('normalise grok-composer-2.5-fast dash', normaliseModel('grok-composer-2.5-
 unit('normalise bare composer -> grok-composer', normaliseModel('composer 2.5 fast') && normaliseModel('composer 2.5 fast').model === 'grok-composer-2.5-fast');
 unit('normalise unknown -> null', normaliseModel('gpt4') === null);
 unit('topMixed N=2', eq(topMixedAssignment(2), ['opus', 'glm-5.2']));
-unit('topMixed N=6', eq(topMixedAssignment(6), ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high', 'codex-high']));
-unit('topMixed N=5', eq(topMixedAssignment(5), ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high']));
+unit('topMixed N=6', eq(topMixedAssignment(6), ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-xhigh', 'codex-xhigh']));
+unit('topMixed N=5', eq(topMixedAssignment(5), ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-xhigh']));
 unit('expandSpec basic', eq(expandSpec('2 opus, 1 sonnet').assignment, ['opus', 'opus', 'sonnet']));
 unit('Z_MAX is 5', Z_MAX === 5);
 unit('N_MAX is 16', N_MAX === 16);
@@ -509,16 +509,16 @@ parseCase('size long with Z>=2', 'optimise the build @@JE:4:1:2 long',
 unit('sizeProfile short keys', (() => {
   const p = sizeProfile('short');
   return p && p.size === 'short' && p.attemptMaxTurns === 15 && p.attemptTimeoutSecs === 180 &&
-    p.codexTimeoutSecs === 300 && p.grokTimeoutSecs === 300;
+    p.codexTimeoutSecs === 600 && p.grokTimeoutSecs === 300;
 })());
 unit('sizeProfile medium == engine defaults spirit', (() => {
   const p = sizeProfile('MEDIUM'); // case-insensitive
   return p && p.size === 'medium' && p.attemptMaxTurns === 30 && p.localMaxTurns === 20 &&
-    p.attemptTimeoutSecs === 300 && p.codexTimeoutSecs === 600 && p.minimaxTimeoutSecs === 900;
+    p.attemptTimeoutSecs === 300 && p.codexTimeoutSecs === 900 && p.minimaxTimeoutSecs === 900;
 })());
 unit('sizeProfile long loosens guards', (() => {
   const p = sizeProfile('long');
-  return p && p.attemptMaxTurns === 50 && p.glmTimeoutSecs === 2400 && p.codexTimeoutSecs === 1200 &&
+  return p && p.attemptMaxTurns === 50 && p.glmTimeoutSecs === 2400 && p.codexTimeoutSecs === 1800 &&
     p.minimaxTimeoutSecs === 1800;
 })());
 unit('sizeProfile unknown -> null', sizeProfile('huge') === null);
