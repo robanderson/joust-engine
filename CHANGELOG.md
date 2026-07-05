@@ -6,6 +6,19 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Fable Engine (`@@FE[:N]`)** — fast composer variant (new `fable-engine` skill + engine
+  `composeOnly: true` flag). One WIDE blind round (default N=10: `2 opus, 2 sonnet,
+  2 glm-5.2, 2 codex-high, 2 minimax-m3`), staged/validated exactly like @@JE but with NO
+  councils; the orchestrating model (Fable/Opus tier) composes the best composite plan from
+  the blind pool with a per-candidate credit table, implements it with unit tests, and
+  reports with timeline telemetry. Trades the council's independent ranking + second
+  security gate for ~30-minute turnarounds; @@JE remains the calibration baseline.
+- **`bin/je-timeline.mjs`** — per-run agent timeline (`timeline.jsonl` + `TIMELINE.md` in
+  the runDir) mined deterministically from workflow transcripts (the workflow sandbox
+  cannot self-timestamp): ordered start/duration per agent, the gating predecessor, peak
+  concurrency, and a deterministic Observations section (barrier seats vs group median,
+  codex judge chain legs). Works mid-run on partial transcripts.
+
 - **Judging-v3: councils never deliberate** (2026-07-05/06 designs; peer-deliberation rounds
   are retired after a live run burned hours re-arguing fixed artifacts).
   - **Fast tally at intermediate reviews** (two-pass Round-1 review): one independent vote
