@@ -76,8 +76,9 @@ const NORMALISER = {
   'air':         { model: 'glm-4.5-air', dispatch: 'glm' },
 
   // Codex (OpenAI, pinned gpt-5.5; the axis is reasoning effort).
-  // Bare 'codex' defaults to codex-medium (codex's own default).
-  'codex':            { model: 'codex-medium', dispatch: 'codex' },
+  // Bare 'codex' defaults to codex-xhigh (2026-07-05: xhigh is the regular tier for all
+  // engine use — pools, presets, judge seats). Explicit low/medium/high still selectable.
+  'codex':            { model: 'codex-xhigh', dispatch: 'codex' },
   'codex low':        { model: 'codex-low',    dispatch: 'codex' },
   'codex medium':     { model: 'codex-medium', dispatch: 'codex' },
   'codex high':       { model: 'codex-high',   dispatch: 'codex' },
@@ -110,7 +111,7 @@ const NORMALISER = {
 };
 
 // Top Mixed preset pool, in remainder-priority order.
-const TOP_MIXED_POOL = ['opus', 'glm-5.2', 'codex-high'];
+const TOP_MIXED_POOL = ['opus', 'glm-5.2', 'codex-xhigh'];
 
 // ---------------------------------------------------------------------------
 // Plan/Implement round split (2026-07-03 design).
@@ -123,12 +124,12 @@ const TOP_MIXED_POOL = ['opus', 'glm-5.2', 'codex-high'];
 // The plan pool sum is the tournament N (attempts per plan round); the implement
 // pool sum is M (implementers in round 3/4). Both are capped by N_MAX.
 const PLAN_DEFAULT_POOL = [
-  'opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'codex-high',
+  'opus', 'opus', 'sonnet', 'sonnet', 'codex-xhigh', 'codex-xhigh',
   'glm-5.2', 'glm-5.2', 'minimax-m3', 'minimax-m3',
 ];
 // 2026-07-03: sonnet joined the implement pool (Sonnet 5 = newer base, better value; Rob wants
 // opus >= 2 AND sonnet >= 2), trading one codex-high seat to keep M lean.
-const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'sonnet', 'sonnet', 'codex-high', 'glm-5.2'];
+const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'sonnet', 'sonnet', 'codex-xhigh', 'glm-5.2'];
 
 // Recognised model token alternatives for the SPEC scan. These match the
 // HEAD of an item (after the count); the normaliser then validates exactly.
@@ -262,7 +263,7 @@ const SIZE_PROFILES = {
     grokMaxTurns: 15,
     attemptTimeoutSecs: 180,
     glmTimeoutSecs: 600,
-    codexTimeoutSecs: 300,
+    codexTimeoutSecs: 600,
     grokTimeoutSecs: 300,
     minimaxTimeoutSecs: 300,
   },
@@ -273,7 +274,7 @@ const SIZE_PROFILES = {
     grokMaxTurns: 30,
     attemptTimeoutSecs: 300,
     glmTimeoutSecs: 1200,
-    codexTimeoutSecs: 600,
+    codexTimeoutSecs: 900,
     grokTimeoutSecs: 600,
     minimaxTimeoutSecs: 900, // issue #30: both M3 seats blew the shared 300s on a real medium task
   },
@@ -284,7 +285,7 @@ const SIZE_PROFILES = {
     grokMaxTurns: 50,
     attemptTimeoutSecs: 600,
     glmTimeoutSecs: 2400,
-    codexTimeoutSecs: 1200,
+    codexTimeoutSecs: 1800,
     grokTimeoutSecs: 1200,
     minimaxTimeoutSecs: 1800,
   },

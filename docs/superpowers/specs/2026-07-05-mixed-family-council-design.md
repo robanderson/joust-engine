@@ -63,6 +63,27 @@ if a flag is missing (prefer none), `references/review-rubric.md` + `orchestrati
 (seat table, judgeMix, snapshot-pinning contract), SKILL.md cost/notes, CHANGELOG, tests
 (parse/shape-validation of a canned VERDICT.json; fallback path; allowed-roots warning).
 
+## Addendum (2026-07-05, same day): 6th judge — dual security gates + codex tier policy
+
+- **Every council gains a SIXTH seat: a second security judge on codex-xhigh**
+  (`security-x`, same mandate text as the Opus security lens, in BOTH councils). Secure
+  code is critical to production implementations; a cross-family second security gate
+  catches vulnerabilities the authoring family is blind to, and the added cost is worth
+  avoiding systems being pwned.
+  - **Dual veto (union, fail-closed):** a standing evidenced high/critical UNSAFE flag
+    from EITHER security judge excludes the candidate. Peers may rebut either flag in
+    deliberation; each security judge withdraws only its own flags.
+  - **6-judge tally:** majority stays strictly >50% of living (4/6 when all alive).
+    Even-N 3-3 splits are possible and resolve through the existing deliberation →
+    NO_CONSENSUS machinery (no tiebreak shortcut).
+  - Opus security seat keeps its fallback-exempt status; the codex security seat falls
+    back to Opus on failure like other codex seats (a fallback panel may thus briefly be
+    2× Opus security — acceptable; metadata records it).
+- **Codex tier policy: xhigh is the default codex everywhere** — the judge seats above,
+  `TOP_MIXED_POOL`, `PLAN_DEFAULT_POOL`, `IMPLEMENT_DEFAULT_POOL`, and the bare `codex`
+  spec token all resolve to `codex-xhigh`; `codexTimeoutSecs` profiles widen accordingly.
+  Explicit `codex low/medium/high` spellings still select those tiers.
+
 ## Acceptance
 
 - `npm run check && npm test` green; rebrand self-verify passes.
