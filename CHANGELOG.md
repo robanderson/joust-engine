@@ -6,6 +6,20 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **GEPA-LITE brief-evidence miner (`bin/je-evolve.mjs`)** — deterministic run-archive
+  miner for reflective prompt evolution (GEPA, arXiv:2507.19457: mutate prompts from
+  execution-trace evidence; WORKER prompts only, never orchestrator prose). v1 is the
+  EVIDENCE step only — a human or frontier session does the reflection. Mines each run
+  for: per-model valid-rate + failReason clusters (mapping.json), recurring challenge
+  themes (review-\*/verdict.json guidance), council cons that repeat across
+  rounds/reviews/runs (review-\*/council.json; same-round lens echo never counts), and
+  rc_summary RC 03 turn-cap / RC 05 no-deliverable seats. Emits a markdown
+  "Brief-evolution evidence report": observation + citing runs (n= everywhere) + a
+  SUGGESTED BRIEF DELTA phrased as a hypothesis, plus a final suggestion→template map
+  (attempt plan-brief / implement-brief / judge lens brief / composer prompt).
+  `<runDir>...` or `--runs-root [<dir>]`; timestamps from artifact mtimes only;
+  missing/malformed inputs degrade gracefully. Tests in `bin/je-evolve.test.mjs`.
+
 - **Standardized implement-deliverable contract (run G).** Non-repoMode implement briefs now
   mandate ONE fixed deliverable layout — `patches/` (ordered unified diffs) + `APPLY.md` (exact,
   ordered apply commands) + `VERIFY.md` (how to verify), with a `files/` + `APPLY.md` full-files
