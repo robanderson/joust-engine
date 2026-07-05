@@ -105,6 +105,10 @@ Peer-deliberation rounds are retired (observed live: hours of judges re-arguing 
 - **Veto filter (absolute):** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from EITHER security gate cannot win, be carried, or be picked by the orchestrator, whatever its vote count. Both steelman finalists vetoed in a runoff (or every candidate vetoed at a final-rank seed vote) → **NO_CONSENSUS** / needs-human — the only remaining NO_CONSENSUS path.
 - The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override.
 
+### Aspect verifiers (optional)
+
+With `aspectVerifiers: true` (default **off**), each council decision point also fans out **4 cheap binary aspect verifiers** (one helper-model agent per aspect: *correct-behaviour, spec-fit, simplicity, robustness*), run **concurrently** with the round-1 lens fan-out against the same blind pool (research BoN-MAV, arXiv:2502.20379 — many cheap **binary** aspect checks beat a single continuous score; spend marginal budget on verification, not candidates). Each verifier answers one yes/no question per candidate (phrased for a design brief at the plan decision points, for code otherwise); a dead verifier simply **abstains** — it can never crash or shrink a run. Approval counts **never** touch the majority tally, the veto, or the `judges: 1` legacy path: they only break **exact** ties in the deterministic carry/seed order (slotting between mean-rank and blind-letter) and are surfaced to the steelman as context alongside the judge-cited cons. Per-candidate approval counts and per-aspect votes are recorded in `council.json` as `aspects`.
+
 ## Single blind judge (`judges: 1`, legacy)
 
 With `judges: 1` there is one blind Opus judge that does the whole job itself — judge, rank, name the winner (and in two pass, distil guidance). Produce the report shape below directly. This is the pre-council behaviour, kept for parity and cheap runs.

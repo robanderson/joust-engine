@@ -6,6 +6,19 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Aspect verifiers with binary approvals (`args.aspectVerifiers`, default OFF)** (research
+  BoN-MAV, arXiv:2502.20379: many cheap BINARY aspect checks beat a single continuous score —
+  spend marginal budget on verification, not candidates). When enabled, every council decision
+  point fans out 4 HELPER_MODEL verifiers (correct-behaviour / spec-fit / simplicity /
+  robustness; question phrased per phase for a design brief or code) CONCURRENTLY with the
+  round-1 lens fan-out, each returning a strict binary approve/reject per candidate. Fail-safe: a
+  dead aspect agent abstains — never crashes, never shrinks the field. Approval counts NEVER
+  touch the majority tally, the veto, or the `judges:1` legacy path: they only break EXACT ties
+  in `nonVetoedOrder` (slotting between mean-rank and blind-letter via the pure `aspectTiebreak`)
+  and are surfaced to the steelman's change-list context. Results persist in `council.json` as
+  `aspects` (per-candidate approval counts + per-aspect votes). Pure logic in a marked
+  extract-and-eval block; tests in `workflows/tournament-aspect-verifiers.test.mjs`.
+
 - **Prompt Lab (`docs/superpowers/prompt-lab/`)** — a document library of 70 optimised
   drop-in variants (10 per family) for every worker sub-agent prompt: plan design brief,
   implement brief, judge lens brief, steelman, boost implementer, guidance synthesis, and

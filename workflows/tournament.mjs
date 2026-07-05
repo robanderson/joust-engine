@@ -28,6 +28,7 @@ export const meta = {
 //   grokWebSearch: boolean,               // optional — true enables grok's web search (default false = hermetic, like the other providers)
 //   quorumClose: boolean,                 // optional — false disables N-1 quorum close (default on where the runtime has timers+clock)
 //   quorumGraceSecs: number,              // optional — grace buffer added to 2x a seat's wall clock (default 90)
+//   aspectVerifiers: boolean,             // optional — true adds 4 cheap binary aspect verifiers per decision point (BoN-MAV, arXiv:2502.20379); tiebreak + steelman context ONLY, never the tally/veto (default off)
 //   attempts: [ {                         // one per attempt, length N
 //      label: 'candidate-1',
 //      dispatch: 'anthropic' | 'glm' | 'local' | 'codex' | 'minimax' | 'grok',
@@ -78,6 +79,15 @@ const COUNCIL = Number(A.judges) !== 1
 // completeness-class/simplicity-class seats); judgeMix:'anthropic' forces every seat native Opus,
 // byte-identical to pre-feature output. Ignored when judges:1 (no council to mix).
 const LEGACY_MIX = A.judgeMix === 'anthropic'
+
+// Aspect verifiers (BoN-MAV, arXiv:2502.20379; default OFF via args.aspectVerifiers === true):
+// many cheap BINARY aspect checks beat a single continuous score — spend marginal budget on
+// verification, not candidates. 4 HELPER_MODEL verifiers (one per aspect) run CONCURRENTLY with
+// the council's round-1 lens fan-out against the same staged pool. Their approval counts ONLY
+// break EXACT ties inside nonVetoedOrder (slotting between mean-rank and blind-letter) and are
+// surfaced to the steelman as context — NEVER the majority tally, the veto, or the judges:1
+// legacy path. A dead aspect agent ABSTAINS; the feature can never crash or shrink a run.
+const ASPECT_VERIFIERS = A.aspectVerifiers === true
 
 // Run-purpose summary for the live /workflows heading (issue #38). meta.name/description is a static
 // PURE LITERAL (Workflow spec — it CANNOT be dynamic per-run), so the only runtime lever into the live
@@ -1927,10 +1937,164 @@ function councilTally(verdicts) {
   return { living, votes, vetoedSet, vetoed: [...vetoedSet], threshold, winner }
 }
 
+// ---- begin: aspect verifiers ----
+// Binary aspect verification (BoN-MAV, arXiv:2502.20379): many cheap BINARY aspect checks beat a
+// single continuous score. PURE — extract-and-eval'able (repo convention, like the return-codes
+// block); the IMPURE fan-out (aspectVerify below) is exercised structurally/system-side. Approvals
+// NEVER override the council order: they only break EXACT ties (aspectTiebreak), slotting between
+// mean-rank and blind-letter in nonVetoedOrder.
+// The 4 aspects. Each carries the SAME binary question phrased for the artifact a phase judges:
+// `plan` for a design brief (the PLAN decision points: 'Review' / 'Final rank'), `code` otherwise.
+const ASPECTS = [
+  { key: 'correct-behaviour',
+    plan: 'Would faithfully implementing this design brief produce the behaviour the task asks for — is every mechanism it relies on sound and workable as described?',
+    code: 'Does this candidate actually produce the behaviour the task asks for — traced or run, does the core path work?' },
+  { key: 'spec-fit',
+    plan: 'Does this design brief address EVERYTHING the task explicitly asked for, honouring every stated constraint, with nothing material missing or out of scope?',
+    code: 'Does this candidate do EVERYTHING the task explicitly asked for, honouring every stated constraint, with nothing material missing or out of scope?' },
+  { key: 'simplicity',
+    plan: "Is this design brief's approach the smallest coherent one that solves the task — free of over-engineering, needless surface, or gold-plating?",
+    code: "Is this candidate's implementation the smallest coherent one that solves the task — free of over-engineering, needless surface, or gold-plating?" },
+  { key: 'robustness',
+    plan: 'Does this design brief account for the realistic failure modes and edge cases its approach will face (bad input, boundaries, partial failure), rather than only the happy path?',
+    code: 'Does this candidate handle the realistic failure modes and edge cases it will face (bad input, boundaries, partial failure) gracefully, rather than only the happy path?' },
+]
+// Phase -> phrasing selector (mirrors defaultLensesFor's phase split; no phase arg reaches the table).
+function aspectQuestionFor(aspect, phaseTitle) {
+  return (phaseTitle === 'Review' || phaseTitle === 'Final rank') ? aspect.plan : aspect.code
+}
+// votesByCandidate: { [label]: [true|false|null, ...] } — one slot per aspect; null = that aspect
+// ABSTAINED (dead agent or missing vote). Approval count = strict `true`s only; an abstention
+// never counts for or against a candidate.
+function aspectTally(votesByCandidate) {
+  const out = {}
+  for (const label of Object.keys(votesByCandidate || {})) {
+    out[label] = (votesByCandidate[label] || []).reduce((n, v) => n + (v === true ? 1 : 0), 0)
+  }
+  return out
+}
+// aspectTiebreak(order, approvals): reorders ONLY exact ties in an existing council ranking by
+// approval count. `order` is an array whose elements are either a single label (not tied — NEVER
+// moved relative to its neighbours) or an array of labels that are an EXACT tie under the
+// council's sort key. Within a tie group: approval count desc, then the group's incoming order
+// (blind-letter asc from the caller's sort) — i.e. the approval count slots BETWEEN mean-rank and
+// blind-letter. A null/empty approvals map disables reordering entirely (flatten unchanged); a
+// label missing from the map counts 0. Pure; never overrides the council order otherwise.
+function aspectTiebreak(order, approvals) {
+  if (!approvals || !Object.keys(approvals).length) {
+    return (order || []).flatMap(g => (Array.isArray(g) ? g : [g]))
+  }
+  const count = l => (Number.isFinite(approvals[l]) ? approvals[l] : 0)
+  return (order || []).flatMap(g => {
+    if (!Array.isArray(g)) return [g]
+    return g.map((l, i) => ({ l, i }))
+      .sort((a, b) => (count(b.l) - count(a.l)) || (a.i - b.i))
+      .map(x => x.l)
+  })
+}
+// ---- end: aspect verifiers ----
+
+// Strict per-aspect vote schema: one BINARY approve/reject per candidate, short reason. No scores,
+// no ranking, no winner — a verifier is not a judge.
+const ASPECT_VOTE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    votes: { type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        label: { type: 'string' },
+        approve: { type: 'boolean' },
+        reason: { type: 'string', maxLength: 240 },
+      },
+      required: ['label', 'approve', 'reason'],
+    } },
+  },
+  required: ['votes'],
+}
+
+// One cheap binary verifier for ONE aspect (HELPER_MODEL): reads the staged pool once, returns
+// approve/reject per candidate. Fail-safe by construction: any failure => null (that aspect
+// ABSTAINS) — it never throws and never shrinks the field.
+async function askAspect(aspect, blindList, poolPath, phaseTitle, label) {
+  const letters = blindList.map(c => c.blind)
+  const prompt = `You are ONE binary ASPECT VERIFIER (not a judge, not a ranker) in a blind review. Your single aspect is **${aspect.key}**. For EVERY candidate answer ONE yes/no question:
+
+${aspectQuestionFor(aspect, phaseTitle)}
+
+Task every candidate was given:
+${task}
+
+All candidate deliverables are concatenated, blind-labelled, in ONE file — read it ONCE (each candidate's section is headed "===== Candidate <letter> ====="):
+${poolPath}
+Do not read any other files. You do NOT know which model produced which candidate; do not speculate.
+
+Return one vote per candidate, for candidates ${letters.join(', ')} — each vote: label, approve (true = yes, it clearly passes this aspect; false = no, or too unclear to approve), and a SHORT reason (one clause). BINARY only: no scores, no ranking, no overall winner.`
+  try {
+    const raw = await agent(prompt, { model: HELPER_MODEL, schema: ASPECT_VOTE_SCHEMA, phase: phaseTitle, label })
+    if (!raw || !Array.isArray(raw.votes)) return null
+    const set = new Set(letters)
+    const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
+    const byLabel = {}
+    for (const v of raw.votes) {
+      const l = norm(v && v.label)
+      if (set.has(l) && typeof (v && v.approve) === 'boolean' && byLabel[l] === undefined) {
+        byLabel[l] = { label: l, approve: v.approve, reason: String(v.reason || '').slice(0, 240) }
+      }
+    }
+    if (!Object.keys(byLabel).length) return null // schema-valid junk (no recognisable labels) = abstain
+    return { aspect: aspect.key, votes: letters.map(l => byLabel[l] || null) }
+  } catch (e) {
+    log(`aspect verifier '${aspect.key}' failed (${String(e).slice(0, 100)}) — this aspect ABSTAINS (never fatal).`)
+    return null
+  }
+}
+
+// Fan out ONE HELPER_MODEL verifier per aspect (4 total) against the SAME staged pool the council
+// reads. Launched CONCURRENTLY with the round-1 lens fan-out (no ordering dependency). Native
+// Anthropic seats expose no engine-known wall clock (lensTimeoutSecsFor-style null), so
+// parallelQuorum never quorum-closes an aspect seat here — but every failure path already
+// degrades to an abstention, so a dead aspect can never block or crash the council. Returns
+// { approvals: {label: n}, by_aspect: [{aspect, votes|null}] } (persisted in council.json as
+// `aspects`) or null when everything abstained/failed.
+async function aspectVerify(blindList, poolPath, phaseTitle) {
+  const letters = blindList.map(c => c.blind)
+  try {
+    const results = await parallelQuorum(ASPECTS, (aspect) =>
+      askAspect(aspect, blindList, poolPath, phaseTitle, `aspect-${aspect.key}`), phaseTitle, {
+      timeoutSecsFor: () => null, // native seats: no engine-known wall clock => never quorum-closable
+      seatLabelFor: (a) => `aspect:${a.key}`,
+    })
+    const votesByCandidate = {}
+    for (const l of letters) {
+      votesByCandidate[l] = ASPECTS.map((a, i) => {
+        const r = results[i]
+        const v = r && Array.isArray(r.votes) ? r.votes.find(x => x && x.label === l) : null
+        return v ? v.approve : null // dead aspect / missing per-candidate vote = abstain (null)
+      })
+    }
+    const approvals = aspectTally(votesByCandidate)
+    const by_aspect = ASPECTS.map((a, i) => ({
+      aspect: a.key,
+      votes: results[i] && Array.isArray(results[i].votes) ? results[i].votes.filter(Boolean) : null, // null = abstained
+    }))
+    const dead = by_aspect.filter(x => !x.votes).map(x => x.aspect)
+    if (dead.length === ASPECTS.length) { log(`aspect verifiers [${phaseTitle}]: ALL aspects abstained — proceeding without aspect data (fail-safe).`); return null }
+    if (dead.length) log(`aspect verifiers [${phaseTitle}]: ${dead.length}/${ASPECTS.length} aspect(s) abstained (${dead.join(', ')}).`)
+    log(`aspect verifiers [${phaseTitle}]: approvals ${letters.map(l => `${l}:${approvals[l]}`).join(', ')} (of ${ASPECTS.length} binary aspects; tiebreak + steelman context only).`)
+    return { approvals, by_aspect }
+  } catch (e) {
+    log(`aspect verifiers failed entirely (${String(e).slice(0, 100)}) — proceeding without (fail-safe).`)
+    return null
+  }
+}
+
 // Non-vetoed candidates in carry/seed order: most first-place votes, then best mean rank across
 // living verdicts, then blind label. Used by the fast tally (top-2 carry) and the steelman loop
-// (finalist seeding). Deterministic code — never an LLM.
-function nonVetoedOrder(verdicts, labels, vetoedSet) {
+// (finalist seeding). Deterministic code — never an LLM. `aspectApprovals` (optional; only passed
+// when args.aspectVerifiers produced data) breaks EXACT (first-votes, mean-rank) ties by binary
+// approval count — slotting between mean-rank and blind-letter via aspectTiebreak. Positions that
+// are not exact ties NEVER move.
+function nonVetoedOrder(verdicts, labels, vetoedSet, aspectApprovals = null) {
   const firstVotes = {}, rankSum = {}, rankCount = {}
   for (const l of labels) { firstVotes[l] = 0; rankSum[l] = 0; rankCount[l] = 0 }
   for (const v of verdicts) {
@@ -1938,8 +2102,19 @@ function nonVetoedOrder(verdicts, labels, vetoedSet) {
     ;(v.ranking || []).forEach((l, idx) => { if (rankCount[l] != null) { rankSum[l] += idx + 1; rankCount[l]++ } })
   }
   const avgRank = l => rankCount[l] ? rankSum[l] / rankCount[l] : labels.length + 1
-  return labels.filter(l => !vetoedSet.has(l))
+  const sorted = labels.filter(l => !vetoedSet.has(l))
     .sort((a, b) => (firstVotes[b] - firstVotes[a]) || (avgRank(a) - avgRank(b)) || a.localeCompare(b))
+  if (!aspectApprovals) return sorted
+  // Group EXACT ties under the council sort key (first-votes, mean-rank); aspectTiebreak reorders
+  // only within a group (approval count desc, then the incoming blind-letter order).
+  const key = l => `${firstVotes[l]}|${avgRank(l)}`
+  const groups = []
+  for (const l of sorted) {
+    const g = groups[groups.length - 1]
+    if (g && key(g[0]) === key(l)) g.push(l)
+    else groups.push([l])
+  }
+  return aspectTiebreak(groups, aspectApprovals)
 }
 
 // A compact, blind (letters-only) peer block handed to each judge during deliberation.
@@ -2096,12 +2271,26 @@ const STEELMAN_SCHEMA = {
   }, required: ['changes'],
 }
 
-async function steelmanChangeLists(finalists, verdicts, phaseTitle, label) {
+// Compact aspect-verifier context block for the steelman prompt (approval counts + which aspects
+// rejected each finalist, with the short reasons). Context only — never votes, never a ranking.
+function aspectSteelmanContext(aspects, finalists) {
+  if (!aspects || !aspects.approvals) return ''
+  const lines = finalists.map(f => {
+    const rejected = (aspects.by_aspect || [])
+      .map(a => ({ aspect: a.aspect, v: Array.isArray(a.votes) ? a.votes.find(x => x && x.label === f) : null }))
+      .filter(x => x.v && x.v.approve === false)
+      .map(x => `${x.aspect} ("${x.v.reason}")`)
+    return `- Candidate ${f}: ${aspects.approvals[f] ?? 0} of ${(aspects.by_aspect || []).length} aspects approved${rejected.length ? `; rejected by ${rejected.join('; ')}` : ''}`
+  })
+  return `\n\nASPECT VERIFIER RESULTS (independent cheap binary checks; CONTEXT ONLY — they are not judges, cast no votes, and never pick winners; use a rejection reason only where it corroborates a judge-cited con):\n${lines.join('\n')}`
+}
+
+async function steelmanChangeLists(finalists, verdicts, phaseTitle, label, aspects = null) {
   const block = JSON.stringify(verdicts.map(v => ({ lens: v.lens, vote: v.vote, ranking: v.ranking, reasoning: v.reasoning,
     candidates: (v.candidates || []).filter(c => finalists.includes(String(c.label || '').charAt(0))).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })) })), null, 2)
   try {
     const res = await agent(
-      `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}`,
+      `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}${aspectSteelmanContext(aspects, finalists)}`,
       { model: 'opus', schema: STEELMAN_SCHEMA, phase: phaseTitle, label: `${label}-steelman` })
     const out = {}
     for (const c of (res && res.changes) || []) {
@@ -2136,6 +2325,11 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     for (const l of lenses) if (!livingKeys.has(l.key)) recordSeat(`${label}:${l.key}`, phaseTitle, RC.UNKNOWN, 'lens-seat-dead-after-retries')
   }
 
+  // Aspect verifiers (args.aspectVerifiers, default OFF): launched CONCURRENTLY with the round-1
+  // lens fan-out — both read the same staged pool, no ordering dependency. aspectVerify never
+  // rejects (fail-safe: abstentions), so the un-awaited promise is always harmless.
+  const aspectsPromise = ASPECT_VERIFIERS ? aspectVerify(blindList, poolPath, phaseTitle) : null
+
   // Round 1 — 5 independent verdicts, no peer visibility. Each lens gets a differently-rotated listing.
   const r1raw = await parallelQuorum(lenses, (lens, i) =>
     askLens(lens, blindList, poolPath, phaseTitle, `${label}-${lens.key}-r1`, 1, null, i), phaseTitle, {
@@ -2150,14 +2344,21 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     return { __failed: 'all council judges failed in round 1' }
   }
 
+  // Aspect data (flag-gated; null when off or all aspects abstained). Approvals feed ONLY the
+  // nonVetoedOrder tiebreak slot and the steelman context; `aspects` is recorded in council
+  // metadata (persisted in council.json).
+  const aspects = aspectsPromise ? await aspectsPromise : null
+  const aspectApprovals = aspects ? aspects.approvals : null
+  const attachAspects = (result) => { if (aspects && result && result.council) result.council.aspects = aspects; return result }
+
   // Security-judge death policy: repoMode = fail-closed (unresolvable veto → NO_CONSENSUS/needs-human);
   // isolated run = proceed, but LOUD warning that veto coverage was lost.
   const securityDeadHalt = () => {
     const tt = councilTally(verdicts)
     roundsLog.push(roundRecord(roundsLog.length + 1, verdicts, tt, lenses))
     recordCouncilSeats(verdicts)
-    return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
-      humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' })
+    return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
+      humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' }))
   }
   if (!verdicts.some(v => v.lens === 'security')) {
     if (repoMode) {
@@ -2178,7 +2379,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   // the panel preferred. Majority => carry 1 (byte-identical outcome to before); split => carry
   // the TOP TWO non-vetoed; all-vetoed => carry NONE and proceed on guidance alone (NOT a halt).
   if (style === 'intermediate') {
-    const order = nonVetoedOrder(verdicts, labels, t.vetoedSet)
+    const order = nonVetoedOrder(verdicts, labels, t.vetoedSet, aspectApprovals)
     const carried = t.winner != null ? [t.winner] : order.slice(0, 2)
     if (t.winner == null) log(`council ${label}: FAST TALLY — no majority; carrying top ${carried.length} non-vetoed candidate(s) [${carried.join(', ')}] into the final pool (no deliberation at intermediate reviews).`)
     if (!carried.length) log(`council ${label}: FAST TALLY — every candidate vetoed; carrying none, round 2 proceeds on guidance alone.`)
@@ -2193,7 +2394,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
         ? `Carried champion(s): ${carried.join(', ')} (vote split ${Object.keys(t.votes).sort().map(k => `${k}:${t.votes[k]}`).join(', ') || 'none'}) — these set the bar the final pool must beat.`
         : 'No candidate was carried (all vetoed); the final pool is round 2 alone.'
     }
-    return result
+    return attachAspects(result)
   }
 
   // ---- FINAL decision point: STEELMAN SHOOTOUT (judging-v3 spec 2). The seed vote NEVER crowns —
@@ -2203,9 +2404,9 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   if (allVetoed()) {
     const reason = 'all candidates were vetoed UNSAFE by the security lens(es)'
     log(`council ${label}: NO_CONSENSUS — ${reason}.`)
-    return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: reason })
+    return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: reason }))
   }
-  const seedOrder = nonVetoedOrder(verdicts, labels, t.vetoedSet)
+  const seedOrder = nonVetoedOrder(verdicts, labels, t.vetoedSet, aspectApprovals)
   const seeds = seedOrder.slice(0, 2)
   const reviewDir = poolPath.replace(/\/_pool\.md$/, '')
   const seedVotesStr = Object.keys(t.votes).sort().map(k => `${k}:${t.votes[k]}`).join(', ') || 'none'
@@ -2221,7 +2422,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
 
   for (let iter = 1; iter <= maxIters && finalWinner == null; iter++) {
     // (a) steelman: cons -> minimal change-lists (never votes). Only the steelman sees history.
-    const changeLists = await steelmanChangeLists(seeds, steelmanVerdicts, phaseTitle, `${label}-i${iter}`)
+    const changeLists = await steelmanChangeLists(seeds, steelmanVerdicts, phaseTitle, `${label}-i${iter}`, aspects)
     // (b) boost each finalist on a COPY; a failed/empty boost re-enters at the last gated version.
     const boostDirs = {}
     await parallel(seeds.map(s => async () => {
@@ -2276,7 +2477,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     const bothVetoed = stagedR.length > 0 && stagedR.every(c => rt.vetoedSet.has(c.blind))
     if (bothVetoed) {
       log(`council ${label}: STEELMAN runoff i${iter} — every finalist vetoed UNSAFE; NO_CONSENSUS (needs-human).`)
-      return buildCouncilResult({ winner: null, verdicts: steelmanVerdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: 'both steelman finalists vetoed UNSAFE in the runoff' })
+      return attachAspects(buildCouncilResult({ winner: null, verdicts: steelmanVerdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: 'both steelman finalists vetoed UNSAFE in the runoff' }))
     }
     if (rt.winner != null) {
       const winEntry = stagedR.find(c => c.blind === rt.winner)
@@ -2301,7 +2502,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     result.reasoning = `Steelman shootout: seed vote ${seedVotesStr}${t.winner ? ` (seed majority ${t.winner})` : ''}; finalists [${seeds.join(', ')}] each received a judge-guided improvement pass; Candidate ${finalWinner} won the cold runoff after ${steelmanMeta.rounds.length} steelman round(s). Decided by ${steelmanMeta.decided_by}.`
     result.council.steelman = steelmanMeta
     if (guidanceWanted) result.guidance = await synthesizeGuidance(steelmanVerdicts, phaseTitle, `${label}-guidance`)
-    return result
+    return attachAspects(result)
   }
   // 5 rounds, still tied -> the ORCHESTRATOR casts the deciding vote (never the engine, never an
   // LLM aggregation). NOT no_consensus: both finalists are gated, security-cleared, 5x improved —
@@ -2317,7 +2518,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   }
   result.reasoning = `Steelman shootout: ${maxIters} improvement rounds could not break the tie between [${seeds.join(', ')}] — the orchestrator must cast the deciding vote (both finalists are gated and security-cleared; a vetoed candidate can never be picked).`
   if (guidanceWanted) result.guidance = await synthesizeGuidance(steelmanVerdicts, phaseTitle, `${label}-guidance`)
-  return result
+  return attachAspects(result)
 }
 
 // ---- begin: report renderers (PURE — sliced by bin/je-render.mjs + tests; deps: GUIDANCE_CAP only) ----
