@@ -3706,7 +3706,13 @@ if (implement) {
   // implementer. Judges stay blind to lineage; the readout is derived from mapping afterwards.
   let abInfo = null
   if (AB_BRIEFS) {
-    const fin = (finalRank.council && finalRank.council.steelman && Array.isArray(finalRank.council.steelman.finalists)) ? finalRank.council.steelman.finalists : []
+    // The steelman metadata's field for the top-2 non-vetoed finalists is `seeds` (observed live:
+    // the run-h calibration resolved A vs G with steelman.seeds=['A','G'], while `finalists` exists
+    // ONLY inside a needs_orchestrator_pick payload — reading it here silently disabled A/B on
+    // every majority-resolved run). Keep `finalists` as a fallback for the pick-payload shape.
+    const sm = finalRank.council && finalRank.council.steelman
+    const fin = (sm && Array.isArray(sm.seeds) && sm.seeds.length) ? sm.seeds
+      : (sm && Array.isArray(sm.finalists)) ? sm.finalists : []
     const ruLetter = fin.find(l => l !== finalRank.winner) || null
     const ru = ruLetter ? blindF.find(c => c.blind === ruLetter) : null
     if (ru) {
