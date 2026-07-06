@@ -213,3 +213,15 @@ test('(structural) composeOnly stops after the staged pool — no council, no ro
   assert.match(branch, /mapping\.json/)
   assert.match(branch, /maybeFileEngineIssues\('Review'\)/)
 })
+
+// ---- run-j2 fix (2026-07-07): the steelman runoff must RE-GATE boosted patches ----
+test('(structural) steelman runoff re-runs the mechanical gate on the boosted copies before the cold re-judge', () => {
+  const stage = SRC.indexOf('runoff staging produced no valid candidates')
+  const gate = SRC.indexOf('mechanicalPatchGate(stagedR, runoffDir, phaseTitle)')
+  const judge = SRC.indexOf('askLens(lens, stagedR, runoffPool')
+  assert.ok(stage > 0 && gate > stage && judge > gate,
+    'stage -> mechanical re-gate -> cold re-judge; a regenerated-broken boost can no longer be judged under its source dir\'s stale clean stamp')
+  const i = SRC.indexOf('failed the MECHANICAL gate — reverted to last gated version')
+  assert.ok(i > 0, 'gate-invalidated boosts ratchet back to the last gated version')
+  assert.ok(SRC.includes('-mechrepair'), 'repair pass re-stages + re-gates under a fresh runoff dir')
+})

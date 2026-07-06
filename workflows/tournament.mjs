@@ -3128,6 +3128,27 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       stagedR = (await stageAndValidate(blindLabel(repaired, iter), runoffDir, phaseTitle)).filter(c => c.valid)
     }
     if (!stagedR.length) { log(`steelman ${label} i${iter}: runoff staging produced no valid candidates — ending loop on seed result.`); break }
+    // run-j2 fix (2026-07-07): the runoff previously carried the COPIED source stamps (a stale
+    // "MECHANICAL: patch applies cleanly") into the cold re-judge and never re-gated the BOOSTED
+    // patches — a boost that regenerates a broken patch was judged (and could WIN) under a clean
+    // stamp; observed live: run-j2 i1's winning boost does not apply at the pinned baseline. The
+    // runoff now re-derives stamps + pool via the same mechanical gate as every implement round; a
+    // gate-invalidated boost ratchets back to the last gated version (one repair pass), mirroring
+    // the staging-gate ratchet above. Lone mode needs no repair: the failed variant simply drops.
+    {
+      const preN = stagedR.length
+      let gatedR = (await mechanicalPatchGate(stagedR, runoffDir, phaseTitle)).filter(inContention)
+      if (gatedR.length < preN && !loneFinalist) {
+        const still = new Set(gatedR.map(c => c.orig))
+        const repaired = runoffEntries.map(e => still.has(e.orig) ? e : { ...e, ws: currentWs[e.orig], variant: 'ratchet' })
+        log(`steelman ${label} i${iter}: ${preN - gatedR.length} boost(s) failed the MECHANICAL gate — reverted to last gated version (ratchet).`)
+        runoffDir = `${runoffDir}-mechrepair`
+        const restaged = (await stageAndValidate(blindLabel(repaired, iter), runoffDir, phaseTitle)).filter(c => c.valid)
+        gatedR = (await mechanicalPatchGate(restaged, runoffDir, phaseTitle)).filter(inContention)
+      }
+      stagedR = gatedR
+    }
+    if (!stagedR.length) { log(`steelman ${label} i${iter}: no candidate survived the runoff mechanical gate — ending loop on seed result.`); break }
     if (repoMode) await enrichBlindPool(stagedR, runoffDir, phaseTitle)
     const runoffPool = `${runoffDir}/_pool.md`
     const rRaw = await parallelQuorum(lenses, (lens, i) =>
