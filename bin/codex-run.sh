@@ -14,14 +14,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
 
 TIMEOUT="${JE_TIMEOUT_SECS:-600}"   # wall-clock backstop (seconds)
-STALL="${JE_STALL_SECS:-120}"       # zero-output stall window (seconds)
+STALL="${JE_STALL_SECS:-300}"       # zero-output stall window (seconds). 300 not 120: codex exec goes
+                                    # legitimately quiet while composing one large patch/file (run-h
+                                    # impl-5 was killed twice at 120s mid-"writing the patch now").
 
 [ -f _brief.txt ] || { finish DONE "exit=4 (missing-brief)" 07 missing-brief; exit 4; }
 command -v codex >/dev/null 2>&1 || { finish DONE "exit=5 (missing-runner)" 07 missing-runner; exit 5; }
 
 # Write the PROVENANCE marker UNCONDITIONALLY, up front: a missing log at this path proves the runner
 # never ran (a native-solve spoof or refusal) and must fail closed (P=0) downstream.
-echo "JOUST-CODEX-PROVENANCE endpoint=api.openai.com flag=${FLAG} timeout=${TIMEOUT}s stall=${STALL}s" >> "$LOG"
+PROV_LINE="JOUST-CODEX-PROVENANCE endpoint=api.openai.com flag=${FLAG} timeout=${TIMEOUT}s stall=${STALL}s"
+echo "$PROV_LINE" >> "$LOG"
 
 # Headless codex exec policy (all VERIFIED on codex-cli 0.139.0). </dev/null pins codex's stdin so it
 # never blocks reading additional input; $FLAG is unquoted so the shell word-splits it into argv.

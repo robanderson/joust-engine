@@ -34,7 +34,8 @@ JITTER_MAX="${JE_GLM_JITTER_MAX:-10}" # random 0..N s added to startup + each ba
 # Portable random 0..N seconds (macOS has no shuf; sh has no reliable $RANDOM).
 jitter() { perl -e 'print int(rand($ARGV[0]+1))' "$1"; }
 
-echo "JOUST-GLM-PROVENANCE endpoint=api.z.ai flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s retries=${RETRIES}" >> "$LOG"
+PROV_LINE="JOUST-GLM-PROVENANCE endpoint=api.z.ai flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s retries=${RETRIES}"
+echo "$PROV_LINE" >> "$LOG"
 
 # Startup jitter: stagger parallel sibling attempts' first call.
 if [ "$JITTER_MAX" -gt 0 ] 2>/dev/null; then

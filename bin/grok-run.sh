@@ -27,7 +27,8 @@ if [ -n "${XAI_API_KEY:-}" ]; then AUTHMODE="env-key"; else AUTHMODE="oauth-sess
 if [ "${JE_GROK_WEB:-0}" = "1" ]; then WEBFLAG=""; WEBMODE="on"; else WEBFLAG="--disable-web-search"; WEBMODE="off"; fi
 
 # Write the PROVENANCE marker UNCONDITIONALLY, up front (missing log => runner never ran => fail closed).
-echo "JOUST-GROK-PROVENANCE endpoint=cli-chat-proxy.grok.com auth=${AUTHMODE} web=${WEBMODE} flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s" >> "$LOG"
+PROV_LINE="JOUST-GROK-PROVENANCE endpoint=cli-chat-proxy.grok.com auth=${AUTHMODE} web=${WEBMODE} flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s"
+echo "$PROV_LINE" >> "$LOG"
 
 # Headless grok policy (every flag CONFIRMED in `grok --help`). </dev/null pins stdin; $FLAG unquoted so
 # the shell word-splits `-m grok-build` into argv before exec.

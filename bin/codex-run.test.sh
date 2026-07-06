@@ -22,6 +22,7 @@ case "${FAKE_MODE:-ok}" in
   stallonce) if [ "$n" -ge 2 ]; then echo "final msg" > _codex_last.txt; echo done; echo x>solution.py; exit 0; else echo boot; sleep 30; fi ;;
   hang)      sleep 30; exit 0 ;;
   scrub)     env > "$WS/child-env.txt"; echo "print('hi')" > solution.py; exit 0 ;;
+  clobber)   rm -f _codex_run.log _brief.txt; echo "final msg" > _codex_last.txt; echo x > solution.py; exit 0 ;;
 esac
 STUB
   chmod +x "$WS/stub/codex"
@@ -63,6 +64,14 @@ rm -rf "$WS"
 
 mk_ws; run_runner FAKE_MODE=scrub ANTHROPIC_API_KEY=leaked-test-key; RC=$?
 check "scrub: ANTHROPIC_API_KEY gone" '! grep -q "^ANTHROPIC_API_KEY=" "$WS/child-env.txt"'
+rm -rf "$WS"
+
+# Provenance self-destruction guard (run-h impl-6): the worker deletes the log + brief mid-run; the
+# runner must restamp the PROVENANCE line at finish so an honest success is not rejected fail-closed.
+mk_ws; run_runner FAKE_MODE=clobber; RC=$?
+check "clobber: exits 0"              '[ "$RC" -eq 0 ]'
+check "clobber: RC 00 in fresh log"   '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 00 ok" "$WS/_codex_run.log"'
+check "clobber: provenance restamped" 'grep -q "^JOUST-CODEX-PROVENANCE .*restamped=finish$" "$WS/_codex_run.log"'
 rm -rf "$WS"
 
 echo "== $PASS passed, $FAIL failed =="

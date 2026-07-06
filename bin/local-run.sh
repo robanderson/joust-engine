@@ -21,7 +21,8 @@ MAXTURNS="${JE_MAX_TURNS:-20}"       # tight cap: local models tend to ignore "s
 [ -z "${OMLX_AUTH_TOKEN:-}" ] && { finish DONE "exit=3 (missing-key)" 07 missing-key; exit 3; }
 [ -f _brief.txt ]           || { finish DONE "exit=4 (missing-brief)" 07 missing-brief; exit 4; }
 
-echo "JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000 flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s" >> "$LOG"
+PROV_LINE="JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000 flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s"
+echo "$PROV_LINE" >> "$LOG"
 
 # --verbose --output-format stream-json --include-partial-messages: stream incremental JSON events
 # (stream-json requires --verbose in -p mode; partial messages give intra-turn liveness during long

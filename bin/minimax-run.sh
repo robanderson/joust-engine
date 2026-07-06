@@ -21,7 +21,8 @@ MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (si
 [ -z "${MINIMAX_API_KEY:-}" ] && { finish DONE "exit=3 (missing-key)" 07 missing-key; exit 3; }
 [ -f _brief.txt ]            || { finish DONE "exit=4 (missing-brief)" 07 missing-brief; exit 4; }
 
-echo "JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io model=MiniMax-M3 max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s" >> "$LOG"
+PROV_LINE="JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io model=MiniMax-M3 max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s"
+echo "$PROV_LINE" >> "$LOG"
 
 # --verbose --output-format stream-json --include-partial-messages: stream incremental JSON events
 # (stream-json requires --verbose in -p mode; partial messages give intra-turn liveness during long

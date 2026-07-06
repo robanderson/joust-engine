@@ -19,6 +19,16 @@ _finished=0
 finish() {
   [ "$_finished" = "1" ] && return 0
   _finished=1
+  # Provenance self-destruction guard (run-h impl-6): a workspace-write worker can delete/recreate the
+  # log mid-run (observed live: codex "tidied" _brief.txt + _codex_run.log away alongside a GOOD
+  # deliverable), destroying the up-front PROVENANCE stamp and turning an honest success into a
+  # fail-closed RC 06 reject. finish() runs ONLY inside the genuine runner process, so restamping here
+  # preserves exactly what the marker asserts ("this runner really ran") while surviving worker
+  # workspace hygiene. Runners opt in by setting PROV_LINE to their exact provenance line; the
+  # restamped copy is suffixed so a log reader can tell it apart from the up-front original.
+  if [ -n "${PROV_LINE:-}" ] && ! grep -q "^JOUST-${PROV}-PROVENANCE" "$LOG" 2>/dev/null; then
+    printf '%s restamped=finish\n' "$PROV_LINE" >> "$LOG"
+  fi
   printf 'JOUST-%s-%s %s\n' "$PROV" "$1" "$2" >> "$LOG"
   printf 'JOUST-RC %s %s\n' "$3" "$4" >> "$LOG"
 }

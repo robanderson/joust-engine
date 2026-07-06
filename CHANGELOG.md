@@ -6,6 +6,22 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Dispatch + workspace hygiene guards (run-h codex-implementer post-mortem).** Run H's
+  "3/6 codex implementers failed staging" cluster decomposed into three distinct defects —
+  none of them codex code quality — each now guarded: (1) every verbatim-run dispatch prompt
+  mandates ONE FOREGROUND Bash call and forbids backgrounding (a backgrounded runner is
+  TERM-killed when the wrapper agent's turn ends; cost an implement seat 11 minutes of work,
+  RC 08); (2) `codex-run.sh` default zero-output stall window raised 120s→300s (codex exec
+  goes legitimately quiet composing one large patch — a seat was stall-killed twice mid-write,
+  RC 01); (3) provenance self-destruction guard: a workspace-write worker that deletes
+  `_codex_run.log`/`_brief.txt` while tidying its deliverables destroyed the up-front
+  PROVENANCE stamp and turned an honest, self-verified patch into a fail-closed RC 06 reject —
+  `finish()` in `_je-run-lib.sh` now restamps a missing provenance line from `PROV_LINE`
+  (set by all five runners; restamped copy suffixed `restamped=finish` for auditability), and
+  the attempt brief forbids deleting workspace scratch files. Tests:
+  `workflows/tournament-dispatch-hygiene.test.mjs` (structural) + a `clobber` behavioural case
+  in `bin/codex-run.test.sh`.
+
 - **Model fallback ladder for native anthropic seats (operator-requested resilience).** The
   orchestrating session may run on a model (Fable) whose safety sensitivity can block a
   sub-agent call outright or downgrade it — a blocked seat now degrades one rung down the

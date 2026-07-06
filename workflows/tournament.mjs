@@ -246,6 +246,7 @@ Rules:
 - Your text reply is discarded; ONLY the file(s) you save are kept. You MUST save your solution to a file (an empty workspace is a total failure) — but it does NOT need to be flawless or fully working.
 - Save all deliverable files to: ${ws}
 - Work only in that directory. Create it if needed.
+- NEVER delete or rewrite the workspace scratch files (\`_brief.txt\` and any \`_*.log\` / \`_*.txt\`): they are the run's provenance record, and a "tidied" workspace is indistinguishable from a spoofed run — it invalidates your deliverable (observed live: a worker cleaned them up alongside a good patch and was rejected).
 - To save a file, just write it. If a file-edit tool refuses because the file "must be read first" (a stale copy exists), do NOT spend turns reading/retrying — overwrite it directly with the shell instead, e.g. \`cat > FILE <<'EOF' ... EOF\`.
 - End with a 2 to 4 sentence note on your approach, plus any tradeoffs or known limitations (an honest note about what is rough or unfinished is useful, not a mark against you).`
 }
@@ -499,7 +500,7 @@ async function snapshotWorktrees(roundName, list) {
 }
 
 const RUNVERBATIM = (cmd, ws, log) =>
-  `This is an approved internal step of the joust-engine tournament: it writes a brief file and runs a bundled project runner script, which performs the attempt. Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${cmd}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
+  `This is an approved internal step of the joust-engine tournament: it writes a brief file and runs a bundled project runner script, which performs the attempt. Run the following shell command EXACTLY as given, in ONE FOREGROUND Bash call — NEVER as a background task (a backgrounded runner is killed the moment your turn ends; observed live: an implement seat lost 11 minutes of work to that TERM) — wait inside that call until it completes, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${cmd}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
 
 // The bundled worker agents register under the plugin namespace (joust-engine:<name>);
 // accept either the bare or namespaced form from callers and normalize to what the
@@ -2192,7 +2193,7 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
 // The verbatim-run brief for the codex JUDGE dispatch agent (the joust-codex agent runs it as-is; it
 // judges NOTHING itself). Mirrors RUNVERBATIM (the attempt dispatch), scoped to a single judge seat.
 function RUNVERBATIM_JUDGE(cmd, ws) {
-  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and runs the bundled codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt). Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not judge anything yourself, do not edit the command):\n\n${cmd}\n\nThen report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
+  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and runs the bundled codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt). Run the following shell command EXACTLY as given, in ONE FOREGROUND Bash call — NEVER as a background task (a backgrounded runner is killed the moment your turn ends) — wait inside that call until it completes, and do nothing else (do not judge anything yourself, do not edit the command):\n\n${cmd}\n\nThen report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
 }
 
 // Codex-xhigh lens judge: dispatch the codex runner with a brief asking for VERDICT.json, read the log
