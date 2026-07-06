@@ -1423,6 +1423,14 @@ function convergenceStampShell(line) {
   return `printf '\\n--- Convergence check ---\\n%s\\n' ${q(line)}`
 }
 
+// R4 (2026-07-07): the pool-rebuild relay returns the script's final JPOOL line so the engine can
+// READ-BACK VERIFY the rebuilt pool against the set it judged into contention. Fail-safe only: a
+// corrupted relay can merely cause a spurious disarm (collapse off = pre-dedup behaviour).
+const POOL_VERIFY_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { raw: { type: 'string' } },
+  required: ['raw'],
+}
 const MECH_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
@@ -1584,14 +1592,43 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
   // + the stamp block. repoMode: enrichBlindPool's rebuild carries the stamp via mechStampShell.
   if (!repoMode) {
     const pool = `${reviewDir}/_pool.md`
-    const rebuild = [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(grouped.filter(inContention).map(c => {
+    // R4 read-back verify (2026-07-07): the rebuild used to be fire-and-forget — a silently failed
+    // rebuild left judges reading a STALE pool (duplicate sections, no stamps) that disagreed with
+    // the collapsed contention set. Now the script prints a terminal JPOOL line (section count +
+    // sorted letters, parsed from the pool ON DISK after the mv) and the engine verifies it against
+    // the exact set it is about to judge. Verified => collapse stands. Two failures => DISARM the
+    // collapse (uncollapsed contention = pre-dedup behaviour, matching whatever pool rebuild we can
+    // still land) — a mismatched relay can only ever disarm, never mis-collapse. NOTE: a candidate
+    // whose own file content contains a line starting "===== Candidate " inflates the count and
+    // causes a spurious disarm — fail-safe direction, accepted.
+    const rebuildFor = (set) => [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(set.map(c => {
       const dest = `${reviewDir}/${c.blind}`
       return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; ${contractStampShell(dest)}; ${convergenceStampShell(convergenceLineFor(c))}; echo; } >> "$tmp"`
-    })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
-    await agentLadder(
-      `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
-      { model: HELPER_MODEL, phase: phaseTitle, label: 'mechanical-pool' }
-    ).catch(() => null)
+    })).concat([
+      `mv -f "$tmp" ${q(pool)}`,
+      `echo "JPOOL $(grep -c '^===== Candidate ' ${q(pool)} 2>/dev/null | tr -d ' ') $(grep '^===== Candidate ' ${q(pool)} 2>/dev/null | awk '{print $3}' | sort | tr '\\n' ' ')"`,
+    ]).join('\n')
+    const verifyPool = async (set, vlabel) => {
+      const res = await agentLadder(
+        `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps and prints ONE final line starting with "JPOOL". Return that final JPOOL line VERBATIM in the "raw" field — do not summarize, alter, or expose any other output:\n\n${rebuildFor(set)}`,
+        { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: phaseTitle, label: vlabel }
+      ).catch(() => null)
+      const raw = res && typeof res.raw === 'string' ? res.raw : ''
+      const m = raw.match(/JPOOL\s+(\d+)\s*(.*)$/)
+      if (!m) return false
+      const want = set.map(c => c.blind).sort()
+      const got = m[2].trim().split(/\s+/).filter(Boolean).sort()
+      return Number(m[1]) === want.length && got.length === want.length && want.every((l, i) => got[i] === l)
+    }
+    const contenders = grouped.filter(inContention)
+    let poolOk = await verifyPool(contenders, 'mechanical-pool')
+    if (!poolOk) poolOk = await verifyPool(contenders, 'mechanical-pool-retry')
+    if (!poolOk) {
+      log(`JE-DEDUP-POOL-VERIFY [${phaseTitle}]: rebuilt pool failed read-back verification against the collapsed contention set after a retry — DISARMING dedup collapse this round (fail-safe: judges must never read a pool that disagrees with the judged set).`)
+      const uncollapsed = merged.map(c => { const { collapse, ...rest } = c; return rest })
+      await verifyPool(uncollapsed.filter(inContention), 'mechanical-pool-uncollapsed')
+      return uncollapsed
+    }
   }
   return grouped
 }

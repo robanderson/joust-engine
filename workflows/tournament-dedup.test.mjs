@@ -221,3 +221,32 @@ test('dynamic-M seat trim gates the pool BEFORE the A/B assignment and BEFORE im
   // of an already-alternated one — so the old assignAbSeeds(implementAttempts, …) wiring is gone.
   assert.ok(!SRC.includes('assignAbSeeds(implementAttempts'), 'A/B must not re-alternate the untrimmed base pool')
 })
+
+// ---- R4 (2026-07-07): pool-rebuild read-back verify — collapse only takes effect if the pool on
+// disk verifies against the exact contention set; two failures DISARM the collapse (fail-safe).
+test('pool rebuild is read-back verified: JPOOL line parsed from the pool ON DISK after the mv', () => {
+  const mv = at('`mv -f "$tmp" ${q(pool)}`,')
+  const jpool = at('echo "JPOOL')
+  assert.ok(mv > 0 && jpool > mv, 'JPOOL is computed AFTER the atomic rename, from the real pool file')
+  assert.ok(SRC.includes('POOL_VERIFY_SCHEMA'), 'verification relay is schema-forced')
+})
+
+test('verify compares count AND the sorted letter set against the judged contention set', () => {
+  assert.ok(SRC.includes('const want = set.map(c => c.blind).sort()'))
+  assert.ok(SRC.includes('Number(m[1]) === want.length && got.length === want.length && want.every((l, i) => got[i] === l)'))
+})
+
+test('two failed verifies DISARM the collapse: uncollapsed contention set, loud log, one salvage rebuild', () => {
+  const retry = at("verifyPool(contenders, 'mechanical-pool-retry')")
+  const disarm = at('JE-DEDUP-POOL-VERIFY')
+  const strip = at('const { collapse, ...rest } = c')
+  assert.ok(retry > 0 && disarm > retry && strip > disarm, 'retry, then loud disarm, then collapse fields stripped')
+  assert.ok(SRC.includes("verifyPool(uncollapsed.filter(inContention), 'mechanical-pool-uncollapsed')"),
+    'a best-effort uncollapsed rebuild still lands stamps for the set actually judged')
+})
+
+test('a verified rebuild returns the grouped (collapsed) set unchanged — the happy path is intact', () => {
+  const ok = at('let poolOk = await verifyPool(contenders')
+  const ret = SRC.indexOf('return grouped', ok)
+  assert.ok(ok > 0 && ret > ok, 'grouped is returned only after verification')
+})
