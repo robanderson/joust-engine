@@ -982,7 +982,12 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
   // phaseKind selects the framing: 'plan' (Rounds 1–2, produce a PLAN artifact) or 'implement'
   // (Rounds 3–4, apply the change, seeded with the winning plan verbatim via seedPlanPath).
   const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance, contextPath, phaseKind, seedPlanPath)
-  const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle }
+  // model: HELPER_MODEL is set even for agentType (runner-wrapper) dispatches: an explicit model
+  // OVERRIDES the agent definition's frontmatter, and the harness does NOT reliably honour that
+  // frontmatter for workflow agentType calls (observed live: 28 codex-dispatch wrappers ran on
+  // HAIKU despite `model: sonnet` frontmatter — operator policy is sonnet MINIMUM for all engine
+  // work; haiku's base predates strong agentic training). Native branches overwrite with a.model.
+  const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle, model: HELPER_MODEL }
   let prompt
   if (a.dispatch === 'glm') {
     opts.agentType = nsAgent(a.agentType)
@@ -2082,7 +2087,8 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
   let lastFail = classifyCodexJudgeFailure('dispatch')
   for (let i = 1; i <= 2; i++) {
     try {
-      await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), phase: phaseTitle, label: `${label}-codex-dispatch` })
+      // model pinned alongside agentType: frontmatter is not reliably honoured (see dispatch()).
+      await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), model: HELPER_MODEL, phase: phaseTitle, label: `${label}-codex-dispatch` })
     } catch (e) {
       log(`council ${label} (${lens.key}) codex-xhigh dispatch attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
       lastFail = classifyCodexJudgeFailure('dispatch')

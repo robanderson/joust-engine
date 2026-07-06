@@ -160,8 +160,11 @@ function auditCalls(name) {
     if (args == null) { offenders.push({ at: m.index, why: 'unbalanced call' }); continue }
     if (!args.trim()) continue // `agent()` in a comment — a mention, not a call
     const code = stripStrings(args)
-    const ok = /\b(model|agentType)\s*:/.test(code) ||
-      // dispatch()'s single pass-through: opts is branch-built (model OR agentType always set)
+    // TIGHTENED (haiku leak, run-h calibration): agentType alone no longer passes — the harness
+    // does not reliably honour wrapper frontmatter for workflow agentType calls (28 codex-dispatch
+    // wrappers ran on HAIKU despite sonnet frontmatter). Every call must carry an explicit model:.
+    const ok = /\bmodel\s*:/.test(code) ||
+      // dispatch()'s single pass-through: opts is branch-built (model ALWAYS set at construction)
       // and the wrapper's runtime guard (asserted below) throws otherwise.
       (name === 'agentLadder' && code.replace(/\s+/g, ' ').trim() === 'prompt, opts')
     if (!ok) offenders.push({ at: m.index, snippet: SCAN.slice(m.index, m.index + 120).replace(/\n/g, ' ') })
