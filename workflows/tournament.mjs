@@ -4041,7 +4041,7 @@ function attemptIdentity(a) {
 }
 function attemptIdentityKey(a) {
   const id = attemptIdentity(a)
-  return [id.label, id.dispatch, id.model || '', id.displayModel || '', id.agentType || ''].join('')
+  return [id.label, id.dispatch, id.model || '', id.displayModel || '', id.agentType || ''].join('\u0001')
 }
 
 // Canonical config string the fingerprint is hashed over (hashing itself is done by the caller with
