@@ -3891,6 +3891,17 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
   phase('Rejudge')
   log(`▶ REJUDGE: ${A.rejudgeCandidates.length} staged candidate(s) — fixed mechanical gate + code council, no generation rounds`)
   await buildContext() // pins gateBaseShaFile (HEAD) for the gate's real-apply snapshot baseline
+  // args.rejudgeBaseSha (2026-07-07, run-j2 post-mortem): staged candidates were authored against
+  // the SOURCE run's tree, not today's HEAD — engine commits landed between run and re-judge drift
+  // the pinned baseline and false-kill candidates whose patch context moved (observed live: one
+  // more kill per commit batch). A rejudge MUST judge against the tree the candidates targeted, and
+  // an A/B pair (same pool, two prompt arms) MUST share one baseline. Strict 7-40 hex or ignored.
+  if (/^[0-9a-f]{7,40}$/.test(String(A.rejudgeBaseSha || ''))) {
+    const pinCmd = `mkdir -p ${q(`${runDir}/_context`)} && { git rev-parse --verify ${q(`${String(A.rejudgeBaseSha)}^{commit}`)} 2>/dev/null || printf ''; } > ${q(gateBaseShaFile)} && wc -c ${q(gateBaseShaFile)}`
+    await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${pinCmd}`,
+      { model: HELPER_MODEL, phase: 'Rejudge', label: 'rejudge-base-pin' }).catch(() => null)
+    log(`REJUDGE baseline pinned to ${A.rejudgeBaseSha} (the tree the candidates were authored against)`)
+  }
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
   const rjN = A.rejudgeCandidates.length
   const rjRot = Number.isInteger(A.rejudgeRot) ? A.rejudgeRot : 3

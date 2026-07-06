@@ -56,3 +56,13 @@ test('mapping persists model + source attribution and the taskBucket rides along
 test('meta declares the Rejudge phase', () => {
   assert.ok(SRC.includes(`{ title: 'Rejudge' }`), 'phase title in meta.phases')
 })
+
+test('rejudgeBaseSha pins the gate baseline to the tree the candidates were AUTHORED against (strict hex, verified rev-parse)', () => {
+  assert.match(SRC, /\/\^\[0-9a-f\]\{7,40\}\$\/\.test\(String\(A\.rejudgeBaseSha \|\| ''\)\)/, 'strict sha shape or ignored')
+  const i = SRC.indexOf('A.rejudgeBaseSha')
+  const seg = SRC.slice(i, i + 700)
+  assert.ok(seg.includes('rev-parse --verify'), 'sha verified against the repo, never trusted as text')
+  assert.ok(seg.includes('gateBaseShaFile'), 'overwrites the context-time HEAD pin')
+  const ctx = SRC.indexOf('await buildContext() // pins gateBaseShaFile (HEAD)')
+  assert.ok(ctx > 0 && ctx < i, 'pin overwrite runs AFTER buildContext so it wins')
+})
