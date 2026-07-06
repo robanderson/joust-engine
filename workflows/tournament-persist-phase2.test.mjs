@@ -79,7 +79,9 @@ function makePersist(agentStub, pluginBin) {
     slice('// ---- begin: structural persist helpers', '// ---- end: structural persist helpers') +
     '\n' + slice('async function persist(pairs, phaseTitle) {', '// Persist phase 2 (issue #33): the verdict.json entries') +
     '\nreturn persist;'
-  return new Function('agent', 'PLUGIN_BIN', 'log', 'HELPER_MODEL', 'PERSIST_SCHEMA', 'q', src)(
+  // persist() now routes through the shared model-ladder wrapper (agentLadder); at sonnet there is
+  // no rung below, so stubbing the wrapper directly preserves the exact pre-ladder semantics.
+  return new Function('agentLadder', 'PLUGIN_BIN', 'log', 'HELPER_MODEL', 'PERSIST_SCHEMA', 'q', src)(
     agentStub, pluginBin, () => {}, 'sonnet', {}, q)
 }
 

@@ -6,6 +6,29 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Model fallback ladder for native anthropic seats (operator-requested resilience).** The
+  orchestrating session may run on a model (Fable) whose safety sensitivity can block a
+  sub-agent call outright or downgrade it — a blocked seat now degrades one rung down the
+  ladder instead of dying. Pure marked block `model ladder`: `MODEL_LADDER =
+  ['fable','opus','sonnet']` + `nextModelDown()` (sonnet is the hard FLOOR — haiku is retired
+  by operator policy; unknown/haiku/sonnet → null). One shared wrapper `agentLadder(prompt,
+  opts, ladder)` (no per-site copies): runner dispatches (`agentType`) pass straight through;
+  `opts.model` is otherwise REQUIRED (runtime guard — no engine sub-agent may inherit the
+  session model); a thrown/blocked attempt (throw OR null) retries ONCE at
+  `nextModelDown(opts.model)`, records `{label, phase, from, to}` in the `model_downgrades`
+  array surfaced on every terminal workflow return, logs loudly (`JE-MODEL-DOWNGRADE`), and
+  tags council `judge_model` with the model that ACTUALLY answered (`ladder.used`). The rung
+  slots AFTER a site's own same-model retries and BEFORE its dead/fallback path (askLensNative:
+  opus try, opus retry, THEN sonnet rung, then dead; guidance synthesis likewise); a rung
+  failure re-surfaces the ORIGINAL outcome so every existing dead-seat path is byte-identical.
+  EXCEPTIONS: the primary `security` lens and the `security-x` opus-fallback seat NEVER
+  downgrade (sonnet retry forbidden — their failure keeps today's dead-judge/fail-closed path);
+  sonnet-seated helpers (persist/stage/etc.) have no rung below by construction. Explicit-model
+  AUDIT: every `agent()`/`agentLadder()` call in `workflows/tournament.mjs` carries an explicit
+  `model:` or `agentType:` — pinned as a structural test so it can never regress. Tests: pure
+  ladder units + the audit + security-exclusion / return-value / log-line structural guards in
+  `workflows/tournament-model-ladder.test.mjs`.
+
 - **INVESTIGATE→COMPOSITE pipeline v1 (`args.investigate`, default OFF; spec
   `docs/superpowers/specs/2026-07-06-investigate-composite-pipeline.md`).** For vague-goal /
   issue-shaped tasks where the expensive part is finding WHAT is true: findings COMPOSE (the

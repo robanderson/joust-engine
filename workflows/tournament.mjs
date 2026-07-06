@@ -378,7 +378,7 @@ async function buildContext() {
   const cat = contextCatCmd(contextFiles)
   const cmd = `mkdir -p ${q(`${runDir}/_context`)} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
   log(`Bundling ${contextFiles.length} context file(s) → ${contextPath}`)
-  await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
+  await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
     { model: HELPER_MODEL, phase: 'Round 1', label: 'context' }).catch(() => null)
 }
 
@@ -450,7 +450,7 @@ async function buildWorktrees(roundName, list) {
   if (!baseSha) throw new Error('repoMode requires args.baseRef')
   const script = list.map(c => worktreeSetupShell(c, roundName)).join('\n')
   log(`Preparing ${list.length} git worktree(s) for ${roundName} from ${baseSha}`)
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It serially creates git worktrees for the tournament attempts; do not parallelize it and do not do anything else.\n\n${script}`,
     { model: HELPER_MODEL, phase: roundName === 'round-1' ? 'Round 1' : 'Round 2', label: `${roundName}-worktrees` }
   ).catch(() => null)
@@ -485,7 +485,7 @@ async function snapshotWorktrees(roundName, list) {
     ...list.map(c => snapshotShell(c, roundName)),
   ].join('\n')
   log(`Snapshotting ${list.length} worktree(s) for ${roundName}`)
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It serially snapshots each worktree into at most one fixed-identity commit; do not parallelize it and do not do anything else.\n\n${script}`,
     { model: HELPER_MODEL, phase: roundName === 'round-1' ? 'Review' : 'Final rank', label: `${roundName}-snapshot` }
   ).catch(() => null)
@@ -498,6 +498,66 @@ const RUNVERBATIM = (cmd, ws, log) =>
 // accept either the bare or namespaced form from callers and normalize to what the
 // agent registry actually resolves.
 const nsAgent = t => (t && !t.includes(':')) ? `joust-engine:${t}` : t
+
+// ---- begin: model ladder ------------------------------------------------------------------------
+// Model fallback ladder (operator-requested resilience, 2026-07-06). The orchestrating session may
+// run on a model (Fable) whose safety sensitivity can block a sub-agent call outright or downgrade
+// it; a blocked NATIVE anthropic seat must degrade ONE rung down this ladder instead of dying.
+// PURE (extract-and-eval'able like the return-codes block): no closures over module state, no I/O.
+// haiku is RETIRED by operator policy (no haiku sub-agents until a Haiku 5.x base ships), so sonnet
+// is the hard FLOOR: nextModelDown('sonnet') === null, and unknown ids (incl. 'haiku') -> null.
+const MODEL_LADDER = ['fable', 'opus', 'sonnet']
+function nextModelDown(model) {
+  const i = MODEL_LADDER.indexOf(String(model == null ? '' : model).trim().toLowerCase())
+  if (i < 0) return null                 // unknown / haiku (retired): no rung below
+  return MODEL_LADDER[i + 1] || null     // sonnet -> null: NEVER below sonnet
+}
+// ---- end: model ladder --------------------------------------------------------------------------
+
+// ---- begin: agent ladder wrapper (impure; the ONE downgrade-retry chokepoint) --------------------
+// Downgrade bookkeeping: one entry per successful ladder rescue. Surfaced in the workflow return
+// value as `model_downgrades` (observability only — it never gates dispatch/judging/any return).
+const modelDowngrades = [] // { label, phase, from, to }
+
+// agentLadder(prompt, opts, ladder) — agent() plus ONE downgrade-retry rung for NATIVE anthropic
+// seats. The SINGLE shared wrapper (no per-site copies). Contract:
+//   * opts.agentType (runner dispatch) passes straight through: command runners are exempt.
+//   * opts.model is REQUIRED otherwise — no engine sub-agent may inherit the session model.
+//   * a thrown/blocked attempt (throw OR null result) retries ONCE at nextModelDown(opts.model);
+//     rung success records {label, phase, from, to} in modelDowngrades + logs LOUDLY
+//     (JE-MODEL-DOWNGRADE) and sets ladder.used to the model that ACTUALLY answered (so council
+//     seats tag judge_model truthfully); a rung failure propagates the ORIGINAL outcome so every
+//     existing dead/fallback path stays byte-for-byte.
+//   * ladder.eligible === false disables the rung entirely: the security lenses (primary
+//     'security' AND the 'security-x' opus-fallback seat) stay opus minimum — a sonnet retry is
+//     FORBIDDEN for them (their failure keeps today's dead-judge path) — and a retry-loop site
+//     passes eligible only on its FINAL same-model try, so the rung slots AFTER the site's own
+//     retries and BEFORE its dead path (askLensNative: opus try, opus retry, THEN sonnet rung).
+//   * sonnet floor by construction: nextModelDown('sonnet') === null, so every sonnet-seated
+//     helper (persist/stage/etc.) keeps today's exact behaviour — no rung below sonnet.
+async function agentLadder(prompt, opts, ladder = {}) {
+  if (opts && opts.agentType) return agent(prompt, opts) // runner dispatch: exempt (command runners)
+  if (!opts || !opts.model) throw new Error('agentLadder: opts.model or opts.agentType is required — no engine sub-agent may inherit the session model')
+  const from = opts.model
+  ladder.used = from
+  const to = ladder.eligible === false ? null : nextModelDown(from)
+  let res, failure = null
+  try { res = await agent(prompt, opts) } catch (e) { failure = e }
+  if (!failure && res != null) return res
+  if (to == null) { if (failure) throw failure; return res } // no rung: today's outcome, unchanged
+  const label = opts.label || '?'
+  const phase = opts.phase || '?'
+  log(`JE-MODEL-DOWNGRADE [${phase}] ${label}: '${from}' seat ${failure ? `threw (${String(failure).slice(0, 120)})` : 'returned null (blocked/empty)'} — retrying ONCE at '${to}' (model fallback ladder; floor=sonnet, haiku retired).`)
+  let res2
+  try { res2 = await agent(prompt, { ...opts, model: to }) }
+  catch (e2) { if (failure) throw failure; throw e2 } // rung also failed: surface the ORIGINAL class
+  if (res2 == null) { if (failure) throw failure; return res2 }
+  ladder.used = to
+  modelDowngrades.push({ label, phase, from, to })
+  log(`JE-MODEL-DOWNGRADE [${phase}] ${label}: '${to}' rung answered — downgrade recorded (${from} -> ${to}); verdict metadata carries the ACTUAL model.`)
+  return res2
+}
+// ---- end: agent ladder wrapper -------------------------------------------------------------------
 
 // ---- dispatch-failure classification (#45) -------------------------------
 // A worker attempt fails in two very different ways: (a) the model RAN but produced a
@@ -966,7 +1026,9 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
     opts.model = a.model
     prompt = b
   }
-  return agent(prompt, opts)
+  // agentLadder: runner dispatches (opts.agentType) pass straight through; a NATIVE anthropic
+  // attempt that is blocked (throw/null) gets ONE downgrade-retry rung (model fallback ladder).
+  return agentLadder(prompt, opts)
     .then(res => ({ label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws, res }))
     .catch(e => {
       const msg = String(e)
@@ -1271,7 +1333,7 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       `echo "JCON ${c.blind} $ccls"` +
       `)`
   }).join('\n')
-  const res = await agent(
+  const res = await agentLadder(
     `Run this exact shell script in ONE Bash call. It prints two lines per candidate: "JMECH <letter> <class> [detail]" and "JCON <letter> <class>". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}; and set that same entry's contract to the class token from the matching letter's JCON line (omit contract if that line is missing). Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
     { model: HELPER_MODEL, schema: MECH_SCHEMA, phase: phaseTitle, label: 'mechanical-gate' }
   ).catch(() => null)
@@ -1292,7 +1354,7 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       const dest = `${reviewDir}/${c.blind}`
       return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; ${contractStampShell(dest)}; echo; } >> "$tmp"`
     })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
-    await agent(
+    await agentLadder(
       `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
       { model: HELPER_MODEL, phase: phaseTitle, label: 'mechanical-pool' }
     ).catch(() => null)
@@ -1362,7 +1424,7 @@ async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
       `echo "JEVID ${c.blind} $n $m"` +
       `)`
   }).join('\n')
-  const res = await agent(
+  const res = await agentLadder(
     `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEVID <letter> <cited> <verified>". Then return the structured results: for EACH printed JEVID line an entry {blind: the letter, cited: the first number, verified: the second number}. Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
     { model: HELPER_MODEL, schema: EVIDENCE_SCHEMA, phase: phaseTitle, label: 'evidence-gate' }
   ).catch(() => null)
@@ -1377,7 +1439,7 @@ async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
     const dest = `${reviewDir}/${c.blind}`
     return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name evidence.txt ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${evidenceStampShell(dest)}; echo; } >> "$tmp"`
   })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with evidence-verification stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
     { model: HELPER_MODEL, phase: phaseTitle, label: 'evidence-pool' }
   ).catch(() => null)
@@ -1434,7 +1496,7 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
            `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
            `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
   })).join('\n')
-  const res = await agent(
+  const res = await agentLadder(
     `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEV <letter> d=<0|1> p=<0|1>", and (for runner candidates only) a matching line "JRC <letter> JOUST-RC <code> <reason>" or "JRC <letter> NONE". Then return the structured results: for EACH printed JEV line, an entry {blind: the letter, deliverable: (d==1), provenance: (p==1)}; and for the matching JRC line, set that blind's rc to the two-digit <code> and rcReason to the <reason> text after "JOUST-RC" ("NONE" or no JRC line => omit rc/rcReason). Report exactly what the script printed — do not infer or change values.\n\n${script}`,
     { model: HELPER_MODEL, schema: STAGE_SCHEMA, phase: phaseTitle, label: 'stage' }
   ).catch(() => null)
@@ -1547,7 +1609,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
            `printf '\\n'; } >> "$tmp"`
   }), `mv -f "$tmp" ${q(pool)}`].join('\n')
   const script = `${perCandidate}\n${rebuild}`
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It runs blind tournament checks and atomically rebuilds the blind pool. Do not print, summarize, or expose command output; do nothing else:\n\n${script}`,
     { model: HELPER_MODEL, phase: phaseTitle, label: 'test-lint-enrichment' }
   ).catch(() => null)
@@ -1963,8 +2025,10 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
   return askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
 }
 
-// Native Opus lens judge: opus, retry once (like judge()), reconcile. Tagged judgeModel:'opus'. This is
-// today's askLens body, unchanged except for the shared roots-warning check + the judgeModel tag.
+// Native Opus lens judge: opus, retry once (like judge()), THEN one model-ladder rung (opus try,
+// opus retry, sonnet rung, dead) — EXCEPT the security lenses, which stay opus minimum (sonnet
+// retry FORBIDDEN; their failure keeps today's dead-judge path). judgeModel is tagged with the
+// model that ACTUALLY answered (ladder.used), so a downgraded verdict is honest in the record.
 async function askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots) {
   const prompt = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot)
   const schema = isSecurityLens(lens.key)
@@ -1972,7 +2036,9 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
     : (roundNum === 1 ? LENS_R1_SCHEMA : LENS_DELIB_SCHEMA)
   for (let i = 1; i <= 2; i++) {
     try {
-      const raw = await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label })
+      // Ladder rung ONLY on the final same-model try, NEVER for a security lens.
+      const ladder = { eligible: i === 2 && !isSecurityLens(lens.key) }
+      const raw = await agentLadder(prompt, { model: 'opus', schema, phase: phaseTitle, label }, ladder)
       if (!raw || typeof raw !== 'object') throw new Error('lens judge returned no structured result (null)')
       // Integrity guard (same choke-point as reconcile(), see EV-judge-placeholder.md): covers BOTH round 1
       // and every deliberation round, since askLens() is the single call site for all of them.
@@ -1980,7 +2046,7 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
       if (integrityIssue) throw new Error(`council lens verdict failed integrity check: ${integrityIssue}`)
       const rootsIssue = checksRunRootsIssue(raw.checks_run, allowedRoots)
       if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
-      return { lens: lens.key, judgeModel: 'opus', ...reconcileLens(raw, labels) }
+      return { lens: lens.key, judgeModel: ladder.used || 'opus', ...reconcileLens(raw, labels) }
     } catch (e) {
       log(`council ${label} (${lens.key}) attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
       if (i === 2) return null // dead lens — council recomputes majority over the living
@@ -2024,7 +2090,7 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
       continue
     }
     try {
-      const readRaw = await agent(
+      const readRaw = await agentLadder(
         `Run this exact shell command in ONE Bash call and return its ENTIRE stdout, verbatim and unaltered, in the "raw" field. Do not summarize, truncate, or interpret it. Do nothing else:\n\n${dumpScript}`,
         { model: HELPER_MODEL, schema: CODEX_JUDGE_DUMP_SCHEMA, phase: phaseTitle, label: `${label}-codex-read` }
       )
@@ -2215,7 +2281,7 @@ Do not read any other files. You do NOT know which model produced which candidat
 
 Return one vote per candidate, for candidates ${letters.join(', ')} — each vote: label, approve (true = yes, it clearly passes this aspect; false = no, or too unclear to approve), and a SHORT reason (one clause). BINARY only: no scores, no ranking, no overall winner.`
   try {
-    const raw = await agent(prompt, { model: HELPER_MODEL, schema: ASPECT_VOTE_SCHEMA, phase: phaseTitle, label })
+    const raw = await agentLadder(prompt, { model: HELPER_MODEL, schema: ASPECT_VOTE_SCHEMA, phase: phaseTitle, label })
     if (!raw || !Array.isArray(raw.votes)) return null
     const set = new Set(letters)
     const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
@@ -2420,7 +2486,8 @@ ${block}
 Return only the two guidance lists (each item: text, conf, why).`
   for (let i = 1; i <= 2; i++) {
     try {
-      const g = await agent(prompt, { model: 'opus', schema: GUIDANCE_SYNTH_SCHEMA, phase: phaseTitle, label })
+      // Ladder rung ONLY on the final same-model try (opus try, opus retry, THEN sonnet rung).
+      const g = await agentLadder(prompt, { model: 'opus', schema: GUIDANCE_SYNTH_SCHEMA, phase: phaseTitle, label }, { eligible: i === 2 })
       if (g && typeof g === 'object' && Array.isArray(g.positives) && Array.isArray(g.challenges)) {
         // Integrity guard (same choke-point family as reconcile()/askLens()): reject schema-valid junk
         // guidance (e.g. every item literally {text:"a", why:"b"}) before it steers a fresh round-2.
@@ -2474,7 +2541,7 @@ async function steelmanChangeLists(finalists, verdicts, phaseTitle, label, aspec
   const block = JSON.stringify(verdicts.map(v => ({ lens: v.lens, vote: v.vote, ranking: v.ranking, reasoning: v.reasoning,
     candidates: (v.candidates || []).filter(c => finalists.includes(String(c.label || '').charAt(0))).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })) })), null, 2)
   try {
-    const res = await agent(
+    const res = await agentLadder(
       `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}${aspectSteelmanContext(aspects, finalists)}`,
       { model: 'opus', schema: STEELMAN_SCHEMA, phase: phaseTitle, label: `${label}-steelman` })
     const out = {}
@@ -2491,7 +2558,7 @@ async function steelmanChangeLists(finalists, verdicts, phaseTitle, label, aspec
 async function boostCandidate(origDir, outDir, items, phaseTitle, label) {
   const list = items.map((it, i) => `${i + 1}. ${it.change}\n   (addresses: ${it.addresses})`).join('\n')
   try {
-    await agent(
+    await agentLadder(
       `This is an approved internal step of the joust-engine tournament: apply a review-driven improvement pass to a candidate artifact. First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical. When done, reply "done".`,
       { model: 'opus', phase: phaseTitle, label })
     return true
@@ -2702,7 +2769,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       // ship the version that WON: copy the winning gated artifact over the winner's staged dir so
       // every downstream consumer (plan bundling, adoption, reports) gets the polished artifact.
       if (winEntry.ws !== `${reviewDir}/${finalWinner}`) {
-        await agent(`This is an approved internal step of the joust-engine tournament: adopt the improved winner artifact. Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; find "$DEST" -mindepth 1 -delete 2>/dev/null; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
+        await agentLadder(`This is an approved internal step of the joust-engine tournament: adopt the improved winner artifact. Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; find "$DEST" -mindepth 1 -delete 2>/dev/null; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
           { model: HELPER_MODEL, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`))
       }
     } else if (iter < maxIters) {
@@ -3076,7 +3143,7 @@ async function persist(pairs, phaseTitle) {
   // Run the given file list through the write-agent; return a map path -> {bytes, sha}.
   const writeAndMeasure = async (list, allowDerive) => {
     const script = list.map(f => stepFor(f, allowDerive)).join('\n')
-    const res = await agent(
+    const res = await agentLadder(
       `This is an approved internal step of the joust-engine tournament: persist result artifacts. ` +
       `Run this exact shell script in ONE Bash call, reproducing it VERBATIM — every heredoc body byte-for-byte, ` +
       `no reformatting, no abbreviation (the engine verifies checksums; any drift is detected and retried). ` +
@@ -3164,7 +3231,7 @@ async function maybeFileEngineIssues(phaseTitle) {
       const cmd = `mkdir -p ${q(`${runDir}/_rc-issues`)}; { printf '%s\\n' ${q(evLines.join('\n'))}; ${logGreps || 'true'}; } > ${q(ev)}; ` +
         `GH_REPO=${q(engineRepo)} JE_ISSUE_AUTOFILE=1 bash ${q(A.issueRunner)} new --sev ${sev} --area ${area} ` +
         `--title ${q(title)} --evidence-file ${q(ev)} --run-id ${q(safeRunId)} 2>&1; echo "JEI ${rc} rc=$?"`
-      const res = await agent(
+      const res = await agentLadder(
         `This is an approved internal step: file ONE dogfood issue for engine-fault class ${rc}. Run this exact shell command in ONE Bash call and report its stdout verbatim. Do nothing else:\n\n${cmd}`,
         { model: HELPER_MODEL, phase: phaseTitle, label: `rc-issue-${rc}` }).catch(() => null)
       const filed = /JEI .* rc=0\b/.test(String(res))
@@ -3286,7 +3353,7 @@ async function bundlePlan(planWs, seedPath) {
   const dir = seedPath.slice(0, seedPath.lastIndexOf('/'))
   const cmd = `mkdir -p ${q(dir)} && { echo "===== APPROVED PLAN (implement this verbatim) ====="; find ${q(planWs)} -type f 2>/dev/null | sort | while IFS= read -r f; do printf '\\n----- %s -----\\n' "$f"; cat "$f" 2>/dev/null; done; } > ${q(seedPath)} && wc -c ${q(seedPath)}`
   log(`Bundling winning plan → ${seedPath}`)
-  await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
+  await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
     { model: HELPER_MODEL, phase: 'Implement Round 3', label: 'seed-plan' }).catch(() => null)
 }
 
@@ -3417,7 +3484,7 @@ if (!blind1.length) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // failure-heavy abort: file engine-fault classes before returning
-  return { mode, n: N, rc_summary: rcSummaryLive(), error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
 }
 
 if (repoMode) await enrichBlindPool(blind1, `${runDir}/review-1`, 'Review')
@@ -3441,7 +3508,7 @@ if (composeOnly) {
   ], 'Review')
   await maybeFileEngineIssues('Review')
   return {
-    mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(),
+    mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades,
     poolPath: `${runDir}/review-1/_pool.md`,
     round1: { mapping: evMapping },
     candidates: stagedEv.filter(c => c.valid).map(c => ({ blind: c.blind, stagedDir: `${runDir}/review-1/${c.blind}`,
@@ -3461,7 +3528,7 @@ if (review.__failed) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // failure-heavy abort: file engine-fault classes before returning
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
 }
 
 if (review.no_consensus) {
@@ -3479,7 +3546,7 @@ if (review.no_consensus) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // abort path: RC observability must survive a NO_CONSENSUS stop
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
 }
 
 // P2: round-1 review is valid — incremental write BEFORE any round-2 dispatch (crash-survival linchpin)
@@ -3500,7 +3567,7 @@ if (mode === 'single') {
     { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, contributions }) },
   ], 'Review')
   await maybeFileEngineIssues('Review')
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping, review }, contributions }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions }
 }
 
 // ---- Two pass ----
@@ -3551,7 +3618,7 @@ if (!blindF.length) {
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
 }
 
 if (repoMode) await enrichBlindPool(blindF, `${runDir}/review-final`, 'Final rank')
@@ -3566,7 +3633,7 @@ if (finalRank.__failed) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
   await maybeFileEngineIssues('Final rank') // failure-heavy abort: file engine-fault classes before returning
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
 }
 
 if (finalRank.no_consensus) {
@@ -3583,7 +3650,7 @@ if (finalRank.no_consensus) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
   ], 'Final rank')
   await maybeFileEngineIssues('Final rank') // abort path: RC observability must survive a NO_CONSENSUS stop
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
 }
 
 if (finalRank.needs_orchestrator_pick) {
@@ -3600,7 +3667,7 @@ if (finalRank.needs_orchestrator_pick) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
   ], 'Final rank')
   await maybeFileEngineIssues('Final rank')
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, needs_orchestrator_pick: finalRank.needs_orchestrator_pick }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, needs_orchestrator_pick: finalRank.needs_orchestrator_pick }
 }
 
 // #7: resolve winnerRound against the VALID finalist set; omit the field if unresolved (no literal "undefined")
@@ -3669,6 +3736,7 @@ if (implement) {
     implementPhase: impl,
     contributions,
     rc_summary: rcSummaryLive(),
+    model_downgrades: modelDowngrades,
   }
 }
 
@@ -3679,4 +3747,5 @@ return {
   final: { mapping: finalMapping, rank: finalRank, ...(winnerEntry ? { winnerRound: winnerEntry.round } : {}) },
   contributions,
   rc_summary: rcSummaryLive(),
+  model_downgrades: modelDowngrades,
 }
