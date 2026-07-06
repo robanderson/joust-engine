@@ -83,7 +83,13 @@ const dynamicMBucket = A.taskBucket || null
 // no round 2, no implement. The caller (the orchestrating model) reads the blind pool and
 // composes/implements itself. Mutually exclusive with implement. `investigate` implies it.
 const composeOnly = (A.composeOnly === true || investigate) && !implement
-const mode = implement ? 'two' : A.mode
+// Run depth (Rob, 2026-07-07): the steelman shootout already iterates 1..N times on the BEST
+// brief, so 'fast' and DEFAULT implement runs skip the whole Round-2 plan rewrite — the R1
+// review becomes the FINAL plan decision point (steelman included) and its winner feeds the
+// implementers. Only a 'deep' run keeps the guided Round-2 rewrite. An EXPLICIT :2 (A.mode
+// 'two' from the sigil) is always honoured — the user asked for two-pass by name.
+const RUN_DEPTH = A.depth === 'deep' ? 'deep' : A.depth === 'fast' ? 'fast' : 'default' // parser field: depth
+const mode = implement ? (RUN_DEPTH === 'deep' || A.mode === 'two' ? 'two' : 'single') : A.mode
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 
 // Judge council (issue #22). The default judge at BOTH decision points (Phase 3 review, Phase 5 final
@@ -2033,6 +2039,8 @@ function guidanceStub(g) {
 // security behaviour keys off this predicate; the fail-closed security-DEAD policy stays keyed
 // to the PRIMARY 'security' seat only (security-x already falls back to Opus like other codex seats).
 const isSecurityLens = (key) => key === 'security' || key === 'security-x'
+// A PLAN decision point (design-brief artifacts): the same phase split defaultLensesFor uses.
+const isPlanPoint = (phaseTitle) => phaseTitle === 'Review' || phaseTitle === 'Final rank'
 
 function chooseJudgeDispatch(lens, legacyMix, codexRunnerConfigured) {
   if (legacyMix) return 'native'
@@ -2968,7 +2976,7 @@ async function steelmanChangeLists(finalists, verdicts, phaseTitle, label, aspec
     candidates: (v.candidates || []).filter(c => finalists.includes(String(c.label || '').charAt(0))).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })) })), null, 2)
   try {
     const res = await agentLadder(
-      `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}${aspectSteelmanContext(aspects, finalists)}`,
+      `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.${isPlanPoint(phaseTitle) ? `\n\nALTITUDE (hard rule for THIS decision point): the finalists are DESIGN BRIEFS, and they must STAY design briefs. Every change item must be an edit to the brief's TEXT (approach, surfaces, risks, acceptance criteria). NEVER emit an item that instructs creating, shipping, or writing code, tests, or any runnable file — even if the task text names a code deliverable; the code is produced LATER by the implement stage from the winning brief. An item like "ship the runnable file" is a redesign of the artifact class and is forbidden (observed live: it flipped a plan steelman into an expensive secret implementation loop).` : ''}\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}${aspectSteelmanContext(aspects, finalists)}`,
       { model: 'opus', schema: STEELMAN_SCHEMA, phase: phaseTitle, label: `${label}-steelman` })
     const out = {}
     for (const c of (res && res.changes) || []) {
@@ -2985,7 +2993,7 @@ async function boostCandidate(origDir, outDir, items, phaseTitle, label) {
   const list = items.map((it, i) => `${i + 1}. ${it.change}\n   (addresses: ${it.addresses})`).join('\n')
   try {
     await agentLadder(
-      `Joust-engine steelman step: apply a review-driven improvement pass to a COPY of a candidate artifact (both paths are inside this run's scratch directory; the original stays untouched). First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical.\n\nHARD STOP DISCIPLINE (this pass is edit-and-stop, not iterate-until-perfect): make ONE editing pass over the listed items, then STOP and reply "done". Do NOT run test suites, builds, or the artifact itself — a separate staging gate validates the boosted artifact after you finish, so any verification you run here is duplicated spend (observed live: a boost agent burned 88 tool calls re-running full test suites). At most, you may re-read an edited file once to confirm the edit landed. If a change-list item cannot be applied as written, skip it and note the skip in your final reply instead of iterating on it.`,
+      `Joust-engine steelman step: apply a review-driven improvement pass to a COPY of a candidate artifact (both paths are inside this run's scratch directory; the original stays untouched). First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical.${isPlanPoint(phaseTitle) ? ` ALTITUDE (hard rule): this artifact is a DESIGN BRIEF — edit its text only. Do NOT create code, tests, or any new runnable file, even if a change item or the task seems to ask for one; skip such an item and note the skip (implementation happens in a later stage from the winning brief).` : ''}\n\nHARD STOP DISCIPLINE (this pass is edit-and-stop, not iterate-until-perfect): make ONE editing pass over the listed items, then STOP and reply "done". Do NOT run test suites, builds, or the artifact itself — a separate staging gate validates the boosted artifact after you finish, so any verification you run here is duplicated spend (observed live: a boost agent burned 88 tool calls re-running full test suites). At most, you may re-read an edited file once to confirm the edit landed. If a change-list item cannot be applied as written, skip it and note the skip in your final reply instead of iterating on it.`,
       { model: 'opus', phase: phaseTitle, label })
     return true
   } catch (e) { log(`steelman boost ${label} failed: ${String(e).slice(0, 100)} — candidate re-enters at its last gated version (ratchet)`); return false }

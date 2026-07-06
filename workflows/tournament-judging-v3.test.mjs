@@ -227,3 +227,21 @@ test('(structural) steelman runoff re-runs the mechanical gate on the boosted co
   assert.ok(i > 0, 'gate-invalidated boosts ratchet back to the last gated version')
   assert.ok(SRC.includes('-mechrepair'), 'repair pass re-stages + re-gates under a fresh runoff dir')
 })
+
+// ---- run depth (2026-07-07, Rob): fast/default implement runs skip the Round-2 plan rewrite ----
+test('(structural) run depth gates the R2 rewrite: implement forces two-pass ONLY for deep or an explicit :2', () => {
+  assert.ok(SRC.includes(`const RUN_DEPTH = A.depth === 'deep' ? 'deep' : A.depth === 'fast' ? 'fast' : 'default'`))
+  assert.ok(SRC.includes(`const mode = implement ? (RUN_DEPTH === 'deep' || A.mode === 'two' ? 'two' : 'single') : A.mode`),
+    'fast/default implement runs: R1 review IS the final plan decision point (steelman included); deep or explicit :2 keeps Round 2')
+})
+
+// ---- plan-altitude clamp (2026-07-07, hangman live finding): steelman/boost must never build code ----
+test('(structural) PLAN-point steelman + boost carry the altitude clamp — design briefs stay design briefs', () => {
+  assert.ok(SRC.includes(`const isPlanPoint = (phaseTitle) => phaseTitle === 'Review' || phaseTitle === 'Final rank'`))
+  const sm = SRC.indexOf('You are the STEELMAN for a blind review')
+  assert.ok(SRC.slice(sm, sm + 2600).includes('isPlanPoint(phaseTitle)'), 'steelman change-lists altitude-clamped at plan points')
+  assert.ok(SRC.includes('NEVER emit an item that instructs creating, shipping, or writing code'),
+    'the exact live failure ("Ship the runnable hangman.py") is named and forbidden')
+  const boost = SRC.indexOf('apply a review-driven improvement pass to a COPY')
+  assert.ok(SRC.slice(boost, boost + 2200).includes('isPlanPoint(phaseTitle)'), 'boost brief altitude-clamped at plan points')
+})
