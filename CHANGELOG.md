@@ -6,6 +6,59 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Rejudge mode (`args.rejudgeCandidates`)** — judge an EXISTING staged implement pool with
+  the current mechanical gate + full code council (fresh rotated blind letters, stale gate
+  stamps stripped, no generation rounds). Born as the run-i salvage (a gate bug false-killed
+  11/12 staged candidates after dispatch had already paid for them) and kept as a permanent
+  harness: with `args.rejudgeBaseSha` (strict hex, rev-parse-verified) pinning the gate
+  baseline to the tree the candidates were AUTHORED against, and `args.lensVariant` swapping
+  ONE whitelisted judge-prompt paragraph, a rejudge pair is a pinned-pool judge-prompt A/B
+  (same candidates, same gate, one variable). `mode:'rejudge'` result/mapping carry
+  winner + winnerSource/winnerModel unblinding. Tests: `tournament-rejudge.test.mjs`.
+
+- **Codex review-seat concurrency cap + per-seat model audit.** A semaphore (default 2,
+  `args.codexJudgeConcurrency`) serializes LIVE codex judge dispatches — 4-way concurrent
+  `codex review` measured ~4x single-seat latency (account backpressure); readback/reformat
+  run outside the slot. And every living lens verdict now records intended-vs-actual model
+  (`judge_seats` in `rc_summary`): a codex seat silently falling back to opus was invisible
+  at summary level (run-h's security-x seat ran opus and nothing said so). Mismatches also
+  log `JE-SEAT-AUDIT`. Tests: `tournament-seat-audit.test.mjs`.
+
+- **Judge-lens prompt A/B hook (`args.lensVariant`)** — closed whitelist, currently
+  `evidence-quota` (prompt-lab 03/V2: `checks_run` must cite >=1 concrete check PER
+  candidate). Single-paragraph insertion; production prompt byte-identical otherwise; the
+  arm is recorded as `lens_variant` in mapping + result. Tests:
+  `tournament-lens-variant.test.mjs`.
+
+### Fixed
+
+- **zsh word-splitting false-kill class (live in run-j).** The helper agents' shell can be
+  zsh, which does NOT word-split an unquoted `$patches`/`$cites` — the mechanical gate passed
+  a multi-patch candidate's paths as ONE filename (`git apply` "can't open patch"), false-
+  killing every 0001+0002-style deliverable (4/12 in run-j, including the strongest
+  candidate); the G2 evidence-citation counter had the same latent bug. Both loops now
+  re-emit the list via `$(printf …)`, which bash AND zsh field-split; verified against the
+  real run-j artifacts under both shells. Tests in `tournament-mechanical-gate.test.mjs`.
+
+- **Review-judge dump relay lost the provenance line on real pools (live in run-j).**
+  Review-mode `_codex_run.log` carries the codex session's stderr stream (the stall-watchdog
+  feed), so on a full council pool the log outgrew the relay's `tail -c 4000` window and the
+  startup `JOUST-CODEX-PROVENANCE` line never reached `parseCodexReviewDump` — which then
+  fail-closed-rejected ALL codex seats (silent all-opus council; the smoke test had passed
+  only because its mini-pool log was <4KB). The relay now greps the provenance line from the
+  log top ahead of the tail; a missing log still relays nothing (fail-closed preserved).
+  First genuinely mixed-family council at scale confirmed live in run-j2 (3/3 codex seats
+  ran as codex-high). Test in `tournament-codex-review-judge.test.mjs`.
+
+- **Dedup pool-rebuild is read-back verified before the collapse takes effect.** The
+  post-gate pool rebuild was fire-and-forget: a silently failed rebuild left judges reading
+  a STALE pool (duplicate sections, no stamps) that disagreed with the collapsed contention
+  set. The rebuild script now prints a terminal `JPOOL` line (section count + sorted letters
+  read from the pool ON DISK after the atomic rename) and the engine verifies it against the
+  exact set it is about to judge; two failures DISARM the collapse (uncollapsed contention +
+  loud `JE-DEDUP-POOL-VERIFY` log + best-effort salvage rebuild). A corrupted relay can only
+  ever disarm, never mis-collapse. Tests in `tournament-dedup.test.mjs`.
+
 - **Codex judge seats: `codex review` preset + mechanical reformat (replaces exec VERDICT.json
   authorship).** The exec-mode seats' self-authored VERDICT.json failed verdict-readback on
   9/9 codex seats across two full runs; a controlled judge-architecture experiment showed the
