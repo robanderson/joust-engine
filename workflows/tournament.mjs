@@ -396,10 +396,25 @@ const safeRunId = String(runDir || 'run').split('/').filter(Boolean).pop().repla
 function contextCatCmd(files) {
   return files.map(f => `printf '===== %s =====\\n' ${q(f)}; if [ ! -L ${q(f)} ] && [ -f ${q(f)} ]; then cat ${q(f)} 2>/dev/null || printf '(unreadable: %s)\\n' ${q(f)}; else printf '(skipped non-regular: %s)\\n' ${q(f)}; fi; echo`).join('; ')
 }
+// Gate baseline pin (run-i mechanical-gate post-mortem): capture the host repo's HEAD sha ONCE at
+// bundle time into a runDir file the mechanical gate reads directly (file-relayed, no model transit).
+// Non-repoMode tournaments still execute FROM a git checkout — the very tree the context bundle was
+// cut from — so this sha gives the gate a REAL apply-check baseline instead of an empty `git init`
+// repo (where a patch MODIFYING any existing file can never pass; that false-killed 11/12 implement
+// candidates in run-i and made run-h's two "clean" stamps a find-order coin-flip). Pinning at BUNDLE
+// time (not gate time) keeps the check honest when the checkout drifts mid-run (commits landed
+// during run-i's implement rounds). Fail-soft: no repo => empty file => the gate degrades to the
+// parse-only structure check.
+const gateBaseShaFile = `${runDir}/_context/base-sha`
 async function buildContext() {
-  if (!contextPath) return
+  const pin = `mkdir -p ${q(`${runDir}/_context`)} && { git rev-parse HEAD 2>/dev/null || printf ''; } > ${q(gateBaseShaFile)}`
+  if (!contextPath) {
+    await agentLadder(`Run this exact shell command in ONE Bash call; do not print or expose its output. Do nothing else:\n\n${pin}`,
+      { model: HELPER_MODEL, phase: 'Round 1', label: 'context' }).catch(() => null)
+    return
+  }
   const cat = contextCatCmd(contextFiles)
-  const cmd = `mkdir -p ${q(`${runDir}/_context`)} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
+  const cmd = `${pin} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
   log(`Bundling ${contextFiles.length} context file(s) → ${contextPath}`)
   await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
     { model: HELPER_MODEL, phase: 'Round 1', label: 'context' }).catch(() => null)
@@ -1404,14 +1419,20 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
     const dest = `${reviewDir}/${c.blind}`
     return `(` +
       `dest=${q(dest)}; mech=${q(`${dest}/mechanical.txt`)}; base=${baseArg}; ` +
-      `patch=''; p0=0; ` +
-      `if [ -s "$dest/candidate.diff" ]; then patch="$dest/candidate.diff"; p0=1; ` +
-      `else patch=$(find "$dest" -maxdepth 3 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) 2>/dev/null | head -n1); ` +
-      `  if [ -z "$patch" ]; then patch=$(grep -rlE '^(diff --git |@@ -[0-9]|--- (a/|/dev/null))' "$dest" 2>/dev/null | head -n1); fi; fi; ` +
+      // Baseline fallback (run-i post-mortem): no repoMode baseSha => use the HEAD sha pinned at
+      // context-bundle time, so non-repo runs get a REAL apply baseline instead of an empty repo.
+      `[ -z "$base" ] && [ -s ${q(gateBaseShaFile)} ] && base=$(cat ${q(gateBaseShaFile)} 2>/dev/null); ` +
+      // ALL patches, sorted (0001, 0002, ...): run-i showed `head -n1` made a multi-patch
+      // deliverable's fate a find-order coin flip. candidate.diff (engine-generated, repoMode)
+      // stays a single -p0 diff.
+      `patches=''; p0=0; ` +
+      `if [ -s "$dest/candidate.diff" ]; then patches="$dest/candidate.diff"; p0=1; ` +
+      `else patches=$(find "$dest" -maxdepth 3 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) 2>/dev/null | sort); ` +
+      `  if [ -z "$patches" ]; then patches=$(grep -rlE '^(diff --git |@@ -[0-9]|--- (a/|/dev/null))' "$dest" 2>/dev/null | head -n1); fi; fi; ` +
       `nfiles=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt 2>/dev/null | grep -c .); ` +
       `cls=''; detail=''; ` +
       `if [ "$nfiles" -eq 0 ]; then cls=empty; ` +
-      `elif [ -z "$patch" ]; then cls=full_files; ` +
+      `elif [ -z "$patches" ]; then cls=full_files; ` +
       `elif ! command -v git >/dev/null 2>&1; then cls=unavailable; ` +
       `else ` +
         `scratch=$(mktemp -d 2>/dev/null) || scratch=''; snapmode=''; top=''; ` +
@@ -1420,12 +1441,25 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
         `wt="$scratch/wt"; ` +
         `if [ -z "$snapmode" ] && [ -n "$scratch" ]; then wt="$scratch/wt"; mkdir -p "$wt" && git init -q "$wt" >/dev/null 2>&1 && snapmode=structure; fi; ` +
         `if [ -z "$snapmode" ]; then cls=unavailable; else ` +
-          `pflag=''; [ "$p0" -eq 1 ] && pflag='-p0'; recount=''; ` +
-          `if err=$(git -C "$wt" apply --check $pflag "$patch" 2>&1); then rc=0; ` +
-          `elif err=$(git -C "$wt" apply --check --recount $pflag "$patch" 2>&1); then rc=0; recount=1; ` +
-          `else rc=1; fi; ` +
-          `if [ "$rc" -eq 0 ]; then cls=clean_patch; if [ "$snapmode" = structure ]; then detail=structure; elif [ -n "$recount" ]; then detail=recount; fi; ` +
-          `else cls=corrupt_patch; detail=$(printf '%s' "$err" | head -n1 | cut -c1-200); fi; ` +
+          `pflag=''; [ "$p0" -eq 1 ] && pflag='-p0'; recount=''; cls=clean_patch; ` +
+          // snapshot: APPLY each patch FOR REAL in sorted order (numbered patches may stack —
+          // 0002 can depend on 0001; independent --check of each against base false-fails those).
+          // The worktree is disposable, so a real apply is safe and mirrors APPLY.md semantics.
+          // structure (no repo reachable): parse-only well-formedness via --numstat — an empty
+          // `git init` repo can NEVER pass a modify-patch under --check, so --check there is a
+          // false-kill machine (run-i: 11/12 candidates), while --numstat still catches the
+          // audited malformed/truncated class and cannot false-kill.
+          `for p in $patches; do ` +
+            `if [ "$snapmode" = snapshot ]; then ` +
+              `if err=$(git -C "$wt" apply $pflag "$p" 2>&1); then :; ` +
+              `elif err=$(git -C "$wt" apply --recount $pflag "$p" 2>&1); then recount=1; ` +
+              `else cls=corrupt_patch; detail=$(printf '%s' "$err" | head -n1 | cut -c1-200); break; fi; ` +
+            `else ` +
+              `if err=$(git -C "$wt" apply --numstat $pflag "$p" 2>&1 >/dev/null); then :; ` +
+              `else cls=corrupt_patch; detail=$(printf '%s' "$err" | head -n1 | cut -c1-200); break; fi; ` +
+            `fi; ` +
+          `done; ` +
+          `if [ "$cls" = clean_patch ]; then if [ "$snapmode" = structure ]; then detail=structure; elif [ -n "$recount" ]; then detail=recount; else detail=''; fi; fi; ` +
         `fi; ` +
         `if [ -n "$scratch" ]; then [ "$snapmode" = snapshot ] && git -C "$top" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$scratch"; fi; ` +
       `fi; ` +

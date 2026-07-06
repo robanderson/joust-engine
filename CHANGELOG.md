@@ -6,6 +6,22 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Mechanical gate: real baseline + all-patches apply (run-i post-mortem).** The non-repo
+  gate false-killed 11/12 implement candidates in run-i with identical "No such file" errors:
+  `git apply --check` in an EMPTY `git init` scratch repo can never pass a patch that MODIFIES
+  an existing file, and the gate checked only `head -n1` of an unsorted `find` — a multi-patch
+  deliverable's fate was a directory-order coin flip (run-h's two "clean" stamps and its one
+  "corrupt-patch kill" were all luck). Fixes: (1) `buildContext` pins the host checkout's HEAD
+  sha to `runDir/_context/base-sha` at bundle time (fail-soft; file-relayed, no model transit) —
+  non-repoMode runs execute FROM the very checkout the context bundle was cut from, so the gate
+  now snapshots a detached worktree at that sha and gets REAL apply verification that also
+  survives mid-run drift; (2) ALL patches are checked in sorted order, and snapshot mode APPLIES
+  them for real so stacked patches (0002-on-0001) verify correctly; (3) the no-repo fallback is
+  a parse-only `--numstat` well-formedness check — still catches the audited malformed/truncated
+  class, structurally cannot false-kill. Verified against live artifacts: run-i's false-killed
+  candidate A now stamps clean against the pinned base, truncated patches still stamp corrupt in
+  both modes, run-h D's 3-patch stack applies clean. +3 structural tests.
+
 - **Launch-and-poll runner dispatch (supersedes the plain foreground mandate).** A foreground
   wrapper Bash call is capped (~600s) BELOW the runner wall-clocks (glm 1200s) — a glm seat
   was TERM-killed at ~10m mid-retry-backoff (RC 08) — while a backgrounded task is reaped when

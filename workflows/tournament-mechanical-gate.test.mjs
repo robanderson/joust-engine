@@ -103,3 +103,33 @@ test('(structural) round-2 and implement-R4 seeds are stub-gated', () => {
   assert.match(SRC, /JE-GUIDANCE-STUB \[Implement Round 4\]/)
   assert.match(SRC, /dispatch\(a, a\.ws, r2Guidance, 'Round 2'\)/)
 })
+
+// Run-i post-mortem (2026-07-06): the non-repo gate false-killed 11/12 implement candidates —
+// `git apply --check` in an EMPTY `git init` repo can never pass a modify-patch, and `head -n1`
+// made multi-patch deliverables a find-order coin flip (run-h's two "clean" stamps were luck).
+test('(structural) gate checks ALL patches, sorted — never a head -n1 coin flip', () => {
+  const i = SRC.indexOf('async function mechanicalPatchGate')
+  const gate = SRC.slice(i, SRC.indexOf('\n}', i))
+  assert.ok(/-iname '\*\.patch' -o -iname '\*\.diff' \\\\\) 2>\/dev\/null\) \| sort/.test(gate) || gate.includes(`2>/dev/null | sort`), 'patch enumeration must be sorted')
+  assert.ok(gate.includes('for p in $patches'), 'every patch is checked, in order')
+  assert.ok(!gate.includes("-iname '*.diff' \\) 2>/dev/null | head -n1"), 'the single-patch head -n1 pick is gone')
+})
+
+test('(structural) snapshot mode APPLIES patches in order (stacked 0002-on-0001 works); structure mode is parse-only --numstat', () => {
+  const i = SRC.indexOf('async function mechanicalPatchGate')
+  const gate = SRC.slice(i, SRC.indexOf('\n}', i))
+  assert.ok(gate.includes('git -C "$wt" apply $pflag "$p"'), 'snapshot applies for real so stacked patches verify')
+  assert.ok(gate.includes('git -C "$wt" apply --numstat $pflag "$p"'), 'structure mode uses --numstat (cannot false-kill a modify-patch)')
+  assert.ok(!gate.includes('apply --check $pflag'), 'the empty-repo --check false-kill machine is gone')
+})
+
+test('(structural) gate baseline: repoMode baseSha, else the HEAD sha pinned at context-bundle time', () => {
+  const i = SRC.indexOf('async function mechanicalPatchGate')
+  const gate = SRC.slice(i, SRC.indexOf('\n}', i))
+  assert.ok(gate.includes('base=$(cat'), 'gate falls back to the pinned base-sha file')
+  assert.ok(SRC.includes('const gateBaseShaFile = `${runDir}/_context/base-sha`'), 'pin file lives under runDir/_context')
+  assert.ok(SRC.includes("git rev-parse HEAD 2>/dev/null || printf ''"), 'buildContext pins HEAD fail-soft at bundle time')
+  const pin = SRC.indexOf("git rev-parse HEAD 2>/dev/null")
+  const attempts = SRC.indexOf('await buildContext()')
+  assert.ok(pin > 0 && attempts > 0, 'both present')
+})
