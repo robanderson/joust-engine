@@ -236,6 +236,17 @@ const NO_REPO_BEFORE_RX = /(?:--no-repo|self[\s-]?contained)\b[\s:,-]*$/i;
 const SIZE_AFTER_RX  = /^[\s:,-]*\b(short|medium|long)\b(?=\s*(?:[,;]|$))/i;
 const SIZE_BEFORE_RX = /\b(short|medium|long)\b[\s:,-]*$/i;
 
+// Marker-adjacent RUN-DEPTH override (2026-07-07, Rob): how many steelman
+// boost-and-cold-re-judge rounds a FINAL decision point may run before the tie routes to
+// needs_orchestrator_pick. 'fast' = 1 (one mandatory shootout round, no iteration),
+// 'deep' = up to 5. Unspecified = the engine default (3). Same adjacency + strip
+// discipline as the size words, so an ordinary 'fast'/'deep' in the task body ('a fast
+// sorter', 'deep copy the tree') is never misread or eaten. The AFTER form requires a
+// clause boundary, so `@@JE fast, <task>` matches and `@@JE fast sorter` does not.
+const DEPTH_AFTER_RX  = /^[\s:,-]*\b(fast|deep)\b(?=\s*(?:[,;]|$))/i;
+const DEPTH_BEFORE_RX = /\b(fast|deep)\b[\s:,-]*$/i;
+const DEPTH_ITERS = { fast: 1, deep: 5 };
+
 // Marker-adjacent 'implement' keyword (plan/implement round split). It enables the
 // implement rounds (3–4) without a phase-scoped Implement: spec. Like the pass /
 // repo-mode / size keywords it is recognised ONLY immediately adjacent to the marker
@@ -576,6 +587,7 @@ function parse(rawInput) {
     repoMode: false, // P0 (plan §4): false => today's self-contained tournament unchanged
     baseRef: null,   // P0: resolved to a pinned sha by the SKILL; the parser records null
     size: null,      // manual task-size override (short|medium|long); null => SKILL estimates
+    depth: null,     // run-depth override (fast|deep); null => engine default steelman budget (3)
     // Plan/Implement round split (2026-07-03). `implement` gates rounds 3–4;
     // planAssignment is the plan-phase pool (== assignment, kept for clarity);
     // implementAssignment is the implement-phase pool (rounds 3–4), null when
@@ -778,6 +790,18 @@ function parse(rawInput) {
     result.size = canon(szMatch[1]); // short | medium | long
     if (szAfter) postMarker = postMarker.replace(SIZE_AFTER_RX, ' ');
     else preMarker = preMarker.replace(SIZE_BEFORE_RX, ' ');
+  }
+
+  // --- 4c2. Run-depth override (fast|deep; steelman shootout iteration budget). ---
+  // Marker-adjacent + stripped, exactly like the size word. When absent, depth stays
+  // null and the engine runs its default budget (3 iterations).
+  const dpAfter = DEPTH_AFTER_RX.exec(postMarker);
+  const dpMatch = dpAfter || DEPTH_BEFORE_RX.exec(preMarker);
+  if (dpMatch) {
+    result.depth = canon(dpMatch[1]);                       // fast | deep
+    result.steelmanMaxIters = DEPTH_ITERS[result.depth];    // 1 | 5 (pass straight to the engine)
+    if (dpAfter) postMarker = postMarker.replace(DEPTH_AFTER_RX, ' ');
+    else preMarker = preMarker.replace(DEPTH_BEFORE_RX, ' ');
   }
 
   // --- 4d. Implement keyword (marker-adjacent; plan/implement round split). ---

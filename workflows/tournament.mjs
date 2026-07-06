@@ -3124,7 +3124,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   let finalWinner = null                        // ORIGINAL pool letter
   let lastRunoffVerdicts = null                 // mapped to original letters (for orchestrator pick)
   let steelmanVerdicts = verdicts               // what the steelman reads (orig-letter space)
-  const maxIters = loneFinalist ? 1 : 5
+  // Steelman iteration budget (2026-07-07, Rob): variable per run — 'fast' = 1 (the one
+  // mandatory shootout round, ties route straight to the orchestrator pick), 'deep' = up to 5,
+  // default 3. Clamped 1..5; loneFinalist stays a single boosted-vs-original round regardless.
+  const iterBudget = Number.isInteger(A.steelmanMaxIters) && A.steelmanMaxIters >= 1 && A.steelmanMaxIters <= 5
+    ? A.steelmanMaxIters : 3
+  const maxIters = loneFinalist ? 1 : iterBudget
 
   for (let iter = 1; iter <= maxIters && finalWinner == null; iter++) {
     // (a) steelman: cons -> minimal change-lists (never votes). Only the steelman sees history.

@@ -96,7 +96,9 @@ test('(structural) final pool takes up to two carried champions', () => {
 // ----- structural: steelman shootout -----
 test('(structural) steelman loop: always >=1 round, max 5, orchestrator pick after', () => {
   const cj = slice('async function councilJudge(', '\n// Render the council')
-  assert.match(cj, /const maxIters = loneFinalist \? 1 : 5/)
+  assert.match(cj, /const maxIters = loneFinalist \? 1 : iterBudget/)
+  // 2026-07-07: variable budget — fast=1, deep=5, DEFAULT 3, clamped 1..5 (args.steelmanMaxIters).
+  assert.match(cj, /A\.steelmanMaxIters >= 1 && A\.steelmanMaxIters <= 5\s*\n\s*\? A\.steelmanMaxIters : 3/)
   assert.match(cj, /needs_orchestrator_pick/)
   assert.match(cj, /decided_by/)
 })

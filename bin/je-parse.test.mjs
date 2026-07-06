@@ -734,6 +734,27 @@ cliParseCase('CLI FE M segment errors, exit 0', 'do abc @@FE:6:2',
   { n: null }, { errorIncludes: 'not valid for @@FE' });
 
 // ===========================================================================
+// 2026-07-07: run-depth keyword (fast|deep) — variable steelman shootout budget.
+// fast = 1 iteration, deep = 5, absent = null (engine default 3). Marker-adjacent
+// + stripped, same D-0006 discipline as the size words.
+// ===========================================================================
+parseCase('depth AFTER form: fast', '@@JE:4 fast, a cli hangman game',
+  { depth: 'fast', steelmanMaxIters: 1, task: 'a cli hangman game' }, { noErrors: true });
+parseCase('depth AFTER form: deep', '@@JE:4 deep, big refactor',
+  { depth: 'deep', steelmanMaxIters: 5 }, { noErrors: true });
+parseCase('depth BEFORE form', 'fast @@JE:4, task',
+  { depth: 'fast', steelmanMaxIters: 1, task: 'task' }, { noErrors: true });
+parseCase('ordinary fast in task body untouched', '@@JE:4 a fast sorter',
+  { depth: null, task: 'a fast sorter' }, { noErrors: true });
+parseCase('ordinary deep in task body untouched', '@@JE:4 deep copy the tree util',
+  { depth: null, task: 'deep copy the tree util' }, { noErrors: true });
+parseCase('depth composes with a spec when marker-adjacent', '@@JE fast, 2 opus 2 codex, task z',
+  { depth: 'fast', steelmanMaxIters: 1, n: 4 }, { noErrors: true });
+parseCase('non-adjacent depth word stays task text (same rule as size words)',
+  '@@JE 2 opus 2 codex fast, short, task z',
+  { depth: null, n: 4 }, { noErrors: true });
+
+// ===========================================================================
 // 2026-07-07: whitespace-joined spec items + loud multiple-fragment refusal.
 // "2 opus 2 codex" (no comma) used to parse as two disjoint 1-item chains and
 // the longest-raw pick SILENTLY DROPPED the other item (live: @@DE dispatched
