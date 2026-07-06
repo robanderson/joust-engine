@@ -561,6 +561,39 @@ function nextModelDown(model) {
 // Downgrade bookkeeping: one entry per successful ladder rescue. Surfaced in the workflow return
 // value as `model_downgrades` (observability only — it never gates dispatch/judging/any return).
 const modelDowngrades = [] // { label, phase, from, to }
+// ---- Seat-model audit (Q1, 2026-07-07): "did every judge seat run as the model the config
+// intended?" — run-h's security-x seat silently ran as opus (fallback) and nothing surfaced it at
+// summary level. Every LIVING lens verdict records intended vs actual here; rcSummaryLive attaches
+// the list as `judge_seats` so mapping.json / the result make silent-fallback councils auditable.
+// `as_intended` is a FAMILY check for codex seats (displayModel says the configured effort, e.g.
+// codex-xhigh, while the actual runs args.codexJudgeEffort — effort drift is config, not fallback).
+const seatModelAudit = [] // { seat, lens, phase, intended, actual, as_intended }
+function auditSeatModel(phaseTitle, label, lens, dispatchMode, verdict) {
+  if (!verdict) return verdict
+  const intended = dispatchMode === 'codex' ? ((lens.judge && lens.judge.displayModel) || 'codex') : 'opus'
+  const actual = String(verdict.judgeModel || 'opus')
+  const as_intended = dispatchMode === 'codex' ? actual.startsWith('codex-') : actual === 'opus'
+  seatModelAudit.push({ seat: label, lens: lens.key, phase: phaseTitle, intended, actual, as_intended })
+  if (!as_intended) log(`JE-SEAT-AUDIT [${phaseTitle}] ${label} (${lens.key}): ran as ${actual}, intended ${intended}`)
+  return verdict
+}
+// ---- Codex review-seat concurrency cap (S1, 2026-07-07): the judge-architecture experiment
+// measured 4-way concurrent `codex review` at ~4x single-seat latency (account-level backpressure,
+// cap ~2 useful lanes). Serialize LIVE codex judge processes through this semaphore — dispatch
+// only (readback/reformat are cheap and run outside the slot). while-loop re-check on wake so a
+// released slot claimed by a fresh arrival can never over-admit a waiter.
+const CODEX_JUDGE_MAX_CONCURRENT = Math.max(1, Number(A.codexJudgeConcurrency) || 2)
+let codexSlotActive = 0
+const codexSlotWaiters = []
+async function acquireCodexSlot() {
+  while (codexSlotActive >= CODEX_JUDGE_MAX_CONCURRENT) await new Promise(r => codexSlotWaiters.push(r))
+  codexSlotActive++
+}
+function releaseCodexSlot() {
+  codexSlotActive = Math.max(0, codexSlotActive - 1)
+  const w = codexSlotWaiters.shift()
+  if (w) w()
+}
 
 // agentLadder(prompt, opts, ladder) — agent() plus ONE downgrade-retry rung for NATIVE anthropic
 // seats. The SINGLE shared wrapper (no per-site copies). Contract:
@@ -1051,7 +1084,12 @@ function trimSeatsForConvergence(seats, evidence, opts = DYNAMIC_M) {
 // ---- end: dynamic M ---------------------------------------------------------------------------
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
-const rcSummaryLive = () => buildRcSummary(seatRcs)
+const rcSummaryLive = () => {
+  const s = buildRcSummary(seatRcs)
+  // Q1 seat-model audit: attach intended-vs-actual per living judge seat (additive; absent until
+  // the first council point, so pure-attempt phases keep the exact legacy shape).
+  return seatModelAudit.length ? { ...s, judge_seats: seatModelAudit.slice() } : s
+}
 // Auto-issue args (spec §3, default-ON for engine-fault classes; fail-closed + fire-and-forget):
 //   noAutoIssue:true  -> skip filing entirely
 //   issueRunner       -> absolute path to bin/je-issue.sh (absent => skip, logged once)
@@ -2270,7 +2308,7 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
   const dispatchMode = chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner)
   if (dispatchMode === 'codex') {
     const result = await askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
-    if (result && !result.__codexFail) return result
+    if (result && !result.__codexFail) return auditSeatModel(phaseTitle, label, lens, 'codex', result)
     const fail = (result && result.__codexFail) || classifyCodexJudgeFailure('dispatch')
     log(`JE-COUNCIL-FALLBACK [${phaseTitle}] ${label} (${lens.key}): codex-xhigh seat exhausted retries — falling back to native Opus for this round so the council does not lose a seat.`)
     // A fallback IS an existing behavioural branch, so recording a RECOVERED fault here honours the
@@ -2282,7 +2320,8 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
     log(`JE-COUNCIL-WARNING: codexRunner not supplied — codex judge seat(s) (spec/craft/completeness/simplicity) will run as native Opus this run. Pass args.codexRunner to enable mixed-family judging.`)
     codexRunnerWarned = true
   }
-  return askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
+  return auditSeatModel(phaseTitle, label, lens, dispatchMode,
+    await askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots))
 }
 
 // Native Opus lens judge: opus, retry once (like judge()), THEN one model-ladder rung (opus try,
@@ -2357,7 +2396,12 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
   for (let i = 1; i <= 2; i++) {
     try {
       // model pinned alongside agentType: frontmatter is not reliably honoured (see dispatch()).
-      await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), model: HELPER_MODEL, phase: phaseTitle, label: `${label}-codex-dispatch` })
+      // S1: the slot serializes the LIVE codex process only (launch-and-poll wrapper returns at
+      // JOUST-SETTLED); readback + reformat run outside the slot.
+      await acquireCodexSlot()
+      try {
+        await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), model: HELPER_MODEL, phase: phaseTitle, label: `${label}-codex-dispatch` })
+      } finally { releaseCodexSlot() }
     } catch (e) {
       log(`council ${label} (${lens.key}) codex-xhigh dispatch attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
       lastFail = classifyCodexJudgeFailure('dispatch')
