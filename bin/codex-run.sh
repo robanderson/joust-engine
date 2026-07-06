@@ -26,19 +26,39 @@ command -v codex >/dev/null 2>&1 || { finish DONE "exit=5 (missing-runner)" 07 m
 PROV_LINE="JOUST-CODEX-PROVENANCE endpoint=api.openai.com flag=${FLAG} timeout=${TIMEOUT}s stall=${STALL}s"
 echo "$PROV_LINE" >> "$LOG"
 
+# JE_CODEX_MODE=review (judge seats, 2026-07-06 judge-architecture experiment): run the purpose-built
+# `codex review` preset instead of an open-ended agentic exec. Custom instructions come from
+# _brief.txt (the review presets are MUTUALLY EXCLUSIVE on >=0.141 — a prompt cannot combine with
+# --base/--commit/--uncommitted — so prompt-only mode reviews the WORKING TREE; the engine stages the
+# subject matter into this workspace beforehand). codex streams its session progress to STDERR
+# (observed 200-350KB/run) — that feeds $LOG so the stall watchdog measures true liveness — and
+# prints the final report to STDOUT -> $REPORT. Model/effort flags are GLOBAL: `review` has no -m.
+MODE="${JE_CODEX_MODE:-exec}"
+REPORT=_review_report.md
+
 # Headless codex exec policy (all VERIFIED on codex-cli 0.139.0). </dev/null pins codex's stdin so it
 # never blocks reading additional input; $FLAG is unquoted so the shell word-splits it into argv.
 run_try() {
-  run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
-    codex exec \
-      -s workspace-write \
-      -C "$PWD" \
-      --skip-git-repo-check \
-      -c approval_policy="never" \
-      -c 'mcp_servers={}' \
-      -o "$LAST" \
-      $FLAG \
-      "$(cat _brief.txt)" </dev/null >> "$LOG" 2>&1
+  if [ "$MODE" = review ]; then
+    run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
+      codex \
+        $FLAG \
+        -c approval_policy="never" \
+        -c 'mcp_servers={}' \
+        review \
+        "$(cat _brief.txt)" </dev/null > "$REPORT" 2>> "$LOG"
+  else
+    run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
+      codex exec \
+        -s workspace-write \
+        -C "$PWD" \
+        --skip-git-repo-check \
+        -c approval_policy="never" \
+        -c 'mcp_servers={}' \
+        -o "$LAST" \
+        $FLAG \
+        "$(cat _brief.txt)" </dev/null >> "$LOG" 2>&1
+  fi
 }
 
 TIMEOUT_RETRIED=0
@@ -52,10 +72,17 @@ while :; do
   # succeed). GUARD [ ! -s "$LAST" ]: only when codex produced NO final message (a real abort), so a
   # SUCCESSFUL run that merely *discusses* these phrases is never force-failed. Scanned against THIS
   # try's fresh log slice.
-  if [ ! -s "$LAST" ] && tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qiE 'requires a newer version of Codex|is not supported when using Codex with a|invalid_api_key|401 Unauthorized|403 Forbidden'; then
+  TARGET="$LAST"; [ "$MODE" = review ] && TARGET="$REPORT"
+  if [ ! -s "$TARGET" ] && tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qiE 'requires a newer version of Codex|is not supported when using Codex with a|invalid_api_key|401 Unauthorized|403 Forbidden'; then
     echo "JOUST-CODEX-ERROR codex reported a model/auth/version failure (see log)" >> "$LOG"
     [ "$RC" -eq 0 ] && RC=6
     finish DONE "exit=${RC}" 02 provider-auth-endpoint
+    break
+  fi
+  # Review mode: a clean exit with an EMPTY report is not a success — classify honestly as RC 05
+  # (no deliverable) so the engine's fallback ladder takes over instead of parsing nothing.
+  if [ "$RC" -eq 0 ] && [ "$MODE" = review ] && [ ! -s "$REPORT" ]; then
+    finish DONE "exit=0 (empty-report)" 05 no-deliverable-saved
     break
   fi
   if [ "$RC" -eq 0 ]; then finish DONE "exit=0" 00 ok; break; fi

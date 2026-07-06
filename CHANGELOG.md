@@ -6,6 +6,27 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Codex judge seats: `codex review` preset + mechanical reformat (replaces exec VERDICT.json
+  authorship).** The exec-mode seats' self-authored VERDICT.json failed verdict-readback on
+  9/9 codex seats across two full runs; a controlled judge-architecture experiment showed the
+  purpose-built review preset finds equal-or-better issues with no authorship failure mode and
+  ~3x fewer tokens. New pipeline: the engine stages the seat workspace (scratch `git init` +
+  the blind pool copied in as `_pool.md` — codex-cli >=0.141 makes the review presets mutually
+  exclusive, so custom instructions review the WORKING TREE); `codex-run.sh` in
+  `JE_CODEX_MODE=review` runs the bounded preset (report -> `_review_report.md` on stdout;
+  the 200-350KB session stream on stderr feeds the stall watchdog; clean-exit-but-empty-report
+  classifies RC 05); the brief demands explicit machine lines (`RANKING:`/`VOTE:`/`SAFETY
+  <letter>:`); `parseCodexReviewDump` validates provenance/exit/report shape before any
+  reformat spend; a sonnet helper MECHANICALLY reformats the report into the verdict shape
+  under a strict traceability rule (found:false instead of inventing a ranking — the
+  reformatter reformats, it never judges), and the result passes the SAME shape/integrity
+  guards + label reconciliation as native seats. Judge effort defaults to HIGH (the
+  experiment's effort sweep: medium/high/xhigh all surfaced the same core findings; high
+  ~1.7x faster than xhigh; override `args.codexJudgeEffort`), and `judge_model` is tagged
+  with the effort that actually ran. Opus fallback ladder unchanged. Live-verified end-to-end
+  (real `codex review` through the runner on a miniature blind pool). Tests:
+  `tournament-codex-review-judge.test.mjs` (12) + review-mode cases in `codex-run.test.sh`.
+
 - **Mechanical gate: real baseline + all-patches apply (run-i post-mortem).** The non-repo
   gate false-killed 11/12 implement candidates in run-i with identical "No such file" errors:
   `git apply --check` in an EMPTY `git init` scratch repo can never pass a patch that MODIFIES

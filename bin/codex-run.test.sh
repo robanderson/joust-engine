@@ -23,6 +23,10 @@ case "${FAKE_MODE:-ok}" in
   hang)      sleep 30; exit 0 ;;
   scrub)     env > "$WS/child-env.txt"; echo "print('hi')" > solution.py; exit 0 ;;
   clobber)   rm -f _codex_run.log _brief.txt; echo "final msg" > _codex_last.txt; echo x > solution.py; exit 0 ;;
+  # review-mode fakes: `codex ... review "<prompt>"` — the report goes to STDOUT (the runner
+  # redirects it to _review_report.md), session progress to STDERR (feeds the watchdog log).
+  review-ok)    echo "session progress" >&2; printf 'Candidate A: fine\nRANKING: A\nVOTE: A\n'; exit 0 ;;
+  review-empty) echo "session progress" >&2; exit 0 ;;
 esac
 STUB
   chmod +x "$WS/stub/codex"
@@ -72,6 +76,19 @@ mk_ws; run_runner FAKE_MODE=clobber; RC=$?
 check "clobber: exits 0"              '[ "$RC" -eq 0 ]'
 check "clobber: RC 00 in fresh log"   '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 00 ok" "$WS/_codex_run.log"'
 check "clobber: provenance restamped" 'grep -q "^JOUST-CODEX-PROVENANCE .*restamped=finish$" "$WS/_codex_run.log"'
+rm -rf "$WS"
+
+# Review mode (judge seats): report lands in _review_report.md; empty report = RC 05, not success.
+mk_ws; run_runner FAKE_MODE=review-ok JE_CODEX_MODE=review; RC=$?
+check "review-ok: exits 0"            '[ "$RC" -eq 0 ]'
+check "review-ok: RC 00"              '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 00 ok" "$WS/_codex_run.log"'
+check "review-ok: report captured"    'grep -q "^RANKING: A$" "$WS/_review_report.md"'
+check "review-ok: stderr fed the log" 'grep -q "session progress" "$WS/_codex_run.log"'
+rm -rf "$WS"
+
+mk_ws; run_runner FAKE_MODE=review-empty JE_CODEX_MODE=review
+check "review-empty: RC 05"           '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 05 no-deliverable-saved" "$WS/_codex_run.log"'
+check "review-empty: no RC 00"        '! grep -q "^JOUST-RC 00 " "$WS/_codex_run.log"'
 rm -rf "$WS"
 
 echo "== $PASS passed, $FAIL failed =="

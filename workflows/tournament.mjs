@@ -334,7 +334,9 @@ const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout, envE
 // Codex reuses cmdHead + the runner but overrides the wall-clock with codexTimeout (no JE_MAX_TURNS:
 // codex has no turn cap, and codex-run.sh ignores it). The optional timeoutSecs arg lets a codex JUDGE
 // seat pass codexJudgeTimeout (its own, roomier wall-clock) without touching the attempt call site.
-const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${cmdHead(ws, b)} && ${detachLaunch(`JE_TIMEOUT_SECS=${timeoutSecs} `, runner, flag)}`
+// prep (optional): extra shell run INSIDE the workspace between the brief write and the launch (the
+// review-mode judge stages the pool file + a scratch git repo there). envExtra as in runnerCmd.
+const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout, prep = '', envExtra = '') => `${cmdHead(ws, b)} && ${prep}${detachLaunch(`${envExtra}JE_TIMEOUT_SECS=${timeoutSecs} `, runner, flag)}`
 // The poll step of the RUNVERBATIM protocol: one bounded until-loop call the wrapper repeats until
 // the runner's guaranteed terminal line lands. maxWaitSecs mirrors the runner wall-clock (+ retry
 // headroom) so the wrapper knows when polling has genuinely outlived the watchdogs.
@@ -1980,6 +1982,69 @@ const CODEX_JUDGE_LOG_MARK = '===JE-CODEX-JUDGE-LOG==='
 const CODEX_JUDGE_VERDICT_MARK = '===JE-CODEX-JUDGE-VERDICT==='
 const CODEX_JUDGE_SHA_MARK = '===JE-CODEX-JUDGE-SHA==='
 
+// ---- begin: codex review-judge parsing ----------------------------------------------------------
+// Review-preset judge seats (2026-07-06 judge-architecture experiment): codex judges via the
+// purpose-built `codex review` preset (bounded plain-text report) instead of authoring VERDICT.json
+// at the end of an open-ended exec session — VERDICT authorship was the 100%-fallback failure class
+// two full runs straight. A sonnet helper then MECHANICALLY reformats the report into the verdict
+// shape under a strict traceability rule (it reformats, it never judges): ranking/vote/safety MUST
+// come from the report's explicit machine lines, or the seat fails over to opus exactly as before.
+// parseCodexReviewDump validates the relayed dump (log tail + report, sentinel-joined) BEFORE any
+// reformat spend: provenance + clean exit + a non-trivial report carrying the RANKING/VOTE lines.
+function parseCodexReviewDump(rawDump) {
+  const s = String(rawDump == null ? '' : rawDump)
+  const li = s.indexOf(CODEX_JUDGE_LOG_MARK)
+  const vi = s.indexOf(CODEX_JUDGE_VERDICT_MARK)
+  if (li < 0 || vi < 0 || vi < li) return { ok: false, reason: 'codex review judge dump missing log/report markers — runner or read-back step failed' }
+  const logPart = s.slice(li + CODEX_JUDGE_LOG_MARK.length, vi)
+  const report = s.slice(vi + CODEX_JUDGE_VERDICT_MARK.length).trim()
+  if (!/^JOUST-CODEX-PROVENANCE endpoint=/m.test(logPart)) return { ok: false, reason: 'codex review judge: no PROVENANCE marker — runner never ran' }
+  if (!/^JOUST-CODEX-DONE exit=0/m.test(logPart)) return { ok: false, reason: 'codex review judge: runner did not report exit=0' }
+  if (/^JOUST-CODEX-(TIMEOUT|ERROR)/m.test(logPart)) return { ok: false, reason: 'codex review judge: runner reported TIMEOUT/ERROR' }
+  if (report.length < 80) return { ok: false, reason: `codex review judge: report too short (${report.length} bytes) to be a real review` }
+  if (!/^RANKING:/m.test(report)) return { ok: false, reason: 'codex review judge: report has no explicit RANKING: line' }
+  if (!/^VOTE:/m.test(report)) return { ok: false, reason: 'codex review judge: report has no explicit VOTE: line' }
+  return { ok: true, report }
+}
+// checks_run is exec-mode honesty telemetry (commands the agentic session ran); the review preset's
+// evidence discipline lives in the report's inline quotes instead. The verdict still needs the field
+// for shape validity, so it carries this engine-written constant — never model-invented content.
+const REVIEW_CHECKS_RUN = ['_pool.md (codex-review preset: evidence quoted inline in the report)']
+// ---- end: codex review-judge parsing ------------------------------------------------------------
+
+// Structured-output schema for the review-report REFORMAT helper. `found` is the traceability
+// escape hatch: when the report lacks the explicit machine lines, the helper reports found:false
+// (and the seat falls over) instead of inventing a ranking — the reformatter must never judge.
+const CODEX_REVIEW_VERDICT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    found: { type: 'boolean' },
+    candidates: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { label: { type: 'string' }, pros: { type: 'array', items: { type: 'string' } }, cons: { type: 'array', items: { type: 'string' } } },
+        required: ['label', 'pros', 'cons'],
+      },
+    },
+    ranking: { type: 'array', items: { type: 'string' } },
+    vote: { type: 'string' },
+    reasoning: { type: 'string' },
+    safety: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { label: { type: 'string' }, safety: { type: 'string' }, severity: { type: 'string' }, evidence: { type: 'string' } },
+        required: ['label', 'safety'],
+      },
+    },
+    response_to_peers: { type: 'string' },
+    changed_this_round: { type: 'boolean' },
+    changed_from_round1: { type: 'boolean' },
+  },
+  required: ['found', 'candidates', 'ranking', 'vote', 'reasoning'],
+}
+
 // Parse+validate a codex judge seat's raw dump (log tail + VERDICT.json body, sentinel-joined). Pure:
 // no I/O, no agent() calls. Reuses the EXISTING guards (verdictIntegrityIssue/checksRunIssue) rather
 // than re-deriving equivalent logic. Returns {ok:true, verdict} or {ok:false, reason} — NEVER throws.
@@ -2249,23 +2314,37 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
 // The verbatim-run brief for the codex JUDGE dispatch agent (the joust-codex agent runs it as-is; it
 // judges NOTHING itself). Mirrors RUNVERBATIM (the attempt dispatch), scoped to a single judge seat.
 function RUNVERBATIM_JUDGE(cmd, ws) {
-  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and LAUNCHES the bundled, self-supervising codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt; the runner's own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log). Follow this LAUNCH-AND-POLL protocol exactly; do not judge anything yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; detaches the runner and returns in seconds — expect JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working.\n\ncd ${q(ws)} && ${pollCmd('_codex_run.log')}\n\nSTEP 3 — report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
+  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and LAUNCHES the bundled, self-supervising codex runner script, which performs ONE codex council judge seat (NOT a task attempt; the runner's own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log). Follow this LAUNCH-AND-POLL protocol exactly; do not judge anything yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; detaches the runner and returns in seconds — expect JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working.\n\ncd ${q(ws)} && ${pollCmd('_codex_run.log')}\n\nSTEP 3 — report only whether a file named _review_report.md exists in ${ws} and its byte size. Do not read or relay its contents.`
 }
 
-// Codex-xhigh lens judge: dispatch the codex runner with a brief asking for VERDICT.json, read the log
-// tail + VERDICT.json body back (sentinel-joined, engine is the source of truth for bytes), then PARSE +
-// VALIDATE in code (parseCodexJudgeDump — provenance + JSON + shape + the SAME integrity guard as native).
-// Retry once; return { lens, judgeModel, ...verdict } or null after two failures (caller falls back to Opus).
+// Codex lens judge — REVIEW-PRESET pipeline (2026-07-06 judge-architecture experiment; replaces the
+// exec+VERDICT.json-authorship flow whose verdict-readback failed 9/9 seats two runs straight):
+//   1. The engine stages the seat workspace: scratch `git init` + the blind pool copied in as
+//      _pool.md (the review presets are mutually exclusive on codex-cli >=0.141, so custom
+//      instructions review the WORKING TREE — the pool copy IS the tree content under review).
+//   2. codex-run.sh in JE_CODEX_MODE=review runs the bounded `codex review` preset — the report
+//      goes to _review_report.md, the session stream feeds the stall watchdog, and the brief
+//      demands explicit machine lines (RANKING: / VOTE: / SAFETY <letter>:).
+//   3. Read-back relays log tail + report (sentinel-joined, sha-verified); parseCodexReviewDump
+//      validates provenance/exit/report-shape BEFORE any reformat spend.
+//   4. A sonnet helper MECHANICALLY reformats the report into the verdict shape (strict
+//      traceability: it reformats, it never judges — found:false on missing machine lines), then
+//      the verdict passes the SAME shape/integrity guards as every other seat.
+// Effort defaults to HIGH: the experiment's effort sweep found medium/high/xhigh all surfaced the
+// same core findings on the review preset, with high ~1.7x faster than xhigh (override:
+// args.codexJudgeEffort). Retry once; { __codexFail } after two failures (caller falls back to Opus).
 async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots) {
   const delibExtra = roundNum > 1
-    ? ' On this deliberation round also include response_to_peers (string), changed_this_round (boolean), and changed_from_round1 (boolean) if you can honestly assess them; omit only if you cannot.'
+    ? `\n- Because this is a deliberation round, ALSO end with lines "RESPONSE TO PEERS: <one paragraph>", "CHANGED THIS ROUND: yes|no", and "CHANGED FROM ROUND 1: yes|no" if you can honestly assess them.`
     : ''
   const briefBody = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) +
-    `\n\nWrite your verdict as VALID JSON — and NOTHING else in that file, no markdown fence, no commentary — to a file named VERDICT.json in your current working directory. Required keys: lens (must be exactly "${lens.key}"), candidates (array of {label, pros: [string], cons: [string]}), ranking (array of candidate letters, best first), vote (single candidate letter), reasoning (string), checks_run (array of strings — every command you ran or file you read, with its key result, each citing a path inside your pinned evaluation scope above)${isSecurityLens(lens.key) ? ', safety (array of {label, safety: "SAFE"|"UNSAFE", severity ("high"|"critical", UNSAFE only), evidence (UNSAFE only)} — one entry per candidate)' : ''}.${delibExtra}`
+    `\n\nThe working tree you are reviewing contains _pool.md — a byte-identical copy of that pool file; it IS the artifact under review. Deliver a prioritized PLAIN-TEXT review report (you are a review preset run — do NOT write any files):\n- One section per candidate, headed exactly "Candidate <letter>:", with your lens's pros and cons, each grounded in evidence QUOTED from the pool.\n- Then finish with EXACTLY these machine-parsed lines, one per line:\nRANKING: <all candidate letters, best first, separated by " > ">\nVOTE: <the single best candidate's letter>${isSecurityLens(lens.key) ? '\nSAFETY <letter>: SAFE — or — SAFETY <letter>: UNSAFE <high|critical> <one-line concrete evidence> (one SAFETY line per candidate; UNSAFE only with evidence you can point to — a standing UNSAFE flag excludes that candidate regardless of votes)' : ''}${delibExtra}\n- Close with one reasoning paragraph explaining the ranking.`
   const seatWs = judgeWs(label)
-  const flag = CODEX_FLAG['codex-xhigh']
-  const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout)
-  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null | cut -d' ' -f1`
+  const judgeEffort = /^(low|medium|high|xhigh)$/.test(String(A.codexJudgeEffort || '')) ? String(A.codexJudgeEffort) : 'high'
+  const flag = CODEX_FLAG[`codex-${judgeEffort}`]
+  const prep = `git init -q . 2>/dev/null; cp ${q(poolPath)} _pool.md && `
+  const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout, prep, 'JE_CODEX_MODE=review ')
+  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null | cut -d' ' -f1`
 
   // Two-stage try/catch per try (fold-in A): the classification is STRUCTURAL — a dispatch-stage
   // failure (codex never produced a verdict) stays RC 02; anything past a successful dispatch
@@ -2305,11 +2384,30 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
           }
         }
       }
-      const parsedResult = parseCodexJudgeDump(rawForParse)
+      const parsedResult = parseCodexReviewDump(rawForParse)
       if (!parsedResult.ok) throw new Error(parsedResult.reason)
-      const rootsIssue = checksRunRootsIssue(parsedResult.verdict.checks_run, allowedRoots)
-      if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}, codex-xhigh): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
-      return { lens: lens.key, judgeModel: (lens.judge && lens.judge.displayModel) || 'codex-xhigh', ...reconcileLens(parsedResult.verdict, labels) }
+      // REFORMAT (sonnet, mechanical): report text -> verdict shape. The helper reformats, it never
+      // judges — every field must trace to report content, and found:false (no invented ranking)
+      // routes to the fallback exactly like any other readback failure.
+      const fmt = await agentLadder(
+        `You are a MECHANICAL reformatter for a code-review council. Below is a judge's plain-text review report over blind candidates ${labels.join(', ')}. Convert it into the structured verdict WITHOUT adding, upgrading, downgrading, or inventing ANYTHING — every pro, con, ranking position, vote${isSecurityLens(lens.key) ? ', safety flag' : ''} and reasoning sentence must be traceable to the report. Take ranking from the report's "RANKING:" line and vote from its "VOTE:" line verbatim${isSecurityLens(lens.key) ? '; take safety entries ONLY from its "SAFETY <letter>:" lines (safety "SAFE" or "UNSAFE"; severity/evidence only as written)' : ''}. If the report lacks an explicit RANKING: or VOTE: line, or is not a real review, return found:false with empty fields rather than inventing one.\n\nREPORT (verbatim):\n${parsedResult.report}`,
+        { model: HELPER_MODEL, schema: CODEX_REVIEW_VERDICT_SCHEMA, phase: phaseTitle, label: `${label}-codex-reformat` }
+      )
+      if (!fmt || fmt.found !== true) throw new Error('codex review judge: reformatter reported no traceable RANKING/VOTE in the report')
+      const verdict = {
+        lens: lens.key,
+        candidates: fmt.candidates, ranking: fmt.ranking, vote: fmt.vote, reasoning: fmt.reasoning,
+        checks_run: REVIEW_CHECKS_RUN,
+        ...(isSecurityLens(lens.key) ? { safety: Array.isArray(fmt.safety) ? fmt.safety : [] } : {}),
+        ...(fmt.response_to_peers ? { response_to_peers: fmt.response_to_peers } : {}),
+        ...(typeof fmt.changed_this_round === 'boolean' ? { changed_this_round: fmt.changed_this_round } : {}),
+        ...(typeof fmt.changed_from_round1 === 'boolean' ? { changed_from_round1: fmt.changed_from_round1 } : {}),
+      }
+      const shapeIssue = verdictShapeIssue(verdict)
+      if (shapeIssue) throw new Error(`codex review judge: reformatted verdict shape invalid — ${shapeIssue}`)
+      const integrityIssue = verdictIntegrityIssue(verdict)
+      if (integrityIssue) throw new Error(`codex review judge verdict failed integrity check: ${integrityIssue}`)
+      return { lens: lens.key, judgeModel: `codex-${judgeEffort}`, ...reconcileLens(verdict, labels) }
     } catch (e) {
       log(`council ${label} (${lens.key}) codex-xhigh readback attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
       lastFail = classifyCodexJudgeFailure('readback')
