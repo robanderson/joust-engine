@@ -468,6 +468,17 @@ const judgeWorkspaceRoot = `${workspaceRoot}/_judges`
 const judgeWs = (label) => `${judgeWorkspaceRoot}/${label}`
 let codexRunnerWarned = false // one-time (not per-seat/round) missing-runner warning
 const engineFiles = ['_brief.txt', '_glm_run.log', '_local_run.log', '_codex_run.log', '_codex_last.txt', '_minimax_run.log', '_grok_run.log']
+// Shared runner dispatch->(log file, provenance token) lookup — the single mapping the resume probe
+// reuses so a newly-added provider is registered ONCE (no drifting parallel ternary chain). Native
+// anthropic (no runner) has no log/token: dispatchRunner returns empty strings for it.
+const DISPATCH_RUNNERS = {
+  glm: { logf: '_glm_run.log', tok: 'GLM' },
+  local: { logf: '_local_run.log', tok: 'LOCAL' },
+  codex: { logf: '_codex_run.log', tok: 'CODEX' },
+  minimax: { logf: '_minimax_run.log', tok: 'MINIMAX' },
+  grok: { logf: '_grok_run.log', tok: 'GROK' },
+}
+const dispatchRunner = d => DISPATCH_RUNNERS[d] || { logf: '', tok: '' }
 const engineLogPath = (c, log) => {
   if (!repoMode || !log) return log ? `${c.ws}/${log}` : ''
   // Implement rounds carry an explicit roundName ('impl-3'/'impl-4'); plan rounds fall back to
@@ -3354,9 +3365,15 @@ function rcSummaryMd(rcSummary) {
   return L
 }
 
-function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound, rcSummary }) {
+function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound, rcSummary, resume }) {
   const L = [`# Joust Engine — run summary${unblind ? '' : ' (BLIND)'}`, '',
     `**Mode:** ${mode === 'two' ? 'two-pass' : 'single-pass'}  •  **N (attempts/round):** ${n}`, '',
+    ...(resume ? [`**RESUMED** — reused ${resume.reused} seat(s) from a prior interrupted run, re-ran ${resume.rerun} seat(s).`,
+      ...(resume.reusedSeats && resume.reusedSeats.length ? [`- Reused seats: ${resume.reusedSeats.join(', ')}`] : []), // item 4
+      ...(resume.rerunSeats && resume.rerunSeats.length ? [`- Re-ran seats: ${resume.rerunSeats.join(', ')}`] : []), // item 4
+      ...(resume.mixedGuidance ? ['- Mixed guidance: reused round-2/implement seats reflect the PRIOR review guidance while re-run seats reflect the NEW guidance — this resumed pool blends both.'] : []), // item 9
+      ...(resume.forfeited ? [`- ${resume.forfeited}.`] : []), // item 3
+      ''] : []),
     '## Task', '', '> ' + String(task).replace(/\n/g, '\n> '), '',
     '## Round-1 candidates', '',
     unblind ? '| Candidate | Model | Valid | Note |' : '| Candidate | Valid | Note |',
@@ -3825,7 +3842,10 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
   const list = implementSeats.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
   await buildWorktrees(roundName, list)
   // Per-attempt seed (A/B briefs): a seat carrying its own seedPlanPath uses it; else the shared one.
-  const doneRaw = (await parallelQuorum(list, (a) => dispatch(a, a.ws, guidance, phaseTitle, 'implement', a.seedPlanPath || seedPlanPath), phaseTitle, {
+  await computeReuse(roundName, list)
+  markInflight(list)
+  await heartbeat(phaseTitle)
+  const doneRaw = (await parallelQuorum(list, (a) => dispatchOrReuse(a, roundName, () => dispatch(a, a.ws, guidance, phaseTitle, 'implement', a.seedPlanPath || seedPlanPath)), phaseTitle, {
     timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
   })).filter(Boolean)
   const done = doneRaw.map(c => ({ ...c, roundName }))
@@ -3833,9 +3853,14 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
   await snapshotWorktrees(roundName, done)
   if (!done.length) return { blind: [], mapping: [], review: { __failed: 'no implement attempts survived dispatch' } }
   let staged = await stageAndValidate(blindLabel(done, rot), reviewDir, phaseTitle)
+  markStaged(staged)
   // Run F: mechanical pre-council gate — classify/stamp every valid candidate, invalidate corrupt
   // patches, BEFORE the code council (or legacy judge) sees the pool. Implement rounds only.
   staged = await mechanicalPatchGate(staged, reviewDir, phaseTitle)
+  // item 11: a REUSED deliverable that fails the mechanical/staging gate is re-run once (see helper).
+  staged = await reRunInvalidReused(roundName, list, staged, reviewDir, phaseTitle,
+    (a) => dispatch(a, a.ws, guidance, phaseTitle, 'implement', a.seedPlanPath || seedPlanPath), true)
+  markStaged(staged)
   // issue #36: inContention drops NON-representative byte-identical duplicates from judging while
   // leaving them valid:true (they never enter blindList, exactly as an invalid candidate doesn't).
   const blind = staged.filter(inContention)
@@ -3987,14 +4012,427 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
   }
 }
 
+// ================= RUN-STATE HEARTBEAT + ABORT STAMPING + RESUME (engine top-10 #10) =============
+// A crash/interrupt mid-tournament used to be unrecoverable: the engine wrote rich artifacts but no
+// authoritative machine-readable RUN STATE, so nothing could tell "seat completed" from "seat in
+// flight". This adds `runDir/run-state.json` — an UNBLINDING bookkeeping sidecar (like mapping.json,
+// never judge-visible) written through the existing atomic sha-verified persist() shim. It is an
+// INDEX/HINT, never authority: resume ALWAYS re-derives a seat's completion from the SAME on-disk
+// probe every other gate trusts (deliverable present + the runner PROVENANCE/DONE contract), so a
+// hand-edited run-state.json can never inject a fake completed seat. Fail-open end to end: any read/
+// probe/heartbeat failure degrades to today's clean-run behaviour and never crashes or stalls a live
+// run. The vote tally, veto, and judging semantics are otherwise unchanged.
+
+// ---- begin: run-state heartbeat/resume pure helpers (PURE — engine #10; sliced by tests) --------
+// No closures over module state, no I/O — extract-and-eval-testable exactly like the persist block.
+const RUN_STATE_VERSION = 1
+const VALID_SEAT_STATUS = new Set(['completed', 'aborted', 'in_flight', 'never_started'])
+
+// Stable seat IDENTITY (what a resume must match to trust a reuse): label + how it dispatches + the
+// exact model/agent it runs. Any change here is genuine config drift -> reuse is refused (fail-safe).
+function attemptIdentity(a) {
+  return {
+    label: a && a.label != null ? a.label : null,
+    dispatch: (a && a.dispatch) || 'anthropic',
+    model: (a && a.model) || null,
+    displayModel: (a && a.displayModel) || null,
+    agentType: (a && a.agentType) || null,
+  }
+}
+function attemptIdentityKey(a) {
+  const id = attemptIdentity(a)
+  return [id.label, id.dispatch, id.model || '', id.displayModel || '', id.agentType || ''].join('')
+}
+
+// Canonical config string the fingerprint is hashed over (hashing itself is done by the caller with
+// sha256Hex, so this block stays dependency-free). Order-stable by construction.
+function canonicalConfig(cfg) {
+  const ids = arr => (Array.isArray(arr) ? arr : []).map(a => {
+    const id = attemptIdentity(a); return [id.label, id.dispatch, id.model, id.displayModel, id.agentType]
+  })
+  return JSON.stringify({
+    mode: (cfg && cfg.mode) || null,
+    implement: !!(cfg && cfg.implement),
+    rots: (cfg && cfg.rots) || {},
+    attempts: ids(cfg && cfg.attempts),
+    implementAttempts: ids(cfg && cfg.implementAttempts),
+  })
+}
+
+// Schema/shape validator for run-state.json — pins the on-disk contract so it can't drift silently.
+function validateRunState(o) {
+  if (!o || typeof o !== 'object') return false
+  if (o.version !== RUN_STATE_VERSION) return false
+  if (typeof o.phase !== 'string') return false
+  if (!Number.isInteger(o.phase_index)) return false
+  if (typeof o.config_fingerprint !== 'string' || !o.config_fingerprint) return false
+  if (!o.config || typeof o.config !== 'object' || !Array.isArray(o.config.attempts)) return false
+  if (!o.seats || typeof o.seats !== 'object') return false
+  for (const k of Object.keys(o.seats)) {
+    const s = o.seats[k]
+    if (!s || typeof s !== 'object' || !VALID_SEAT_STATUS.has(s.status)) return false
+  }
+  return true
+}
+
+// THE single source of truth for a seat's status: classify from an on-disk PROBE (already gathered by
+// the shell), never from a cached claim. `probe` = { started, present, provenance, provStarted, rc }.
+//   never_started : no workspace began (no _brief.txt).
+//   completed     : a deliverable is present AND the provenance/DONE contract holds (reuse-eligible).
+//   in_flight     : a runner wrote its PROVENANCE marker but never a clean DONE and left no deliverable
+//                   (a hard kill mid-run) — must RE-RUN, never reused.
+//   aborted       : began but left no reusable deliverable (empty dir + no clean provenance) — re-run.
+// Provider-agnostic BY PRINCIPLE: it reads the probe facts, not which dispatch produced the seat.
+function deriveSeatStatus(probe) {
+  if (!probe || !probe.started) return 'never_started'
+  if (probe.present && probe.provenance) return 'completed'
+  if (probe.provStarted && !probe.provenance && !probe.present) return 'in_flight'
+  return 'aborted'
+}
+
+// Rebuild the resume seat list in ORIGINAL order with reused seats substituted IN PLACE, or return
+// null (REFUSE reuse -> clean full re-run) on ANY drift: fingerprint change, blind-rotation change,
+// attempts length/order/identity change. Returning null is the fail-safe that guarantees a reused
+// deliverable can never be mispaired with a shifted blind letter.
+function rebuildResumeList({ prevAttempts, currentAttempts, completedSet, prevRot, currentRot, prevFingerprint, currentFingerprint } = {}) {
+  const cur = Array.isArray(currentAttempts) ? currentAttempts : []
+  if (prevFingerprint != null && currentFingerprint != null && prevFingerprint !== currentFingerprint) return null
+  if (prevRot != null && currentRot != null && prevRot !== currentRot) return null
+  if (!Array.isArray(prevAttempts) || prevAttempts.length !== cur.length) return null
+  for (let i = 0; i < cur.length; i++) {
+    if (attemptIdentityKey(prevAttempts[i]) !== attemptIdentityKey(cur[i])) return null
+  }
+  const done = completedSet instanceof Set ? completedSet : new Set(Array.isArray(completedSet) ? completedSet : [])
+  return cur.map(a => ({ attempt: a, reuse: done.has(a && a.label) }))
+}
+// ---- end: run-state heartbeat/resume pure helpers -----------------------------------------------
+
+// ---- run-state runtime (IMPURE — thin call-site hooks; fail-open) -------------------------------
+const RESUME = A.resume === true
+const REUSE_DELIVERED = A.reuseDelivered !== false // default true
+// Per-round blind ROTATIONS captured into the config echo so a code change to any rot is drift.
+const ROTS = { 'round-1': 1, 'round-2': 2, 'impl-3': 3, 'impl-4': 4 }
+const RUN_STATE_PATH = `${runDir}/run-state.json`
+const LOCK_PATH = `${runDir}/resume.lock`
+const LOCK_STALE_MIN = Number(A.resumeLockStaleMins) > 0 ? Math.floor(Number(A.resumeLockStaleMins)) : 30
+const RUN_STATE_CONFIG = { mode, implement, rots: ROTS, attempts: attempts.map(attemptIdentity), implementAttempts: implementAttempts.map(attemptIdentity) }
+const CONFIG_FP = sha256Hex(canonicalConfig(RUN_STATE_CONFIG))
+const RUN_STATE_DUMP_SCHEMA = { type: 'object', additionalProperties: false, properties: { raw: { type: 'string' } }, required: ['raw'] }
+const PROBE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { results: { type: 'array', items: {
+    type: 'object', additionalProperties: false,
+    properties: { label: { type: 'string' }, started: { type: 'boolean' }, present: { type: 'boolean' }, provenance: { type: 'boolean' }, provStarted: { type: 'boolean' }, rc: { type: 'string' } },
+    required: ['label', 'started', 'present', 'provenance'],
+  } } },
+  required: ['results'],
+}
+let phaseIndex = 0
+let resumed = false
+let prevConfig = null
+let resumeReuseCount = 0
+let resumeRerunCount = 0
+let resumeForfeited = null                // item 3: set when a degraded probe/relay forces a fail-open clean re-run
+let resumeMixedGuidance = false           // item 9: set when a guided round reuses SOME seats and re-runs others
+const resumeReusedLabels = []             // item 4: the specific seat labels reused in place
+const resumeRerunLabels = []              // item 4: the specific seat labels re-run
+const resumeReuse = Object.create(null)   // roundName -> Set(label) to reuse
+const runStateSeats = Object.create(null) // label -> { status, rc, reused? }
+
+// item 4: report WHICH seats were reused vs re-run (not just counts). items 3/9: also surface a
+// degraded-probe reuse forfeit and the mixed-guidance condition so the SUMMARY disclosure is complete.
+function resumeSummary() {
+  return resumed ? {
+    reused: resumeReuseCount, rerun: resumeRerunCount,
+    reusedSeats: resumeReusedLabels.slice(), rerunSeats: resumeRerunLabels.slice(),
+    ...(resumeForfeited ? { forfeited: resumeForfeited } : {}),
+    ...(resumeMixedGuidance ? { mixedGuidance: true } : {}),
+  } : null
+}
+
+function markInflight(list) {
+  for (const a of (list || [])) {
+    const cur = runStateSeats[a.label]
+    if (cur && cur.status === 'completed') continue // a reused seat is already done
+    runStateSeats[a.label] = { status: 'in_flight', rc: null }
+  }
+}
+function markStaged(staged) {
+  for (const c of (staged || [])) {
+    const label = c.label || c.blind
+    if (label == null) continue
+    runStateSeats[label] = { status: c.valid ? 'completed' : 'aborted', rc: c.rc || (c.valid ? '00' : null), ...(c.reused ? { reused: true } : {}) }
+  }
+}
+
+// One batched heartbeat per phase boundary — routed through persist() (atomic temp+rename+sha-verify),
+// fail-open: an exception logs and is swallowed so a degraded persist never stalls a live run.
+async function heartbeat(phaseLabel, opts = {}) {
+  try {
+    phaseIndex += 1
+    const state = {
+      version: RUN_STATE_VERSION,
+      phase: phaseLabel,
+      phase_index: phaseIndex,
+      resumed,
+      ...(opts.phaseComplete ? { phase_complete: opts.phaseComplete } : {}),
+      resume_reused: resumeReuseCount,
+      resume_rerun: resumeRerunCount,
+      config_fingerprint: CONFIG_FP,
+      config: RUN_STATE_CONFIG,
+      seats: runStateSeats,
+    }
+    await persist([{ path: RUN_STATE_PATH, content: json(state) }], phaseLabel)
+    // item 8: refresh the lock's mtime on each heartbeat so `find -mmin` staleness ages from the LAST
+    // heartbeat, not from launch — a crashed run's lock then goes stale LOCK_STALE_MIN after its last
+    // activity, unblocking re-resume automatically. The terminal heartbeat releases the lock instead.
+    if (opts.phaseComplete === 'final') await releaseLock()
+    else await touchLock()
+  } catch (e) { log(`heartbeat (${phaseLabel}) failed (non-fatal): ${String(e).slice(0, 120)}`) }
+}
+
+async function readRunState() {
+  try {
+    const cmd = `cat ${q(RUN_STATE_PATH)} 2>/dev/null || true`
+    const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
+      { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'read-run-state' }).catch(() => null)
+    const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    if (!raw.trim()) return null
+    return JSON.parse(raw)
+  } catch { return null }
+}
+
+// Advisory concurrency guard: atomic (noclobber) create. A live lock younger than LOCK_STALE_MIN =>
+// a second launch is resuming the same runDir -> REFUSE (double-launching corrupts in-flight work). A
+// stale lock (older, owner gone) is STOLEN so a post-crash resume is never blocked. mtime uses the OS
+// clock (`find -mmin`), which is available even though the sandbox's Date.now() throws.
+// item 6: the noclobber create is the atomic test-and-acquire — success means NO lock was present, so
+// we hold it (fail open on a genuinely absent lock). A create FAILURE means a lock exists (or the
+// probe erred): we classify stale (steal) vs held-fresh (refuse). Any UNRECOGNIZED output / relay
+// throw can NOT confirm the lock is absent, so it returns 'unreadable' (a refusal), NOT 'acquired' —
+// a transient probe error no longer green-lights a concurrent double-launch.
+async function acquireLock() {
+  try {
+    const cmd = `mkdir -p ${q(runDir)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK acquired; ` +
+      `elif [ -n "$(find ${q(LOCK_PATH)} -mmin +${LOCK_STALE_MIN} 2>/dev/null)" ]; then : > ${q(LOCK_PATH)} 2>/dev/null; echo JLOCK stale-stolen; ` +
+      `else echo JLOCK held-fresh; fi`
+    const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
+      { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'resume-lock' }).catch(() => null)
+    const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    if (/JLOCK acquired/.test(raw)) return 'acquired'      // create SUCCEEDED: no lock was present
+    if (/JLOCK stale-stolen/.test(raw)) return 'stale-stolen'
+    if (/JLOCK held-fresh/.test(raw)) return 'held-fresh'
+    return 'unreadable'                                     // probe could not confirm the lock is absent
+  } catch { return 'unreadable' } // fail-safe: an existing-but-unreadable lock must NOT permit a double-launch
+}
+// item 8: refresh the lock file's mtime (best-effort) so staleness ages from the last heartbeat.
+async function touchLock() {
+  try {
+    await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\ntouch ${q(LOCK_PATH)} 2>/dev/null; echo JLOCK touched`,
+      { model: HELPER_MODEL, phase: 'Round 1', label: 'resume-lock-touch' }).catch(() => null)
+  } catch { /* best-effort */ }
+}
+// item 7: the lock now covers the ORIGINAL clean run too (acquired at launch, released on the final
+// heartbeat), so a resume launched against a still-alive original detects the held lock. Released for
+// ANY launch that reaches its terminal heartbeat, not only resumes.
+async function releaseLock() {
+  try {
+    await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\nrm -f ${q(LOCK_PATH)}; echo JLOCK released`,
+      { model: HELPER_MODEL, phase: 'Final rank', label: 'resume-unlock' }).catch(() => null)
+  } catch { /* best-effort */ }
+}
+
+// Probe each seat's WORKSPACE on disk (read-only; never stages) so deriveSeatStatus can classify it.
+// Reuses the exact provenance contract (provCheckShell) + engine-file exclusion the staging path uses.
+async function probeSeats(roundName, list) {
+  const excl = engineFiles.map(f => `! -name ${q(f)}`).join(' ')
+  const script = (list || []).map(c => {
+    // item 12: use the shared dispatchRunner table (the single provider->log/token mapping) instead of
+    // an inline ternary chain, so adding a provider can't leave this probe out of sync with dispatch.
+    const { logf, tok } = dispatchRunner(c.dispatch)
+    const lp = logf ? q(`${c.ws}/${logf}`) : ''
+    const provChk = provCheckShell(logf, tok, lp, false) // sets P (DONE exit=0 contract), P=1 for native
+    const psChk = logf ? `if grep -q '^JOUST-${tok}-PROVENANCE endpoint=' ${lp} 2>/dev/null; then PS=1; else PS=0; fi` : `PS=1`
+    const rcEcho = logf ? `rc=$(grep -a '^JOUST-RC ' ${lp} 2>/dev/null | tail -n1 | sed -n 's/^JOUST-RC \\([0-9][0-9]\\).*/\\1/p'); [ -z "$rc" ] && rc=NONE` : `rc=NONE`
+    return `if [ -f ${q(`${c.ws}/_brief.txt`)} ]; then S=1; else S=0; fi; ` +
+      `D=$(find ${q(c.ws)} -type f ${excl} 2>/dev/null | grep -c .); ${provChk}; ${psChk}; ${rcEcho}; ` +
+      `echo "JPRB ${c.label} S=$S D=$([ "$D" -gt 0 ] && echo 1 || echo 0) P=$P PS=$PS RC=$rc"`
+  }).join('\n')
+  const res = await agentLadder(
+    `This is an approved internal step of the joust-engine tournament: probe on-disk seat state for a RESUME (read-only). Run this exact shell script in ONE Bash call. It prints one line per seat of the form "JPRB <label> S=<0|1> D=<0|1> P=<0|1> PS=<0|1> RC=<code|NONE>". Then return the structured results: for EACH printed JPRB line an entry {label: the label, started: (S==1), present: (D==1), provenance: (P==1), provStarted: (PS==1), rc: the RC token}. Report exactly what the script printed — do not infer or change values. Do nothing else:\n\n${script}`,
+    { model: HELPER_MODEL, schema: PROBE_SCHEMA, phase: roundName === 'round-2' ? 'Round 2' : roundName === 'round-1' ? 'Round 1' : 'Implement Round 3', label: `resume-probe-${roundName}` }
+  ).catch(() => null)
+  // item 3: a null/shapeless relay result is a DEGRADED PROBE, not "nothing on disk" — signal it to
+  // the caller (return null) so the forfeited reuse can be DISCLOSED, rather than silently re-running.
+  if (!res || !Array.isArray(res.results)) return null
+  const out = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
+    if (r && r.label != null) out[String(r.label)] = {
+      started: !!r.started, present: !!r.present, provenance: !!r.provenance, provStarted: !!r.provStarted,
+      rc: typeof r.rc === 'string' ? r.rc : null,
+    }
+  }
+  return out
+}
+
+// Decide, for one round, which seats to REUSE (completed on disk) vs re-run. Fail-open + drift-safe:
+// no resume / reuse disabled / any config drift => empty reuse set (a clean full re-run).
+// item 10: the SAME disk-probe + provenance-gated reuse now applies in repoMode too (no early return),
+// extending the recovery win to the grand-loop / implement-into-repo path under identical gating.
+async function computeReuse(roundName, list) {
+  resumeReuse[roundName] = new Set()
+  if (!resumed || !REUSE_DELIVERED) return
+  let probeMap = null
+  try { probeMap = await probeSeats(roundName, list) } catch { probeMap = null }
+  // item 3: a degraded probe/relay forfeits reuse (fail-open clean re-run) — DISCLOSE it in the
+  // SUMMARY so the lost recoverability is visible to the operator, not buried in a log line.
+  if (probeMap == null) {
+    resumeForfeited = `reuse forfeited: probe relay degraded — re-ran all seats clean (round ${roundName})`
+    log(`JE-RESUME-PROBE-DEGRADED [${roundName}]: ${resumeForfeited}`)
+    probeMap = {}
+  }
+  const completedSet = new Set()
+  for (const a of (list || [])) {
+    const st = deriveSeatStatus(probeMap[a.label])
+    if (st === 'completed') completedSet.add(a.label)
+    else {
+      // item 2: a killed run's seat probes as in_flight/empty; persist the honest TERMINAL 'aborted'
+      // (one heartbeat, BEFORE re-dispatch) so the durable run-state.json literally reads 'aborted'.
+      const persistedStatus = (st === 'in_flight' || st === 'aborted') ? 'aborted' : st
+      runStateSeats[a.label] = { status: persistedStatus, rc: (probeMap[a.label] && probeMap[a.label].rc && probeMap[a.label].rc !== 'NONE') ? probeMap[a.label].rc : null }
+    }
+  }
+  // item 2: durably stamp the 'aborted' reclassification BEFORE any seat is re-dispatched.
+  if ((list || []).some(a => runStateSeats[a.label] && runStateSeats[a.label].status === 'aborted')) await heartbeat(`resume-abort:${roundName}`)
+  const isImpl = roundName === 'impl-3' || roundName === 'impl-4'
+  const plan = rebuildResumeList({
+    prevAttempts: prevConfig ? (isImpl ? prevConfig.implementAttempts : prevConfig.attempts) : null,
+    currentAttempts: (list || []).map(attemptIdentity),
+    completedSet,
+    prevRot: prevConfig && prevConfig.rots ? prevConfig.rots[roundName] : undefined,
+    currentRot: ROTS[roundName],
+    prevFingerprint: prevConfig ? prevConfig.fingerprint : undefined,
+    currentFingerprint: CONFIG_FP,
+  })
+  if (!plan) {
+    log(`JE-RESUME-DRIFT-REFUSED [${roundName}]: run-state config drift — re-running ALL seats this round (no reuse, no shifted blind letters).`)
+    return
+  }
+  resumeReuse[roundName] = new Set(plan.filter(p => p.reuse).map(p => p.attempt.label))
+  const reused = resumeReuse[roundName].size
+  if (reused) log(`JE-RESUME [${roundName}]: reusing ${reused}/${list.length} completed on-disk seat(s); re-running ${list.length - reused}.`)
+  // item 9: a GUIDED round (round-2 / implement rounds) that reuses SOME seats while re-running others
+  // blends prior-guidance and new-guidance deliverables — flag it so the SUMMARY discloses the
+  // guidance-incoherence of the resumed pool.
+  if ((roundName === 'round-2' || roundName === 'impl-3' || roundName === 'impl-4') && reused > 0 && reused < (list || []).length) resumeMixedGuidance = true
+}
+
+// Dispatch a seat, OR — on a resume where the seat's on-disk deliverable is trusted complete — reuse
+// it in place (same ws, same dispatch-order index, so blindLabel() yields the same letter). Never
+// trusts a bare status claim: reuse only happens for labels computeReuse() derived from the disk probe.
+async function dispatchOrReuse(a, roundName, thunk) {
+  const set = resumeReuse[roundName]
+  if (set && set.has(a.label)) {
+    resumeReuseCount += 1
+    resumeReusedLabels.push(a.label) // item 4: record WHICH seat was reused
+    runStateSeats[a.label] = { status: 'completed', rc: '00', reused: true }
+    log(`JE-RESUME-REUSE [${roundName}]: seat ${a.label} (${a.displayModel}) — reusing on-disk deliverable (not re-dispatched).`)
+    await heartbeat(`seat:${roundName}:${a.label}`) // item 5: durably persist this individual seat completion
+    return { label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws: a.ws, res: null, reused: true }
+  }
+  if (resumed) { resumeRerunCount += 1; resumeRerunLabels.push(a.label) } // item 4: record WHICH seat re-ran
+  const out = await thunk()
+  // item 5: one heartbeat per individual seat completion (its status is refined at staging by markStaged);
+  // durability now tracks per-seat completion, not only phase boundaries.
+  await heartbeat(`seat:${roundName}:${a.label}`)
+  return out
+}
+
+// Launch entry hook: acquire the advisory lock (item 7: for the ORIGINAL clean run too, not only a
+// resume — released on the final heartbeat), read + validate the prior run-state, gate on the config
+// fingerprint. On a held-fresh OR unreadable lock, REFUSE (return an error the flow surfaces). On
+// no/invalid/drifted prior state, fall through to a clean run (resumed stays false -> nothing reused).
+async function resumeInit() {
+  const lock = await acquireLock()
+  if (lock === 'held-fresh' || lock === 'unreadable') {
+    // item 6: 'unreadable' = the probe could not confirm the lock is absent (transient read error); we
+    // refuse rather than risk a concurrent double-launch. item 7: this now also catches a resume that
+    // races a still-alive ORIGINAL run (whose lock is held-fresh and refreshed each heartbeat).
+    const why = lock === 'unreadable'
+      ? `the lock probe could not confirm ${LOCK_PATH} is absent (transient read error)`
+      : `${LOCK_PATH} is held by a live launch (younger than ${LOCK_STALE_MIN}min)`
+    log(`JE-RESUME-LOCK-HELD: ${why} — refusing to double-launch this runDir.`)
+    return { error: `RESUME-LOCK-HELD: ${why}; refusing to double-launch (would corrupt in-flight work). Remove the lock if the owner is gone, or raise args.resumeLockStaleMins.` }
+  }
+  if (!RESUME) return null // clean launch: the lock is now held for this runDir; nothing prior to reuse.
+  const prev = await readRunState()
+  if (!prev || !validateRunState(prev)) {
+    log('JE-RESUME: no valid prior run-state.json found — starting a CLEAN run (nothing to reuse).')
+    return null
+  }
+  if (prev.config_fingerprint !== CONFIG_FP) {
+    log(`JE-RESUME-DRIFT-REFUSED: config fingerprint changed since the prior run — running CLEAN, no seat reuse.`)
+    return null
+  }
+  resumed = true
+  prevConfig = {
+    attempts: prev.config && prev.config.attempts,
+    implementAttempts: prev.config && prev.config.implementAttempts,
+    rots: prev.config && prev.config.rots,
+    fingerprint: prev.config_fingerprint,
+  }
+  log(`JE-RESUME: valid prior run-state.json (phase '${prev.phase}', index ${prev.phase_index}) — reusing completed seats, re-running the missing/aborted ones.`)
+  return null
+}
+
+// item 11: a provenance-DONE deliverable can still be SEMANTICALLY invalid (e.g. a corrupt patch that
+// fails the mechanical/staging gate). On a resume, such a REUSED seat would otherwise be left
+// permanently failed. Detect reused seats that ended invalid post-gate, reclassify them 'aborted', and
+// RE-RUN each ONCE (fresh dispatch) re-staged under its ORIGINAL blind letter (blind order preserved),
+// then splice the fresh result back in. Fail-open: if the re-run/re-stage throws, keep today's pool.
+// `applyMechGate` re-applies the implement-round mechanical gate to the fresh single-seat result.
+async function reRunInvalidReused(roundName, list, staged, reviewDir, phaseTitle, dispatchFor, applyMechGate) {
+  if (!resumed) return staged
+  const bad = (staged || []).filter(c => c && c.reused && !c.valid)
+  if (!bad.length) return staged
+  const out = staged.slice()
+  for (const c of bad) {
+    const a = (list || []).find(x => (x.label != null ? x.label : null) === (c.label != null ? c.label : c.blind))
+    if (!a) continue
+    log(`JE-RESUME-REUSE-INVALID [${roundName}]: reused seat ${c.label != null ? c.label : c.blind} failed the mechanical/staging gate — reclassifying 'aborted' and re-running once.`)
+    runStateSeats[c.label != null ? c.label : c.blind] = { status: 'aborted', rc: null }
+    if (resumeReuse[roundName]) resumeReuse[roundName].delete(a.label)
+    resumeReuseCount = Math.max(0, resumeReuseCount - 1)
+    resumeRerunCount += 1
+    { const i = resumeReusedLabels.indexOf(a.label); if (i >= 0) resumeReusedLabels.splice(i, 1) }
+    resumeRerunLabels.push(a.label)
+    try {
+      const fresh = await dispatchFor(a)
+      if (!fresh) continue
+      await snapshotWorktrees(roundName, [{ ...fresh, roundName }])
+      let [restaged] = await stageAndValidate([{ ...fresh, roundName, blind: c.blind }], reviewDir, phaseTitle)
+      if (restaged && applyMechGate && restaged.valid) { const g = await mechanicalPatchGate([restaged], reviewDir, phaseTitle); restaged = g[0] || restaged }
+      if (restaged) { const i = out.findIndex(x => x.blind === c.blind); if (i >= 0) out[i] = restaged }
+    } catch (e) { log(`JE-RESUME-REUSE-INVALID re-run failed (non-fatal): ${String(e).slice(0, 120)}`) }
+  }
+  await heartbeat(`resume-rerun:${roundName}`)
+  return out
+}
+// ---- end run-state runtime ----------------------------------------------------------------------
+
 // ---- Round 1 ----
 phase('Round 1')
 log(`▶ ${deriveSummary()}`) // issue #38: run-purpose summary as the first narrator line (above the progress tree)
+const __resumeErr = await resumeInit()
+if (__resumeErr) return __resumeErr
 await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
 const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label) }))
 await buildWorktrees('round-1', r1Worktrees) // repoMode-only no-op otherwise
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
-const r1 = (await parallelQuorum(r1Worktrees, (a) => dispatch(a, a.ws, null, 'Round 1', investigate ? 'investigate' : 'plan'), 'Round 1', {
+await computeReuse('round-1', r1Worktrees)
+markInflight(r1Worktrees)
+await heartbeat('Round 1')
+const r1 = (await parallelQuorum(r1Worktrees, (a) => dispatchOrReuse(a, 'round-1', () => dispatch(a, a.ws, null, 'Round 1', investigate ? 'investigate' : 'plan')), 'Round 1', {
   timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
 })).filter(Boolean)
 { const w = dispatchDropSummary('Round 1', dispatchDrops, r1Worktrees.length, r1.length); if (w) log(w) } // #45
@@ -4009,6 +4447,8 @@ await snapshotWorktrees('round-1', r1) // repoMode-only no-op otherwise
 phase('Review')
 const staged1 = await stageAndValidate(blindLabel(r1, 1), `${runDir}/review-1`, 'Review')
 const blind1 = staged1.filter(c => c.valid)
+markStaged(staged1)
+await heartbeat('Review')
 const r1mapping = staged1.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
 const N = attempts.length
 if (!blind1.length) {
@@ -4039,7 +4479,7 @@ if (composeOnly) {
     ...(c.valid ? {} : { failReason: c.failReason }) }))
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(), round1: evMapping, winner1: null }) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping: evMapping }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping: evMapping, resume: resumeSummary() }) },
   ], 'Review')
   await maybeFileEngineIssues('Review')
   return {
@@ -4077,8 +4517,8 @@ if (review.no_consensus) {
     ...verdictEntries(`${runDir}/review-1`, review, 'review'),
     { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict (NO CONSENSUS)'), derive: { mode: 'verdict-md', from: `${runDir}/review-1/verdict.json`, title: 'Round-1 review verdict (NO CONSENSUS)' } },
     { path: `${runDir}/review-1/council.json`, content: json(review.council), derive: { mode: 'council-json', from: `${runDir}/review-1/verdict.json` } },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, resume: resumeSummary() }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, resume: resumeSummary() }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // abort path: RC observability must survive a NO_CONSENSUS stop
   return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
@@ -4097,11 +4537,12 @@ if (mode === 'single') {
   // P3: single-pass — mapping/verdict already written at P2; add the summaries
   const contributions = computeContributions({ mapping: r1mapping, review }, null, null, mode)
   await persist([
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, resume: resumeSummary() }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, resume: resumeSummary() }) },
     { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, contributions }) },
   ], 'Review')
   await maybeFileEngineIssues('Review')
+  await heartbeat('done', { phaseComplete: 'final' })
   return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions }
 }
 
@@ -4122,7 +4563,10 @@ await buildWorktrees('round-2', r2Worktrees) // repoMode-only no-op otherwise
 let r2Guidance = review.guidance
 { const stub = guidanceStub(r2Guidance)
   if (stub) { log(`JE-GUIDANCE-STUB [Round 2]: ${stub} — falling back to TASK-ONLY round 2 (no priors block seeds a brief).`); r2Guidance = null } }
-const r2 = (await parallelQuorum(r2Worktrees, (a) => dispatch(a, a.ws, r2Guidance, 'Round 2'), 'Round 2', {
+await computeReuse('round-2', r2Worktrees)
+markInflight(r2Worktrees)
+await heartbeat('Round 2')
+const r2 = (await parallelQuorum(r2Worktrees, (a) => dispatchOrReuse(a, 'round-2', () => dispatch(a, a.ws, r2Guidance, 'Round 2')), 'Round 2', {
   timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
 })).filter(Boolean)
 { const w = dispatchDropSummary('Round 2', dispatchDrops, r2Worktrees.length, r2.length); if (w) log(w) } // #45
@@ -4142,6 +4586,8 @@ const finalPool = [
 phase('Final rank')
 const stagedF = await stageAndValidate(blindLabel(finalPool, 2), `${runDir}/review-final`, 'Final rank')
 const blindF = stagedF.filter(c => c.valid)
+markStaged(stagedF)
+await heartbeat('Final rank')
 const finalMapping = stagedF.map(c => ({ candidate: c.blind, model: c.displayModel, round: c.round, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
 const carriedEntries = finalMapping.filter(e => e.round === 1)
 const carriedOverWinner = carriedEntries.length ? carriedEntries[0].candidate : null // legacy field (first champion)
@@ -4219,13 +4665,14 @@ await persist([
   ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
   { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict' } },
   ...(finalRank.council ? [{ path: `${runDir}/review-final/council.json`, content: json(finalRank.council), derive: { mode: 'council-json', from: `${runDir}/review-final/verdict.json` } }] : []),
-  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
-  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
+  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null, resume: resumeSummary() }) },
+  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null, resume: resumeSummary() }) },
   { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, contributions }) },
 ], 'Final rank')
 
 // Auto-file engine-fault issues AFTER durable persistence, so a filing hang can never lose artifacts.
 await maybeFileEngineIssues('Final rank')
+if (!implement) await heartbeat('done', { phaseComplete: 'final' })
 
 // ===== IMPLEMENT PHASE hook — only with args.implement. =====================================
 // Reached only on a RESOLVED winning plan: a plan-phase NO_CONSENSUS / __failed / no-valid-pool
@@ -4285,6 +4732,7 @@ if (implement) {
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+  await heartbeat('done', { phaseComplete: 'final' })
   return {
     mode, n: N, implement: true,
     plan: {
