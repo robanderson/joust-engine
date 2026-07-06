@@ -29,6 +29,7 @@ That one line triggers the loop: it asks which model(s) to run the 5 attempts on
 - [Model providers](#model-providers)
 - [Diversity injection](#diversity-injection-pool-a--pool-b)
 - [Grand loops (`Z >= 2`)](#grand-loops-z--2)
+- [Run state: heartbeat, abort stamping, resume](#run-state-heartbeat-abort-stamping-resume)
 - [The dogfood backlog](#the-dogfood-backlog)
 - [Installation & setup](#installation--setup)
 - [The benchmarking system (`je-bench`)](#the-benchmarking-system-je-bench)
@@ -284,6 +285,29 @@ At the end the driver switches back to your starting branch. Safety rails:
 The orchestration home is the skill procedure plus `bin/je-git.sh` (which owns *all* git/gh side effects). The tournament engine (`workflows/tournament.mjs`) is **unchanged** and never touches the repo — that purity is its safety guarantee.
 
 ---
+
+## Run state: heartbeat, abort stamping, resume
+
+Every run writes a `run-state.json` sidecar into its run directory — the same trust class
+as `mapping.json` (unblinding bookkeeping; never judge-visible). It is updated atomically
+at every phase boundary through the engine's verified persist dataplane, and it is an
+**index, never an authority**: resume decisions are re-derived from the artifacts on disk.
+
+- **Heartbeat** — phase, a monotonic `phase_index`, and a per-seat status table land at
+  each phase boundary, so a dead run is inspectable at a glance.
+- **Abort stamping** — seats that were in flight when a run died are reclassified
+  `aborted` on the next launch from on-disk truth (empty workspace, no `JOUST-RC` line),
+  never from the file's own claims.
+- **Resume** — relaunch with `resume: true` and the SAME `runDir`: completed seats are
+  reused **in place** (same blind-letter index, so blind judging determinism holds) and
+  only missing/failed seats re-dispatch. Reuse is gated by a config fingerprint (attempts,
+  rotations, task); any drift refuses reuse and falls back to a clean full run. A
+  `resume.lock` (atomic, symlink-refusing) stops two resumes racing one run directory.
+  The SUMMARY of a resumed run discloses exactly which seats were reused vs re-run.
+
+A hand-edited `run-state.json` cannot inject a fake completed seat: there is no code path
+from its status fields to any reuse decision — the on-disk probe is the single source of
+truth, so the worst a forged file can cause is a re-dispatch.
 
 ## The dogfood backlog
 

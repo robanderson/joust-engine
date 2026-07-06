@@ -6,6 +6,42 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Run-state heartbeat + abort stamping + resume (engine #10, tournament-adopted).** A
+  `run-state.json` sidecar in the runDir (same trust class as mapping.json — unblinding
+  bookkeeping, never judge-visible) is written through the existing `persist()` dataplane
+  (atomic temp+rename, sha-verified, fail-open) at every phase boundary. Resume
+  (`args.resume: true`, `args.reuseDelivered` default true) re-uses completed seats IN PLACE
+  (same blind-letter index) and re-dispatches only missing/failed ones; the reuse decision
+  comes exclusively from a deterministic on-disk probe (provenance + deliverable + JOUST-RC),
+  so a hand-edited run-state.json is inert by construction. Config drift (attempts order/
+  identity, rots, task) refuses reuse via a sha256 fingerprint and falls safe to a clean run;
+  a `resume.lock` (resume-path only, atomic noclobber, symlink-refusing, stale-steal without
+  ever writing through the lock path) guards concurrent resumes; a resumed run's SUMMARY
+  discloses which seats were reused vs re-run. Winner of the run-i implement pool re-judged
+  by run J2 (blind council + steelman), adopted with the steelman's judge-directed
+  improvements and two security fixes found by the run-J3 evidence-quota council (symlink
+  lock truncation; probe label injection). Tests: `tournament-run-state.test.mjs` (28, incl.
+  a real killed-runDir e2e resume).
+
+- **Speculative implement overlap (`args.speculativeImplement`, default OFF).** The steelman
+  shootout is the measured long pole (~30-50 min); when enabled, Implement Round 3 starts the
+  moment the shootout SEEDS its finalists, seeded with the tally leader's pre-steelman brief
+  (disclosed in implement.json). Crowned leader => the pre-started round is adopted; a flip
+  discards it (awaited, staging + workspaces wiped) and re-runs clean at baseline wall-clock.
+  Tests: `tournament-speculative-implement.test.mjs`.
+
+- **Steelman runoff re-gates boosted copies.** The cold runoff used to judge boost outputs
+  under the stamps COPIED from their source dirs — run-j2's winning boost regenerated a patch
+  that did not apply at the pinned baseline yet carried a stale "applies cleanly" stamp. The
+  runoff now re-derives stamps + pool via the same mechanical gate as implement rounds; a
+  gate-invalidated boost ratchets back to the last gated version.
+
+- **Helper-prompt honesty pass.** All "This is an approved internal step" framings (6 sites)
+  replaced with plain statements of what each step does and that paths are engine-managed
+  run scratch — the phrasing was flagged by a codex review con and then live-blocked by a
+  safety classifier on the steelman adopt step. Codex judge fallback reasons now carry the
+  actual guard/reformat error (bounded) instead of only the class.
+
 - **Rejudge mode (`args.rejudgeCandidates`)** — judge an EXISTING staged implement pool with
   the current mechanical gate + full code council (fresh rotated blind letters, stale gate
   stamps stripped, no generation rounds). Born as the run-i salvage (a gate bug false-killed
