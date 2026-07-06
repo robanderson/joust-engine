@@ -60,10 +60,19 @@ const implementAttempts = (Array.isArray(A.implementAttempts) && A.implementAtte
 // never against a brief); the A/B readout is derived from mapping afterwards, never from votes.
 const AB_BRIEFS = A.abBriefs === true
 let implementSeats = implementAttempts // reassigned by the A/B hook when a second finalist exists
+// investigate (INVESTIGATE→COMPOSITE pipeline v1, spec 2026-07-06, gap G1): Round 1 attempts use
+// the 'investigate' brief kind — each returns a short FINDINGS.md (diagnosis + VERIFIABLE evidence
+// citations + a candidate improvement sketch; findings only, never fixes) — and the run IMPLIES
+// composeOnly semantics (stage/validate/pool, then return {poolPath, mapping, candidates} for the
+// orchestrating composer; no councils, no round 2). A G2 evidence-verification pass stamps each
+// pooled candidate with `EVIDENCE: n cited, m verified` before the pool returns. Off (default) =>
+// byte-identical behavior to today. Ignored under implement (investigation precedes implementation
+// by construction — the composite, not the findings pool, seeds implementers).
+const investigate = A.investigate === true && !implement
 // composeOnly (@@FE Fable Engine): run Round 1 + stage/validate/pool, then STOP — no councils,
 // no round 2, no implement. The caller (the orchestrating model) reads the blind pool and
-// composes/implements itself. Mutually exclusive with implement.
-const composeOnly = A.composeOnly === true && !implement
+// composes/implements itself. Mutually exclusive with implement. `investigate` implies it.
+const composeOnly = (A.composeOnly === true || investigate) && !implement
 const mode = implement ? 'two' : A.mode
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 
@@ -114,11 +123,14 @@ function deriveSummary() {
 // strings — treat a string as a tentative, evidence-less item so the live system never crashes on cached data.
 
 // brief() frames one attempt. `kind` selects the phase framing:
-//   'plan'      — Plan Round 1/2: produce a PLAN artifact (a concrete, file-level change
-//                 proposal). Plans NEVER touch the repo, so this is always the scratch path.
-//   'implement' — Implement Round 3/4: apply the change. `seedPlanPath` (when set) seeds the
-//                 attempt with the WINNING PLAN verbatim — the deliberate exception to the
-//                 "never seed prior artifacts" rule (the plan IS the spec).
+//   'plan'        — Plan Round 1/2: produce a PLAN artifact (a concrete, file-level change
+//                   proposal). Plans NEVER touch the repo, so this is always the scratch path.
+//   'investigate' — Investigate Round 1 (investigate: true): produce a FINDINGS.md — diagnosis +
+//                   verifiable evidence citations + an improvement sketch. Findings only, never
+//                   fixes; same single-pass + save contract + hard stop as the other kinds.
+//   'implement'   — Implement Round 3/4: apply the change. `seedPlanPath` (when set) seeds the
+//                   attempt with the WINNING PLAN verbatim — the deliberate exception to the
+//                   "never seed prior artifacts" rule (the plan IS the spec).
 function brief(nudge, ws, guidance, ctx, kind = 'implement', seedPlanPath = null) {
   let g = ''
   if (guidance) {
@@ -130,6 +142,30 @@ function brief(nudge, ws, guidance, ctx, kind = 'implement', seedPlanPath = null
   const ctxLine = ctx
     ? `\nShared context for this task has ALREADY been gathered for you in one file: ${ctx}\nRead that single file at the start — it contains the source material you need. Do NOT re-read the underlying source files one by one (that work is already done).\n`
     : ''
+
+  // ---- INVESTIGATE round (investigate: true, Round 1 only): produce FINDINGS, never fixes. ----
+  if (kind === 'investigate') {
+    return `You are INVESTIGATING a problem — establishing WHAT is actually true, not designing or writing a fix. Your deliverable is FINDINGS ONLY.
+
+Task to investigate:
+${task}
+${g}${ctxLine}
+${nudge}
+
+Write ONE file, FINDINGS.md, in your workspace, organised as:
+- DIAGNOSIS (1-3 bullets): what is actually wrong/slow/missing, in decision-level language.
+- EVIDENCE (2-6 bullets): VERIFIABLE citations backing each diagnosis bullet — exact file paths with line numbers (e.g. src/foo.js:123), artifact/log paths, or short quoted log/telemetry excerpts naming their source path, plus measured numbers where you have them. Every claim must be checkable by a reader with the same files; a claim you could not verify is speculation and MUST be labelled as such.
+- CANDIDATE IMPROVEMENT SKETCH (1-3 bullets): the direction a fix could take, at design-brief altitude — what KIND of change, where, and why it would address the diagnosis.
+
+ALTITUDE RULE (hard): FINDINGS ONLY — NO code blocks, NO diffs, NO function bodies, NO fixes, NO line-level edit instructions. Citing a file:line as evidence is citing, not editing. A findings file that reads like a patch or an implementation will be judged DOWN for altitude violation; a diagnosis without checkable evidence will be weighed as speculation.
+
+Rules:
+- This task is fully specified and self-contained. Do NOT ask clarifying questions or stop for input — investigate with what you can read; where you cannot verify, say so honestly rather than speculate.
+- Produce the FINDINGS ONLY. Do NOT write a fix, do NOT edit real source files, do NOT run anything beyond what you need to verify your claims.
+- Work in a SINGLE pass and then STOP. Your first version is final; do not rewrite or polish it.
+- Save FINDINGS.md into: ${ws} (create the directory if needed). To save a file, just write it; if a file-edit tool refuses because the file "must be read first", overwrite it directly with the shell (\`cat > FILE <<'EOF' ... EOF\`).
+- End FINDINGS.md with a 2 to 4 sentence note on your confidence and what you could not verify (outside the bullet budget).`
+  }
 
   // ---- PLAN phase (Plan Round 1/2): produce a PLAN artifact, never touch the repo. ----
   if (kind === 'plan') {
@@ -756,6 +792,71 @@ function assignAbSeeds(attempts, seedPaths) {
   return attempts.map((a, i) => ({ ...a, seedPlanPath: seedPaths[i % 2], seedBrief: i % 2 === 0 ? 'brief-1' : 'brief-2' }))
 }
 // ---- end: ab briefs ----------------------------------------------------------------------------
+
+// ---- begin: evidence verification ---------------------------------------------------------------
+// G2 evidence-verification pass (INVESTIGATE→COMPOSITE v1) — PURE, extract-and-eval'able like the
+// mechanical/contract gates. The IMPURE runner (evidenceVerificationPass) composes these onto one
+// HELPER_MODEL shell step AFTER staging: extract each valid candidate's cited file paths from its
+// FINDINGS deliverable, grep-check they exist in the snapshot/context, and stamp
+// `EVIDENCE: n cited, m verified` into the pool. FAIL-SAFE end to end: an unverifiable citation is
+// counted-but-unverified (stamp only), a garbled/dead helper degrades to UNSTAMPED, and nothing
+// here ever invalidates a candidate or touches valid/failReason (contrast corrupt_patch).
+//
+// Citation grammar (the contract both extractors implement): a path-shaped token — one or more
+// directory segments then a dotted filename (optionally absolute), with an optional :line suffix —
+// preceded by start-of-text or a separator (whitespace/quote/backtick/paren/bracket), so URL
+// interiors (https://host/a/b.js — every path-ish substring is preceded by ':' '/' or '.') and
+// mid-word fragments never match. Bare slashless filenames (package.json) deliberately do NOT
+// count: requiring a directory segment is what keeps prose mentions from inflating `n cited`.
+// CITE_GREP is the POSIX-ERE twin of parseCitations' JS regex; the two MUST stay in sync (the
+// extract-and-eval suite pins parseCitations; the structural suite pins CITE_GREP into the shell).
+const CITE_GREP = `(^|[[:space:]"'\`(\\[])\\/?([A-Za-z0-9._-]+\\/)+[A-Za-z0-9._-]+\\.[A-Za-z0-9_]+(:[0-9]+)?`
+// Shell post-processing for `grep -ohE CITE_GREP` output: strip the one leading separator char the
+// alternation may have captured, then the :line suffix — leaving one bare path per line (sort -u
+// then counts DISTINCT cited paths, the same dedupe parseCitations applies).
+const CITE_SED = `s/^[[:space:]"'\`(\\[]//; s/:[0-9]+$//`
+
+// parseCitations(text) -> [{ path, line }] — the marked-block citation parser. Dedupes by PATH
+// (first-seen line number kept), so its length is exactly the runner's `n cited`. Never throws.
+function parseCitations(text) {
+  const re = /(?:^|[\s"'`(\[])(\/?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.[A-Za-z0-9_]+)(?::(\d+))?/g
+  const out = []
+  const seen = new Set()
+  const s = String(text == null ? '' : text)
+  let m
+  while ((m = re.exec(s))) {
+    const path = m[1]
+    if (seen.has(path)) continue
+    seen.add(path)
+    out.push({ path, line: m[2] ? Number(m[2]) : null })
+  }
+  return out
+}
+
+// counts -> the exact judge/composer-visible stamp line (closed grammar; letters only — no
+// candidate text, no paths, no model identity ever enters the stamp).
+const EVIDENCE_GRAMMAR = '^EVIDENCE: [0-9]+ cited, [0-9]+ verified$'
+function evidenceStampFor(cited, verified) {
+  const n = Number.isInteger(cited) && cited >= 0 ? cited : 0
+  const m = Math.min(Number.isInteger(verified) && verified >= 0 ? verified : 0, n)
+  return `EVIDENCE: ${n} cited, ${m} verified`
+}
+
+// Merge parsed JEVID counts onto the staged list. PURELY ADDITIVE — attaches c.evidence and NEVER
+// touches valid/failReason in either direction (fail-safe by construction: there is no
+// invalidation branch). Missing/garbled/non-numeric => NO evidence attached (degrade to unstamped,
+// the contract-gate discipline: helper noise never reads as a candidate signal).
+function mergeEvidence(staged, byBlind) {
+  return staged.map(c => {
+    const r = byBlind && byBlind[c.blind]
+    const cited = r == null ? NaN : Number(r.cited)
+    const verified = r == null ? NaN : Number(r.verified)
+    if (!Number.isInteger(cited) || cited < 0 || !Number.isInteger(verified) || verified < 0) return { ...c }
+    const m = Math.min(verified, cited)
+    return { ...c, evidence: { cited, verified: m, stamp: evidenceStampFor(cited, m) } }
+  })
+}
+// ---- end: evidence verification -----------------------------------------------------------------
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
 const rcSummaryLive = () => buildRcSummary(seatRcs)
@@ -1196,6 +1297,90 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       { model: HELPER_MODEL, phase: phaseTitle, label: 'mechanical-pool' }
     ).catch(() => null)
   }
+  return merged
+}
+
+// G2 evidence-stamp plumbing (INVESTIGATE→COMPOSITE v1). EVIDENCE/JEVID are provider-neutral
+// literals — like MECHANICAL/JMECH they are deliberately NOT rebrand tokens and stay byte-identical
+// in the dev copy. The fail-safe is DEGRADE TO UNSTAMPED (the contract-gate discipline): a missing
+// or grammar-violating evidence.txt emits no "--- Evidence check ---" block at all, so pass-infra
+// noise never becomes a composer-visible signal.
+function evidenceStampShell(dest) {
+  const f = `${dest}/evidence.txt`
+  return `if grep -Eq ${q(EVIDENCE_GRAMMAR)} ${q(f)} 2>/dev/null; then printf '\\n--- Evidence check ---\\n'; cat ${q(f)}; fi`
+}
+
+const EVIDENCE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { blind: { type: 'string' }, cited: { type: 'number' }, verified: { type: 'number' } },
+        required: ['blind', 'cited', 'verified'],
+      },
+    },
+  },
+  required: ['results'],
+}
+
+// G2 evidence-verification pass (investigate runs only): one HELPER_MODEL agent, one deterministic
+// shell script, once per round — mechanicalPatchGate's shape exactly. AFTER staging (and the
+// repoMode enrichment rebuild), BEFORE the composeOnly pool return: for each VALID candidate,
+// extract its cited paths (grep -ohE CITE_GREP — the shell twin of parseCitations), grep-check each
+// against the snapshot/context (working tree at the repo top, the pinned baseSha via git cat-file,
+// or the shared context bundle), stamp `EVIDENCE: n cited, m verified` into evidence.txt, and
+// rebuild the blind pool with the stamp (letters only — no path, no candidate text, no identity).
+// FAIL-SAFE: an unverifiable citation is stamped-but-unverified; a dead helper / garbled counts
+// degrade to unstamped; NOTHING here invalidates a candidate (mergeEvidence is purely additive).
+async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
+  if (!investigate) return staged
+  const targets = staged.filter(c => c.valid)
+  if (!targets.length) return staged
+  const baseArg = repoMode && baseSha ? q(baseSha) : `''`
+  const ctxArg = contextPath ? q(contextPath) : `''`
+  const perCandidate = targets.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `(` +
+      `dest=${q(dest)}; ev=${q(`${dest}/evidence.txt`)}; base=${baseArg}; ctx=${ctxArg}; ` +
+      `cites=$(find "$dest" -type f ! -name evidence.txt -print0 2>/dev/null | xargs -0 grep -ohE ${q(CITE_GREP)} 2>/dev/null | sed -E ${q(CITE_SED)} | sort -u); ` +
+      // Citation paths carry no whitespace/globs by grammar (charset [A-Za-z0-9._-/]), so plain
+      // word-splitting iteration is safe and keeps n/m in THIS shell (no subshell-pipe counter loss).
+      `n=0; m=0; top=$(git rev-parse --show-toplevel 2>/dev/null); ` +
+      `for p in $cites; do n=$((n+1)); ok=0; ` +
+        `if [ -e "$p" ]; then ok=1; ` +
+        `elif [ -n "$top" ] && [ -e "$top/$p" ]; then ok=1; ` +
+        `elif [ -n "$top" ] && [ -n "$base" ] && git -C "$top" cat-file -e "$base:$p" >/dev/null 2>&1; then ok=1; ` +
+        `elif [ -n "$ctx" ] && grep -qF -- "$p" "$ctx" 2>/dev/null; then ok=1; fi; ` +
+        `[ "$ok" -eq 1 ] && m=$((m+1)); ` +
+      `done; ` +
+      `printf 'EVIDENCE: %s cited, %s verified\\n' "$n" "$m" > "$ev"; ` +
+      // Degrade-to-unstamped guard: anything not matching the closed grammar is DELETED, so
+      // evidenceStampShell emits no block for it (fail-safe; no fallback stamp on purpose).
+      `grep -Eq ${q(EVIDENCE_GRAMMAR)} "$ev" 2>/dev/null || rm -f "$ev"; ` +
+      `echo "JEVID ${c.blind} $n $m"` +
+      `)`
+  }).join('\n')
+  const res = await agent(
+    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEVID <letter> <cited> <verified>". Then return the structured results: for EACH printed JEVID line an entry {blind: the letter, cited: the first number, verified: the second number}. Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
+    { model: HELPER_MODEL, schema: EVIDENCE_SCHEMA, phase: phaseTitle, label: 'evidence-gate' }
+  ).catch(() => null)
+  const byBlind = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) byBlind[String(r.blind).trim()] = r
+  const merged = mergeEvidence(staged, byBlind)
+  // Rebuild the pool from the still-valid candidates (stageAndValidate's section format + the
+  // grammar-guarded stamp block — the mechanical-gate rebuild discipline; engine stamp files are
+  // excluded from the cat and re-emitted only through their guarded stamp shells).
+  const pool = `${reviewDir}/_pool.md`
+  const rebuild = [`tmp=${q(`${pool}.evid`)}`, `: > "$tmp"`].concat(merged.filter(c => c.valid).map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name evidence.txt ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${evidenceStampShell(dest)}; echo; } >> "$tmp"`
+  })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
+  await agent(
+    `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with evidence-verification stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
+    { model: HELPER_MODEL, phase: phaseTitle, label: 'evidence-pool' }
+  ).catch(() => null)
   return merged
 }
 
@@ -3207,7 +3392,7 @@ await buildContext() // shared context bundle (no-op unless args.contextFiles gi
 const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label) }))
 await buildWorktrees('round-1', r1Worktrees) // repoMode-only no-op otherwise
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
-const r1 = (await parallelQuorum(r1Worktrees, (a) => dispatch(a, a.ws, null, 'Round 1'), 'Round 1', {
+const r1 = (await parallelQuorum(r1Worktrees, (a) => dispatch(a, a.ws, null, 'Round 1', investigate ? 'investigate' : 'plan'), 'Round 1', {
   timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
 })).filter(Boolean)
 { const w = dispatchDropSummary('Round 1', dispatchDrops, r1Worktrees.length, r1.length); if (w) log(w) } // #45
@@ -3237,19 +3422,30 @@ if (!blind1.length) {
 
 if (repoMode) await enrichBlindPool(blind1, `${runDir}/review-1`, 'Review')
 
+// G2 evidence-verification pass (investigate runs only — a hard no-op otherwise): AFTER staging
+// (and the repoMode enrichment rebuild), BEFORE the composeOnly pool return, so every pooled
+// finding carries its `EVIDENCE: n cited, m verified` stamp when the composer reads the pool.
+const stagedEv = await evidenceVerificationPass(staged1, `${runDir}/review-1`, 'Review')
+
 // composeOnly (@@FE): the pool is the product. Persist the key + summaries and return the
 // staged blind pool for the orchestrating model to review/compose from. No council spend.
 if (composeOnly) {
+  // Evidence-aware mapping rows (investigate only; identical to r1mapping otherwise, since
+  // mergeEvidence attaches nothing when the pass did not run).
+  const evMapping = stagedEv.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
+    ...(c.evidence ? { evidence: { cited: c.evidence.cited, verified: c.evidence.verified } } : {}),
+    ...(c.valid ? {} : { failReason: c.failReason }) }))
   await persist([
-    { path: `${runDir}/mapping.json`, content: json({ mode: 'composeOnly', n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null }) },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(), round1: evMapping, winner1: null }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping: evMapping }) },
   ], 'Review')
   await maybeFileEngineIssues('Review')
   return {
-    mode: 'composeOnly', n: N, rc_summary: rcSummaryLive(),
+    mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(),
     poolPath: `${runDir}/review-1/_pool.md`,
-    round1: { mapping: r1mapping },
-    candidates: blind1.map(c => ({ blind: c.blind, stagedDir: `${runDir}/review-1/${c.blind}` })),
+    round1: { mapping: evMapping },
+    candidates: stagedEv.filter(c => c.valid).map(c => ({ blind: c.blind, stagedDir: `${runDir}/review-1/${c.blind}`,
+      ...(c.evidence ? { evidence: { cited: c.evidence.cited, verified: c.evidence.verified } } : {}) })),
   }
 }
 

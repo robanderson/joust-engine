@@ -6,6 +6,31 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **INVESTIGATE→COMPOSITE pipeline v1 (`args.investigate`, default OFF; spec
+  `docs/superpowers/specs/2026-07-06-investigate-composite-pipeline.md`).** For vague-goal /
+  issue-shaped tasks where the expensive part is finding WHAT is true: findings COMPOSE (the
+  union of verified diagnoses beats the best single one), so no winner is picked. G1: a third
+  `brief()` kind `'investigate'` — Round 1 attempts return a short FINDINGS.md (diagnosis +
+  VERIFIABLE evidence citations (file:line / artifact paths / log excerpts) + a candidate
+  improvement sketch), altitude-guarded (findings only — no code blocks, no fixes) with the same
+  single-pass + save contract + hard stop as the other kinds; `investigate: true` IMPLIES
+  composeOnly semantics (stage/validate/pool then return `{poolPath, mapping, candidates,
+  investigate: true}` — reuses the @@FE seam; no councils, no round 2; ignored under
+  `implement`). G2: an evidence-verification pass — one HELPER_MODEL deterministic shell step
+  (mechanicalPatchGate's shape) after staging/enrichment and before the pool return: extracts
+  each valid candidate's cited paths (pure marked-block citation parser `parseCitations` +
+  its POSIX-ERE twin `CITE_GREP`), grep-checks them against the snapshot/context (working tree /
+  pinned baseRef via `git cat-file` / contextFiles bundle), and stamps `EVIDENCE: n cited,
+  m verified` per candidate into `_pool.md` (letters only; fail-safe: unverifiable =
+  stamped-but-unverified, garbled/dead helper = unstamped, NEVER invalidates; mapping rows gain
+  `evidence: {cited, verified}`). G3+G4 are skill-side (no engine): the fable-engine SKILL gains
+  an "Investigate mode" section (@@FE + `investigate: true`; composer UNIONS verified findings —
+  diagnosis union, approach, approach-neutral acceptance criteria, credit table; a finding whose
+  citation failed verification is demoted/dropped visibly) and issue-intake (`@@FE fix #NNN` →
+  `gh issue view NNN` as the task + named files as contextFiles); orchestration.md documents the
+  args. Flag off => byte-identical behavior. Tests: pure citation-parser/stamp/merge units +
+  structural brief/ordering coverage in `workflows/tournament-investigate.test.mjs`.
+
 - **Structural persist phase 2 — per-seat verdict files + deterministic assembler (issue #33,
   spec `docs/superpowers/specs/2026-07-06-persist-phase2-author-writes.md`).** The last large
   model-transiting artifact (verdict.json, ~130KB typed per checkpoint after phase 1) is

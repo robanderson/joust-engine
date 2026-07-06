@@ -71,6 +71,40 @@ new behaviour needs a failing-then-passing test), then the full gate: `npm run c
 the full test suite, and the rebrand self-verify when engine/runner files changed.
 Commit only when green. Never push or open PRs beyond what the user has authorized.
 
+## Investigate mode (`investigate: true`)
+
+For a VAGUE goal ("the system is too slow") or a CONCRETE ISSUE ("fix #454") the expensive
+part is finding WHAT is true, not choosing between designs for a guess — and FINDINGS
+COMPOSE (the union of verified diagnoses beats the best single one), so no winner is picked.
+Use @@FE with `investigate: true` added to the Phase 2 workflow args. The engine then:
+Round 1 attempts produce **FINDINGS.md** artifacts (diagnosis + VERIFIABLE evidence
+citations — file:line / artifact paths / log excerpts — + a candidate improvement sketch;
+altitude-guarded: findings only, never fixes), an evidence-verification pass stamps each
+pooled candidate with `EVIDENCE: n cited, m verified` (fail-safe: unverifiable is stamped,
+never invalidated), and the run returns composeOnly-style — `{ poolPath, round1.mapping
+(rows carry evidence counts), candidates[], investigate: true, rc_summary }`. The ORIGINAL
+request is the constitution for the whole run: it appears verbatim in every later artifact
+and nothing downstream may redefine it.
+
+- **Issue intake** (`@@FE fix #NNN` / "fix issue NNN"): fetch the issue FIRST — `gh issue
+  view NNN` — and install its title+body verbatim as the task text (it joins the original
+  request as constitution); add the files the issue names to `contextFiles` so seats can
+  actually read the substrate (a run without substrate must say so rather than speculate).
+- **Compose (Phase 3, investigate variant):** UNION the VERIFIED findings into the
+  composite — additive, never a winner-pick; two seats finding the same fault is
+  confirmation, not redundancy. The composite must carry: the **diagnosis union**
+  (priority-ordered by measured impact; a finding whose citation failed verification —
+  low/zero `verified` on its stamp, or a citation you cannot reproduce — is demoted to a
+  hypothesis or dropped, VISIBLY, never silently adopted), the **chosen approach** + why
+  and rejected alternatives, **approach-neutral acceptance criteria** (binding on the
+  implementation, mechanically checkable where possible), and the **credit table** (per
+  seat: adopted/rejected and why, each adopted finding traced to its seat + verified
+  citation). ALTITUDE-GUARDED like a design brief: no code blocks, no diffs, no function
+  bodies — evidence file:line citations are citing, not editing.
+- **Implement (Phase 4) and report (Phase 5) as usual.** v1: the acceptance criteria land
+  verbatim in the report/PR body and as judge evidence requests — no mechanical
+  criteria-extraction into the verify set yet.
+
 ## Phase 5: Report
 
 1. Unblind: the mapping (candidate → model) and the credit table merged, so the user sees

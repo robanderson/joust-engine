@@ -198,8 +198,8 @@ test('je-render renders steelman + fast-tally metadata into verdict.md', () => {
 
 // ----- structural: composeOnly (@@FE Fable Engine) -----
 test('(structural) composeOnly stops after the staged pool — no council, no round 2', () => {
-  // flag exists and is implement-exclusive
-  assert.match(SRC, /const composeOnly = A\.composeOnly === true && !implement/)
+  // flag exists and is implement-exclusive (investigate implies composeOnly semantics — v1 pipeline)
+  assert.match(SRC, /const composeOnly = \(A\.composeOnly === true \|\| investigate\) && !implement/)
   // the branch returns the pool BEFORE the round-1 judge call and never judges
   const seam = SRC.indexOf('if (composeOnly) {')
   const firstJudgeCall = SRC.indexOf("await judge('reviewer'")
