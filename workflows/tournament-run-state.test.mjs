@@ -253,7 +253,7 @@ test('e2e resume: completed seats reuse in place; empty/in_flight seats re-run (
 
   const attempts = [seatA, seatB, seatC]
   const mod = buildRuntime({
-    A: { resume: true }, runDir, mode: 'two', implement: false, attempts, implementAttempts: [],
+    A: { resume: true }, runDir, mode: 'two', implement: false, task: 'test-task', attempts, implementAttempts: [],
     attemptIdentity, canonicalConfig, sha256Hex, RUN_STATE_VERSION,
     persist, json: x => JSON.stringify(x), log: () => {}, q, agentLadder, HELPER_MODEL: 'sonnet',
     engineFiles, provCheckShell, dispatchRunner, deriveSeatStatus, rebuildResumeList, validateRunState,

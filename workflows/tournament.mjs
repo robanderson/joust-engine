@@ -4115,7 +4115,7 @@ const ROTS = { 'round-1': 1, 'round-2': 2, 'impl-3': 3, 'impl-4': 4 }
 const RUN_STATE_PATH = `${runDir}/run-state.json`
 const LOCK_PATH = `${runDir}/resume.lock`
 const LOCK_STALE_MIN = Number(A.resumeLockStaleMins) > 0 ? Math.floor(Number(A.resumeLockStaleMins)) : 30
-const RUN_STATE_CONFIG = { mode, implement, rots: ROTS, attempts: attempts.map(attemptIdentity), implementAttempts: implementAttempts.map(attemptIdentity) }
+const RUN_STATE_CONFIG = { mode, implement, task_sha: sha256Hex(String(task || '')), rots: ROTS, attempts: attempts.map(attemptIdentity), implementAttempts: implementAttempts.map(attemptIdentity) } // steelman F5: task rides the fingerprint (hashed) so a changed task refuses reuse
 const CONFIG_FP = sha256Hex(canonicalConfig(RUN_STATE_CONFIG))
 const RUN_STATE_DUMP_SCHEMA = { type: 'object', additionalProperties: false, properties: { raw: { type: 'string' } }, required: ['raw'] }
 const PROBE_SCHEMA = {
@@ -4128,6 +4128,7 @@ const PROBE_SCHEMA = {
   required: ['results'],
 }
 let phaseIndex = 0
+let lockHeld = false // steelman F2: only a resume acquires the lock; only the holder releases/touches it
 let resumed = false
 let prevConfig = null
 let resumeReuseCount = 0
@@ -4186,8 +4187,8 @@ async function heartbeat(phaseLabel, opts = {}) {
     // item 8: refresh the lock's mtime on each heartbeat so `find -mmin` staleness ages from the LAST
     // heartbeat, not from launch — a crashed run's lock then goes stale LOCK_STALE_MIN after its last
     // activity, unblocking re-resume automatically. The terminal heartbeat releases the lock instead.
-    if (opts.phaseComplete === 'final') await releaseLock()
-    else await touchLock()
+    if (opts.phaseComplete === 'final') { if (lockHeld) { await releaseLock(); lockHeld = false } }
+    else if (lockHeld) await touchLock()
   } catch (e) { log(`heartbeat (${phaseLabel}) failed (non-fatal): ${String(e).slice(0, 120)}`) }
 }
 
@@ -4213,12 +4214,13 @@ async function readRunState() {
 // a transient probe error no longer green-lights a concurrent double-launch.
 async function acquireLock() {
   try {
-    const cmd = `mkdir -p ${q(runDir)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK acquired; ` +
+    const cmd = `[ -L ${q(runDir)} ] && { echo JLOCK symlink; exit 0; }; mkdir -p ${q(runDir)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK acquired; ` +
       `elif [ -n "$(find ${q(LOCK_PATH)} -mmin +${LOCK_STALE_MIN} 2>/dev/null)" ]; then : > ${q(LOCK_PATH)} 2>/dev/null; echo JLOCK stale-stolen; ` +
       `else echo JLOCK held-fresh; fi`
     const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
       { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'resume-lock' }).catch(() => null)
     const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    if (/JLOCK symlink/.test(raw)) return 'symlink'        // steelman F4: refuse a symlinked runDir
     if (/JLOCK acquired/.test(raw)) return 'acquired'      // create SUCCEEDED: no lock was present
     if (/JLOCK stale-stolen/.test(raw)) return 'stale-stolen'
     if (/JLOCK held-fresh/.test(raw)) return 'held-fresh'
@@ -4337,14 +4339,15 @@ async function dispatchOrReuse(a, roundName, thunk) {
     resumeReusedLabels.push(a.label) // item 4: record WHICH seat was reused
     runStateSeats[a.label] = { status: 'completed', rc: '00', reused: true }
     log(`JE-RESUME-REUSE [${roundName}]: seat ${a.label} (${a.displayModel}) — reusing on-disk deliverable (not re-dispatched).`)
-    await heartbeat(`seat:${roundName}:${a.label}`) // item 5: durably persist this individual seat completion
+    // steelman F1 (run-j2): NO per-seat heartbeat — one batched heartbeat per phase boundary keeps
+    // the <=~5-persist budget; resume authority is the DISK PROBE, so per-seat run-state durability
+    // was observability-only at ~2 helper calls per seat.
     return { label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws: a.ws, res: null, reused: true }
   }
   if (resumed) { resumeRerunCount += 1; resumeRerunLabels.push(a.label) } // item 4: record WHICH seat re-ran
   const out = await thunk()
-  // item 5: one heartbeat per individual seat completion (its status is refined at staging by markStaged);
-  // durability now tracks per-seat completion, not only phase boundaries.
-  await heartbeat(`seat:${roundName}:${a.label}`)
+  // steelman F1: seat status still lands in runStateSeats (markStaged) and persists at the NEXT
+  // phase-boundary heartbeat — no per-seat persist round-trip.
   return out
 }
 
@@ -4353,18 +4356,31 @@ async function dispatchOrReuse(a, roundName, thunk) {
 // fingerprint. On a held-fresh OR unreadable lock, REFUSE (return an error the flow surfaces). On
 // no/invalid/drifted prior state, fall through to a clean run (resumed stays false -> nothing reused).
 async function resumeInit() {
+  // steelman F2 (run-j2): the lock guards the RESUME path only. A fresh launch acquires nothing and
+  // can never be refused by a leftover lock (the item-7 lock-every-launch design made a crashed
+  // run's <staleness-old lock block an ordinary relaunch of the same runDir — a new failure mode
+  // for normal tournaments). The cost, accepted by the runoff: resume-vs-live-ORIGINAL races are no
+  // longer detected — the guard now covers resume-vs-resume.
+  if (!RESUME) return null
+  // steelman F4 (run-j2): harden runDir BEFORE probing any artifact through it — resume reads and
+  // trusts files under this path. Reject non-absolute / traversal here; the lock probe below also
+  // refuses a symlinked runDir (shell-side [ -L ] check).
+  if (!/^\//.test(String(runDir)) || String(runDir).includes('..')) {
+    log(`JE-RESUME: runDir ${runDir} failed the resume path guard (non-absolute or traversal) — starting a CLEAN run (nothing reused).`)
+    return null
+  }
   const lock = await acquireLock()
-  if (lock === 'held-fresh' || lock === 'unreadable') {
+  lockHeld = (lock === 'acquired' || lock === 'stale-stolen')
+  if (lock === 'held-fresh' || lock === 'unreadable' || lock === 'symlink') {
     // item 6: 'unreadable' = the probe could not confirm the lock is absent (transient read error); we
-    // refuse rather than risk a concurrent double-launch. item 7: this now also catches a resume that
-    // races a still-alive ORIGINAL run (whose lock is held-fresh and refreshed each heartbeat).
+    // refuse rather than risk a concurrent double-launch of the same resume target.
     const why = lock === 'unreadable'
       ? `the lock probe could not confirm ${LOCK_PATH} is absent (transient read error)`
+      : lock === 'symlink' ? `${runDir} is a symlink (resume refuses to follow redirected run directories)`
       : `${LOCK_PATH} is held by a live launch (younger than ${LOCK_STALE_MIN}min)`
     log(`JE-RESUME-LOCK-HELD: ${why} — refusing to double-launch this runDir.`)
     return { error: `RESUME-LOCK-HELD: ${why}; refusing to double-launch (would corrupt in-flight work). Remove the lock if the owner is gone, or raise args.resumeLockStaleMins.` }
   }
-  if (!RESUME) return null // clean launch: the lock is now held for this runDir; nothing prior to reuse.
   const prev = await readRunState()
   if (!prev || !validateRunState(prev)) {
     log('JE-RESUME: no valid prior run-state.json found — starting a CLEAN run (nothing to reuse).')
