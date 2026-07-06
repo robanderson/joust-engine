@@ -211,9 +211,11 @@ test('convergence stamp rides BOTH pool-rebuild writers (mechanical + enrich)', 
 
 test('dynamic-M seat trim gates the pool BEFORE the A/B assignment and BEFORE implementPhase', () => {
   const trim = at('const trimmed = trimSeatsForConvergence(implementSeats, ev)')
-  const gate = at('if (DYNAMIC_M_ON) {')
-  const abAssign = at('assignAbSeeds(implementSeats,')
-  const implPhase = at('const impl = await implementPhase(seedPlanPath)')
+  const gate = at('if (DYNAMIC_M_ON && !specHit) {') // run N: the trim additionally skips a speculative hit
+  // run N: the speculative seed callback also calls assignAbSeeds (earlier in source, seed-time
+  // path, deliberately untrimmed) — anchor on the NORMAL-path assignment after the trim.
+  const abAssign = SRC.indexOf('assignAbSeeds(implementSeats,', at('const trimmed = trimSeatsForConvergence(implementSeats, ev)'))
+  const implPhase = at('const impl = await implementPhase(seedPlanPath, specHit') // run N: optional pre-started R3
   assert.ok(gate <= trim, 'the trim is gated by the opt-in DYNAMIC_M_ON flag')
   assert.ok(trim < abAssign, 'trim the base pool BEFORE A/B so the split re-alternates the trimmed pool')
   assert.ok(abAssign < implPhase, 'seats are finalized before the implement phase runs')

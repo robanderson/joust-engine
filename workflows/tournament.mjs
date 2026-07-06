@@ -588,6 +588,18 @@ function auditSeatModel(phaseTitle, label, lens, dispatchMode, verdict) {
   if (!as_intended) log(`JE-SEAT-AUDIT [${phaseTitle}] ${label} (${lens.key}): ran as ${actual}, intended ${intended}`)
   return verdict
 }
+// ---- Run N (S2, 2026-07-07): SPECULATIVE IMPLEMENT overlap — flag-gated, DEFAULT OFF ----------
+// The steelman shootout is the long pole between "tally leader known" and "winner crowned" (~30-50
+// min live). With args.speculativeImplement === true, the final-rank council fires a seed callback
+// the moment the shootout SEEDS its finalists: Implement Round 3 starts immediately, seeded with
+// the tally leader's PRE-STEELMAN brief (disclosed). If the shootout crowns the leader, the round
+// is adopted as-is; a FLIP discards it (awaited to completion, staging + workspaces wiped) and
+// re-runs Round 3 clean — flip cost = the wasted speculative round, wall-clock = baseline. The
+// seed-time path deliberately SKIPS dynamic-M (spend guard stays decided on the normal path only).
+const SPECULATIVE_IMPLEMENT = A.speculativeImplement === true
+let speculativeImpl = null   // { leader, ab?, promise } — set by the seed callback
+let onSteelmanSeeds = null   // registered ONLY before the plan final-rank judge call; cleared on fire
+
 // ---- Codex review-seat concurrency cap (S1, 2026-07-07): the judge-architecture experiment
 // measured 4-way concurrent `codex review` at ~4x single-seat latency (account-level backpressure,
 // cap ~2 useful lanes). Serialize LIVE codex judge processes through this semaphore — dispatch
@@ -3103,6 +3115,9 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   const seedVotesStr = Object.keys(t.votes).sort().map(k => `${k}:${t.votes[k]}`).join(', ') || 'none'
   log(`council ${label}: STEELMAN SHOOTOUT — seed vote ${seedVotesStr}${t.winner ? ` (majority: ${t.winner})` : ' (no majority)'}; finalists [${seeds.join(', ')}].`)
   const steelmanMeta = { seeds, seed_votes: { ...t.votes }, seed_majority: t.winner || null, rounds: [], decided_by: null }
+  // Run N: fire-and-forget the speculative-implement seed hook the moment the finalists are known.
+  // Registered only for the plan final rank; cleared on fire so no other council point can trigger it.
+  if (onSteelmanSeeds) { const h = onSteelmanSeeds; onSteelmanSeeds = null; try { h(seeds.slice()) } catch (e) { log(`speculative seed hook failed (non-fatal): ${String(e).slice(0, 120)}`) } }
   const currentWs = {}                          // ratchet state: letter -> last GATED artifact dir
   for (const s of seeds) currentWs[s] = `${reviewDir}/${s}`
   const loneFinalist = seeds.length === 1
@@ -3878,10 +3893,11 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
 }
 
 // The implement phase driver. Round 3 always; Round 4 ONLY on a failed R3 gate (guided by R3 review).
-async function implementPhase(seedPlanPath) {
+async function implementPhase(seedPlanPath, preR3 = null) {
   phase('Implement Round 3')
   log(`Implement Round 3: ${implementAttempts.length} implementer(s) seeded with the winning plan (${implementAttempts.map(a => a.displayModel).join(', ')})`)
-  const r3 = await implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
+  // Run N: a speculative round started at steelman-seed time substitutes for the fresh dispatch.
+  const r3 = preR3 ? await preR3 : await implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
   await persist([
     ...(r3.review && !r3.review.__failed ? [
       ...verdictEntries(`${runDir}/review-impl-3`, r3.review, 'impl-3-review'),
@@ -4621,7 +4637,33 @@ if (!blindF.length) {
 if (repoMode) await enrichBlindPool(blindF, `${runDir}/review-final`, 'Final rank')
 
 // Plan Final rank — the winning PLAN, judged by the same PLAN-lens council (by phaseTitle).
+// Run N: register the speculative-implement seed hook (implement runs only; flag-gated). The
+// callback captures blindF so seed letters resolve to candidate workspaces at fire time.
+if (implement && SPECULATIVE_IMPLEMENT) {
+  onSteelmanSeeds = (seeds) => {
+    const leader = seeds && seeds[0]
+    const lead = leader ? blindF.find(c => c.blind === leader) : null
+    if (!lead) return
+    const ruLetter = seeds[1] || null
+    const ru = ruLetter ? blindF.find(c => c.blind === ruLetter) : null
+    log(`JE-SPECULATIVE [Implement Round 3]: seeding implementers with tally-leader ${leader}'s PRE-STEELMAN brief while the shootout runs (a flip discards + re-runs clean).`)
+    const spec = { leader }
+    spec.promise = (async () => {
+      const seedPlanPath = `${runDir}/_winning-plan/plan.md`
+      await bundlePlan(lead.ws, seedPlanPath)
+      if (AB_BRIEFS && ru) {
+        const brief2Path = `${runDir}/_winning-plan/brief-2.md`
+        await bundlePlan(ru.ws, brief2Path)
+        implementSeats = assignAbSeeds(implementSeats, [seedPlanPath, brief2Path])
+        spec.ab = { 'brief-1': leader, 'brief-2': ruLetter }
+      }
+      return implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
+    })()
+    speculativeImpl = spec
+  }
+}
 const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-final/_pool.md`, RANK_SCHEMA, 'Final rank', 'final-rank')
+onSteelmanSeeds = null // Run N: never leaks past the plan final rank (fired or not)
 if (finalRank.__failed) {
   // P5: final-rank judge failed — same payload as P4 (no finalRank to render)
   await persist([
@@ -4697,7 +4739,17 @@ if (!implement) await heartbeat('done', { phaseComplete: 'final' })
 if (implement) {
   const planWinner = blindF.find(c => c.blind === finalRank.winner) || champ || blindF[0]
   const seedPlanPath = `${runDir}/_winning-plan/plan.md`
-  await bundlePlan(planWinner.ws, seedPlanPath)
+  // Run N: resolve the speculative round's fate against the crowned winner.
+  const specHit = !!(SPECULATIVE_IMPLEMENT && speculativeImpl && speculativeImpl.leader === finalRank.winner)
+  if (SPECULATIVE_IMPLEMENT && speculativeImpl && !specHit) {
+    log(`JE-SPECULATIVE-FLIP: shootout crowned ${finalRank.winner} but the speculative round was seeded with ${speculativeImpl.leader} — discarding it (awaited to completion) and re-running Implement Round 3 clean.`)
+    await speculativeImpl.promise.catch(() => null)
+    await agentLadder(
+      `Joust-engine speculative-flip cleanup (BOTH paths are engine-managed scratch dirs inside this run): run in ONE Bash call: rm -rf ${q(`${runDir}/review-impl-3`)} ${q(`${workspaceRoot}/impl-3`)}; echo done`,
+      { model: HELPER_MODEL, phase: 'Implement Round 3', label: 'speculative-wipe' }).catch(() => null)
+    speculativeImpl = null
+  }
+  if (!specHit) await bundlePlan(planWinner.ws, seedPlanPath)
   // Dynamic M (issue #36): OPT-IN spend optimization — decided BEFORE the A/B-brief assignment so the
   // reduce-only prefix trim shrinks the BASE pool and the A/B split re-alternates the TRIMMED pool
   // below (a prefix slice of an already-alternated pool would unbalance brief-1/brief-2).
@@ -4705,7 +4757,7 @@ if (implement) {
   // (never below the floor). Any missing input / read failure / thin evidence leaves the count as-is.
   // Safe by construction: dedup already dissolves the duplicate-deadlock before judging, so a wrong
   // or stale read can only ever spend slightly less — it can never recreate the deadlock #36 targets.
-  if (DYNAMIC_M_ON) {
+  if (DYNAMIC_M_ON && !specHit) { // Run N: the seed-time path skips the trim (spend guard stays normal-path-only)
     const ev = await readConvergenceEvidence(dynamicMBucket)
     const trimmed = trimSeatsForConvergence(implementSeats, ev)
     if (trimmed.length < implementSeats.length) {
@@ -4719,8 +4771,8 @@ if (implement) {
   // briefs. The runner-up comes from the steelman's seeded finalists (top-2 NON-VETOED by
   // construction — a vetoed candidate can never be a finalist), so a vetoed brief can never seed an
   // implementer. Judges stay blind to lineage; the readout is derived from mapping afterwards.
-  let abInfo = null
-  if (AB_BRIEFS) {
+  let abInfo = specHit ? (speculativeImpl.ab || null) : null
+  if (AB_BRIEFS && !specHit) {
     // The steelman metadata's field for the top-2 non-vetoed finalists is `seeds` (observed live:
     // the run-h calibration resolved A vs G with steelman.seeds=['A','G'], while `finalists` exists
     // ONLY inside a needs_orchestrator_pick payload — reading it here silently disabled A/B on
@@ -4742,9 +4794,10 @@ if (implement) {
       log('A/B BRIEFS requested but the final rank has no second non-vetoed finalist — all implementers seed from the single winning brief.')
     }
   }
-  const impl = await implementPhase(seedPlanPath)
+  if (specHit) log(`JE-SPECULATIVE: tally leader ${speculativeImpl.leader} held through the shootout — adopting the speculative Implement Round 3 (seeded PRE-STEELMAN; disclosed in mapping).`)
+  const impl = await implementPhase(seedPlanPath, specHit ? speculativeImpl.promise : null)
   await persist([
-    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...(abInfo ? { ab: abInfo } : {}), ...impl }) },
+    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...(abInfo ? { ab: abInfo } : {}), ...(SPECULATIVE_IMPLEMENT ? { speculative: { enabled: true, ...(speculativeImpl ? { leader: speculativeImpl.leader, hit: specHit, seed: 'pre-steelman' } : { fired: false }) } } : {}), ...impl }) },
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
