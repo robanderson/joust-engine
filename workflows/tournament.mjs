@@ -2316,6 +2316,30 @@ async function boostCandidate(origDir, outDir, items, phaseTitle, label) {
 async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitle, label, lenses = LENSES, style = 'final') {
   const labels = blindList.map(c => c.blind)
   const roundsLog = []
+  const reviewDir = poolPath.replace(/\/_pool\.md$/, '')
+  // Persist phase 2 (issue #33): land each round's per-seat verdicts as SMALL typed sha-verified
+  // files under <reviewDir>/_judges/ as soon as the round's verdicts are final — amortized DURING
+  // judging, off the checkpoint critical path. The engine copy is authoritative (the exact
+  // roundRecord verdict entry, serialized json(entry)); a codex seat's raw workspace VERDICT.json
+  // stays a debug artifact. Verified writes are recorded in the module seatRefs map so the
+  // checkpoint's tally skeleton can reference them; a failed write leaves that seat INLINE in the
+  // skeleton (persist logs, never throws) — worst case is today's behaviour, never a crashed run.
+  const refs = seatRefs[label] = Object.create(null)
+  const judgesDir = `${reviewDir}/_judges`
+  const relJudges = judgesDir.startsWith(`${runDir}/`) ? judgesDir.slice(runDir.length + 1) : judgesDir
+  const persistSeatFiles = async (entries) => {
+    try {
+      const okPaths = new Set(await persist(entries.map(e => ({ path: `${judgesDir}/${e.name}`, content: e.content })), phaseTitle))
+      for (const e of entries) {
+        if (okPaths.has(`${judgesDir}/${e.name}`)) refs[e.key] = { rel: `${relJudges}/${e.name}`, sha: sha256Hex(heredocBody(e.content)) }
+      }
+    } catch (e) { log(`seat-file persist (${label}): ${String(e).slice(0, 120)} — affected seats stay inline in the tally skeleton`) }
+  }
+  // One persist batch per judging round: the just-pushed roundRecord's verdict entries, keyed by
+  // lens + round (what buildTallySkeleton matches against council.rounds). Seat filenames reuse
+  // the existing seat label (`<phase-label>-<lens.key>-r<n>`), flat under _judges/.
+  const persistRoundSeats = (rec) => persistSeatFiles((rec.verdicts || []).map(v => ({
+    key: `${v.lens}|r${rec.round}`, name: `${label}-${v.lens}-r${rec.round}.json`, content: json(v) })))
   // Per-judge-seat RC (observability). A living lens seat = 00; a REQUESTED lens with no living verdict
   // after retries = a dead seat (09). `no_consensus` is NOT a fault — it still records 00 for the living
   // seats only. Recorded once, at the terminal decision, over the FINAL living verdicts.
@@ -2353,9 +2377,10 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
 
   // Security-judge death policy: repoMode = fail-closed (unresolvable veto → NO_CONSENSUS/needs-human);
   // isolated run = proceed, but LOUD warning that veto coverage was lost.
-  const securityDeadHalt = () => {
+  const securityDeadHalt = async () => {
     const tt = councilTally(verdicts)
     roundsLog.push(roundRecord(roundsLog.length + 1, verdicts, tt, lenses))
+    await persistRoundSeats(roundsLog[roundsLog.length - 1]) // persist phase 2: this fail path still checkpoints its seats
     recordCouncilSeats(verdicts)
     return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
       humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' }))
@@ -2370,6 +2395,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
 
   let t = councilTally(verdicts)
   roundsLog.push(roundRecord(1, verdicts, t, lenses))
+  await persistRoundSeats(roundsLog[roundsLog.length - 1]) // persist phase 2: round-1 seats land now (~2-20KB each, one helper batch)
   const allVetoed = () => labels.length > 0 && labels.every(l => t.vetoedSet.has(l))
   recordCouncilSeats(verdicts)
 
@@ -2408,7 +2434,6 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   }
   const seedOrder = nonVetoedOrder(verdicts, labels, t.vetoedSet, aspectApprovals)
   const seeds = seedOrder.slice(0, 2)
-  const reviewDir = poolPath.replace(/\/_pool\.md$/, '')
   const seedVotesStr = Object.keys(t.votes).sort().map(k => `${k}:${t.votes[k]}`).join(', ') || 'none'
   log(`council ${label}: STEELMAN SHOOTOUT — seed vote ${seedVotesStr}${t.winner ? ` (majority: ${t.winner})` : ' (no majority)'}; finalists [${seeds.join(', ')}].`)
   const steelmanMeta = { seeds, seed_votes: { ...t.votes }, seed_majority: t.winner || null, rounds: [], decided_by: null }
@@ -2466,6 +2491,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       candidates: (v.candidates || []).map(c => ({ ...c, label: origOf(String(c.label || '').charAt(0)) || c.label })),
       vote: origOf(v.vote) || v.vote,
       ranking: (v.ranking || []).map(l => origOf(l) || l) }))
+    // Persist phase 2: durable per-seat runoff verdicts (ORIG-LETTER mapped — what steelmanVerdicts
+    // consumes) under the base reviewDir's _judges/. Runoff verdicts never appear in council.rounds,
+    // so these files are a natural partial checkpoint (inspection v1; resume v2), recorded under
+    // distinct runoff keys the tally skeleton never matches.
+    await persistSeatFiles(steelmanVerdicts.map(v => ({
+      key: `runoff${iter}|${v.lens}`, name: `${label}-runoff${iter}-${v.lens}-r1.json`, content: json(v) })))
     steelmanMeta.rounds.push({
       iteration: iter,
       change_lists: Object.fromEntries(seeds.map(s => [s, (changeLists[s] || []).map(it => it.change)])),
@@ -2767,8 +2798,37 @@ function heredocBody(content) {
 }
 // ---- end: structural persist helpers ------------------------------------------------------------
 
+// ---- begin: tally skeleton builder (PURE — persist phase 2, issue #33; sliced by tests) ----------
+// Deep-copy the council result and replace each council.rounds[*].verdicts[*] body with its
+// on-disk seat ref {"$seat": "<runDir-relative path>", "sha256": "<hex>"} — matched by lens key +
+// round. Skeleton + splice, never recompute: bin/je-assemble.mjs reverses this by splicing the
+// sha-verified seat files back, byte-identical to json(result). A verdict with no verified on-disk
+// ref stays INLINE (the skeleton grows but assembly still succeeds — never a crashed persist). The
+// deep copy guarantees refs can NEVER leak into json(review) itself (byte-parity invariant).
+function buildTallySkeleton(result, refs) {
+  const skel = JSON.parse(JSON.stringify(result))
+  const rounds = skel && skel.council && Array.isArray(skel.council.rounds) ? skel.council.rounds : []
+  for (const r of rounds) {
+    if (!r || !Array.isArray(r.verdicts)) continue
+    r.verdicts = r.verdicts.map(v => {
+      const ref = v && v.lens && refs ? refs[`${v.lens}|r${r.round}`] : null
+      return ref ? { $seat: ref.rel, sha256: ref.sha } : v
+    })
+  }
+  return skel
+}
+// ---- end: tally skeleton builder -----------------------------------------------------------------
+
 // ---- durable persistence (sandbox has NO node:fs/import/process — write via a sonnet helper+Bash) ----
 const json = obj => JSON.stringify(obj, null, 2) + '\n'
+
+// Persist phase 2 (issue #33): per-seat verdict refs, module-level, keyed phase label ->
+// { '<lensKey>|r<round>': { rel, sha } } for round-log seats (splice-able into the tally skeleton)
+// plus 'runoff<i>|<lensKey>' keys for steelman runoff seats (durable/inspection only — runoff
+// verdicts never appear in council.rounds). NEVER attached to the council result itself: refs
+// inside json(review) would break assemble byte-parity. Written by councilJudge as each round's
+// seat files verify; read by the checkpoint call sites via verdictEntries().
+const seatRefs = Object.create(null)
 
 // Plugin bin dir (for on-disk derivation via bin/je-render.mjs), derived from any supplied runner path.
 const PLUGIN_BIN = (() => {
@@ -2778,7 +2838,7 @@ const PLUGIN_BIN = (() => {
   return null
 })()
 
-// Write one persistence point — STRUCTURAL PERSIST (issue #33). Two entry kinds:
+// Write one persistence point — STRUCTURAL PERSIST (issue #33). Three entry kinds:
 //   { path, content }            — typed once through the helper as a single quoted HEREDOC (no
 //                                  printf re-quoting, no chunking), then VERIFIED: the helper reports
 //                                  `wc -c` + `shasum -a 256` per file and the engine compares against
@@ -2789,17 +2849,33 @@ const PLUGIN_BIN = (() => {
 //                                  rendered ON DISK by deterministic code and NEVER transit the model
 //                                  (the dominant cost: run C typed ~290KB at ~9KB/min ≈ 35min/checkpoint).
 //                                  `content` is the fallback (typed+verified) when PLUGIN_BIN is unknown.
-// Any verified miss is RETRIED ONCE (a failed derive retries as typed content); a still-bad target is
-// logged as a REAL, path-named failure. An unverified LLM write is NEVER treated as success (#D-0002).
-// Still fire-and-forget overall: a persist failure logs but must never crash a fully-paid run.
+//   { path, content, assemble }  — ASSEMBLED artifact (persist phase 2): the helper runs
+//                                  `node bin/je-assemble.mjs <assemble.tally> <path>` so deterministic
+//                                  code splices the sha-pinned per-seat files back into the tally
+//                                  skeleton ON DISK. Unlike derive, the result is FULLY verified: the
+//                                  FLP sha must equal the engine-computed sha256Hex over `content`
+//                                  (= json(review)) — assembled bytes ≠ the engine's result object is
+//                                  a verified miss, so corruption structurally cannot land silently.
+// Any verified miss is RETRIED ONCE (a failed derive/assemble retries as typed content); a still-bad
+// target is logged as a REAL, path-named failure. An unverified LLM write is NEVER treated as success
+// (#D-0002). Still fire-and-forget overall: a persist failure logs but must never crash a fully-paid
+// run. Returns the list of VERIFIED paths (empty on total failure) so callers — the per-seat writes
+// feeding the tally skeleton — can record refs only for files that actually landed.
 async function persist(pairs, phaseTitle) {
   const files = (pairs || []).filter(p => p && p.path && (p.content != null || p.derive))
-  if (!files.length) return
+  if (!files.length) return []
   const expected = {} // path -> sha256 hex for typed writes (derived writes verify bytes>0 + exit only)
   const stepFor = (f, allowDerive) => {
     const dir = f.path.slice(0, f.path.lastIndexOf('/'))
     const tmp = `${f.path}.partial`
     const report = `printf 'FLP %s %s %s\\n' ${q(f.path)} "$(wc -c < ${q(f.path)} 2>/dev/null || echo 0)" "$(shasum -a 256 ${q(f.path)} 2>/dev/null | cut -d' ' -f1)"`
+    if (f.assemble && f.content != null && allowDerive && PLUGIN_BIN) {
+      // Assembled write: deterministic splice on disk, but expected[] STAYS SET (over the exact
+      // json(review) bytes) — full-file verification, stronger than derive's bytes>0 check. A
+      // je-assemble crash/miss/mismatch surfaces as a verified miss and retries as typed content.
+      expected[f.path] = sha256Hex(heredocBody(f.content))
+      return `mkdir -p ${q(dir)} && node ${q(`${PLUGIN_BIN}/je-assemble.mjs`)} ${q(f.assemble.tally)} ${q(f.path)}; ${report}`
+    }
     if (f.derive && allowDerive && PLUGIN_BIN) {
       delete expected[f.path]
       const extra = f.derive.title ? ` ${q(f.derive.title)}` : ''
@@ -2848,7 +2924,28 @@ async function persist(pairs, phaseTitle) {
       missing = files.filter(f => bad(f, seen))
     }
     if (missing.length) log(`persist FAILED (${phaseTitle}): ${missing.map(f => `${f.path} [${bad(f, seen)}]`).join(', ')} after retry`)
-  } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`) }
+    const badSet = new Set(missing.map(f => f.path))
+    return files.map(f => f.path).filter(p => !badSet.has(p))
+  } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`); return [] }
+}
+
+// Persist phase 2 (issue #33): the verdict.json entries for one review checkpoint. With a council
+// AND at least one verified per-seat file, the bulk never transits the model: a SMALL typed tally
+// skeleton (the result with $seat refs) lands first, then bin/je-assemble.mjs splices the
+// sha-pinned seat files back into verdict.json ON DISK — verified against the engine-computed
+// sha256Hex(json(review)) via the assemble entry's `content`. Any failure retries through the
+// existing ladder as today's single typed write (worst case = current behaviour). No council
+// (judges:1 legacy) or no verified refs → today's plain typed write, unchanged.
+function verdictEntries(dir, review, phaseLabel) {
+  const path = `${dir}/verdict.json`
+  const content = json(review)
+  const refs = seatRefs[phaseLabel]
+  if (!review || !review.council || !refs || !Object.keys(refs).length) return [{ path, content }]
+  const tallyPath = `${dir}/_judges/tally.json`
+  return [ // tally.json ordered BEFORE the assemble step — persist runs its steps sequentially in one script
+    { path: tallyPath, content: json(buildTallySkeleton(review, refs)) },
+    { path, content, assemble: { tally: tallyPath } },
+  ]
 }
 
 // ---- auto-filed engine issues (privacy-scrubbed, fail-closed, fire-and-forget) ----
@@ -3058,7 +3155,7 @@ async function implementPhase(seedPlanPath) {
   const r3 = await implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
   await persist([
     ...(r3.review && !r3.review.__failed ? [
-      { path: `${runDir}/review-impl-3/verdict.json`, content: json(r3.review) },
+      ...verdictEntries(`${runDir}/review-impl-3`, r3.review, 'impl-3-review'),
       { path: `${runDir}/review-impl-3/verdict.md`, content: verdictToMd(r3.review, 'Implement Round 3 verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-impl-3/verdict.json`, title: 'Implement Round 3 verdict' } },
     ] : []),
     ...(r3.review && r3.review.council ? [{ path: `${runDir}/review-impl-3/council.json`, content: json(r3.review.council), derive: { mode: 'council-json', from: `${runDir}/review-impl-3/verdict.json` } }] : []),
@@ -3084,7 +3181,7 @@ async function implementPhase(seedPlanPath) {
   const r4 = await implementRound('impl-4', 'Implement Round 4', 4, seedPlanPath, guidance, `${runDir}/review-impl-4`, false)
   await persist([
     ...(r4.review && !r4.review.__failed ? [
-      { path: `${runDir}/review-impl-4/verdict.json`, content: json(r4.review) },
+      ...verdictEntries(`${runDir}/review-impl-4`, r4.review, 'impl-4-review'),
       { path: `${runDir}/review-impl-4/verdict.md`, content: verdictToMd(r4.review, 'Implement Round 4 verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-impl-4/verdict.json`, title: 'Implement Round 4 verdict' } },
     ] : []),
     ...(r4.review && r4.review.council ? [{ path: `${runDir}/review-impl-4/council.json`, content: json(r4.review.council), derive: { mode: 'council-json', from: `${runDir}/review-impl-4/verdict.json` } }] : []),
@@ -3179,7 +3276,7 @@ if (review.no_consensus) {
   log(`Review: council NO_CONSENSUS — ${review.reasoning}`)
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null, no_consensus: true, ...(mode === 'two' ? { winner: null } : {}) }) },
-    { path: `${runDir}/review-1/verdict.json`, content: json(review) },
+    ...verdictEntries(`${runDir}/review-1`, review, 'review'),
     { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict (NO CONSENSUS)'), derive: { mode: 'verdict-md', from: `${runDir}/review-1/verdict.json`, title: 'Round-1 review verdict (NO CONSENSUS)' } },
     { path: `${runDir}/review-1/council.json`, content: json(review.council), derive: { mode: 'council-json', from: `${runDir}/review-1/verdict.json` } },
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
@@ -3192,7 +3289,7 @@ if (review.no_consensus) {
 // P2: round-1 review is valid — incremental write BEFORE any round-2 dispatch (crash-survival linchpin)
 await persist([
   { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner }) },
-  { path: `${runDir}/review-1/verdict.json`, content: json(review) },
+  ...verdictEntries(`${runDir}/review-1`, review, 'review'),
   { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-1/verdict.json`, title: 'Round-1 review verdict' } },
   ...(review.council ? [{ path: `${runDir}/review-1/council.json`, content: json(review.council), derive: { mode: 'council-json', from: `${runDir}/review-1/verdict.json` } }] : []),
   ...(review.guidance ? [{ path: `${runDir}/review-1/guidance.md`, content: guidanceToMd(review.guidance), derive: { mode: 'guidance-md', from: `${runDir}/review-1/verdict.json` } }] : []),
@@ -3283,7 +3380,7 @@ if (finalRank.no_consensus) {
   log(`Final rank: council NO_CONSENSUS — ${finalRank.reasoning}`)
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, carriedOver: carriedOverAll, no_consensus: true }) },
-    { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+    ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
     { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict (NO CONSENSUS)'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict (NO CONSENSUS)' } },
     { path: `${runDir}/review-final/council.json`, content: json(finalRank.council), derive: { mode: 'council-json', from: `${runDir}/review-final/verdict.json` } },
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
@@ -3300,7 +3397,7 @@ if (finalRank.needs_orchestrator_pick) {
   log(`Final rank: steelman loop tied after 5 rounds — needs_orchestrator_pick [${finalRank.needs_orchestrator_pick.finalists.join(', ')}]`)
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, carriedOver: carriedOverAll, needs_orchestrator_pick: finalRank.needs_orchestrator_pick.finalists }) },
-    { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+    ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
     { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict (ORCHESTRATOR PICK NEEDED)'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict (ORCHESTRATOR PICK NEEDED)' } },
     { path: `${runDir}/review-final/council.json`, content: json(finalRank.council) },
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
@@ -3321,7 +3418,7 @@ const contributions = computeContributions(
 )
 await persist([
   { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, carriedOverWinner, carriedOver: carriedOverAll }) },
-  { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+  ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
   { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict' } },
   ...(finalRank.council ? [{ path: `${runDir}/review-final/council.json`, content: json(finalRank.council), derive: { mode: 'council-json', from: `${runDir}/review-final/verdict.json` } }] : []),
   { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },

@@ -6,6 +6,29 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Structural persist phase 2 — per-seat verdict files + deterministic assembler (issue #33,
+  spec `docs/superpowers/specs/2026-07-06-persist-phase2-author-writes.md`).** The last large
+  model-transiting artifact (verdict.json, ~130KB typed per checkpoint after phase 1) is
+  eliminated. As each judging round's verdicts land, councilJudge persists every living seat's
+  exact `roundRecord` verdict entry as a SMALL typed sha-verified file under
+  `<reviewDir>/_judges/` (steelman runoffs persist their orig-letter-mapped verdicts too),
+  amortized during judging. At the checkpoint, a small typed `tally.json` skeleton — the full
+  result with each `council.rounds[*].verdicts[*]` replaced by a runDir-relative
+  `{"$seat", "sha256"}` ref (`buildTallySkeleton`, pure) — plus a new persist() entry kind
+  `{ path, content, assemble: { tally } }` drive the new **`bin/je-assemble.mjs`**: a
+  deterministic splice-only assembler (no tally/merge logic re-implemented) that sha-verifies
+  each seat file with node:crypto and writes verdict.json ON DISK, byte-identical to
+  `json(review)`. Assemble is FULLY verified against the engine-computed
+  `sha256Hex(json(review))` (stronger than derive's bytes>0); any failure — corrupt seat file,
+  truncated tally, missing ref, assembler crash, byte drift — falls back through the existing
+  retry ladder to today's typed write (a seat whose own persist failed simply stays inline in
+  the skeleton). je-render derivation (verdict.md/council.json/guidance.md), the `judges:1`
+  legacy path, and SUMMARY typed writes are unchanged. Checkpoint model transit for a >=100KB
+  council verdict drops to a <30KB skeleton (acceptance test included). Tests: byte-parity
+  fixtures vs the typed pipeline across 6 council shapes + je-render parity + corruption
+  injection in `bin/je-assemble.test.mjs`; skeleton-builder units, stubbed-agent fallback-ladder
+  runs, and checkpoint wiring in `workflows/tournament-persist-phase2.test.mjs`.
+
 - **Aspect verifiers with binary approvals (`args.aspectVerifiers`, default OFF)** (research
   BoN-MAV, arXiv:2502.20379: many cheap BINARY aspect checks beat a single continuous score —
   spend marginal budget on verification, not candidates). When enabled, every council decision
