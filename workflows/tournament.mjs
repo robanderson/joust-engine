@@ -2514,6 +2514,16 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
 
 // Each judge's candidate LISTING is rotated differently (position-bias control). The shared _pool.md
 // order is fixed (advisory caveat), but the dirs listing + the "consider in this order" hint rotate.
+// Run O (2026-07-07): prompt-lab judge-lens A/B hook. ONE whitelisted variant may be swapped in
+// via args.lensVariant; anything unrecognised silently runs production (fail-safe: a typo can never
+// change judging). 'evidence-quota' = prompt-lab 03/V2 — targets the proven recall gap (a security
+// lens without forced per-candidate evidence passed bugs the same model found under other lenses).
+// The variant text is inserted as a SINGLE paragraph; every other slot stays byte-identical, per
+// the prompt-lab protocol (one variable per arm). Record: mapping.json carries lens_variant.
+const LENS_VARIANT = String(A.lensVariant || '') === 'evidence-quota' ? 'evidence-quota' : ''
+const LENS_VARIANT_BLOCKS = {
+  'evidence-quota': `\n\nEVIDENCE QUOTA (hard): your \`checks_run\` must contain AT LEAST ONE entry PER CANDIDATE — a command you ran or a file/section you actually read for that candidate, with its key result and a path inside your pinned scope. A candidate you cannot cite evidence for is a candidate you have not judged; go back and read it before ranking. No quota entry may be a duplicate of another with only the letter changed.`,
+}
 function lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) {
   const n = blindList.length
   const rotated = blindList.map((_, i) => blindList[(i + rot) % n])
@@ -2526,7 +2536,7 @@ function lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) {
     ? `\n\nThis is DELIBERATION round ${roundNum - 1} of at most 3. Your peers' latest full verdicts (blind, letters only) are below as verbatim JSON. Read them, address the disagreements in \`response_to_peers\` (convince them or be convinced — converge on the CORRECT call, do not hold a position out of stubbornness), and you MAY run 1-2 targeted checks to settle a factual dispute. Then emit your REVISED verdict and set \`changed_this_round\` / \`changed_from_round1\` truthfully.${isSecurityLens(lens.key) ? ' A peer may rebut your veto with evidence; if it genuinely refutes the flag, WITHDRAW it (drop that UNSAFE entry). A flag you still believe stands and keeps excluding the candidate.' : ''}\n\nPEER VERDICTS (JSON, verbatim):\n${peerBlock}`
     : ''
   return `You are a blind judge on a 5-member review COUNCIL. Your lens is **${lens.title || lens.key}**: ${lens.owns}. ${lens.special}
-You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you, through YOUR lens (the other four lenses cover the rest). Apply the shared scoring method: judge the real artifact not any self-summary; score against the task's STATED runtime (treat reliance on a capability the task did not establish as a risk, and treat an unfamiliar but constraint-honouring mechanism as correct unless you can name a concrete way it fails); cite specifics (a line or behaviour, never a vibe); thoroughness is evidence, not word count — do not reward length or verbosity per se.
+You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you, through YOUR lens (the other four lenses cover the rest). Apply the shared scoring method: judge the real artifact not any self-summary; score against the task's STATED runtime (treat reliance on a capability the task did not establish as a risk, and treat an unfamiliar but constraint-honouring mechanism as correct unless you can name a concrete way it fails); cite specifics (a line or behaviour, never a vibe); thoroughness is evidence, not word count — do not reward length or verbosity per se.${LENS_VARIANT ? LENS_VARIANT_BLOCKS[LENS_VARIANT] : ''}
 
 Task that every candidate was given:
 ${task}
@@ -3911,7 +3921,7 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
     ...(c.collapse ? { collapse: c.collapse } : {}),
     ...(c.valid ? {} : { failReason: c.failReason }) }))
   if (!rjBlind.length) {
-    await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: null }) }], 'Rejudge')
+    await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: null }) }], 'Rejudge')
     return { mode: 'rejudge', n: rjN, mapping: rjMapping, winner: null, __failed: 'no valid candidates survived the mechanical gate', rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
   }
   const rjReview = await judge('code reviewer', rjBlind, false, `${reviewDir}/_pool.md`, RANK_SCHEMA, 'Rejudge', 'rejudge-review', LENSES, 'final')
@@ -3925,10 +3935,10 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
   const rjGate = implGatePassed({ review: rjReview, blind: rjBlind })
   const rjWinnerEntry = rjGate.pass ? rjMapping.find(m => m.candidate === rjGate.winner) : null
   const rjPick = !rjGate.pass && rjReview && rjReview.needs_orchestrator_pick ? rjReview.needs_orchestrator_pick : null
-  await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}), no_consensus: !!(rjReview && rjReview.no_consensus) }) }], 'Rejudge')
+  await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}), no_consensus: !!(rjReview && rjReview.no_consensus) }) }], 'Rejudge')
   await maybeFileEngineIssues('Rejudge')
   return {
-    mode: 'rejudge', n: rjN, mapping: rjMapping,
+    mode: 'rejudge', n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), mapping: rjMapping,
     winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}),
     no_consensus: !!(rjReview && rjReview.no_consensus),
     ...(rjPick ? { needs_orchestrator_pick: rjPick } : {}),
