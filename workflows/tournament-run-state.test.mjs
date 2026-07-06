@@ -301,3 +301,17 @@ test('e2e resume: completed seats reuse in place; empty/in_flight seats re-run (
   assert.deepEqual(summary.reusedSeats, ['candidate-1'])
   assert.deepEqual(summary.rerunSeats, ['candidate-2', 'candidate-3'])
 })
+
+// ---- run-j3 (2026-07-07): evidence-quota arm's cross-family security vetoes, confirmed + fixed ----
+test('security: the stale-lock steal never writes THROUGH the lock path (symlink-truncation veto finding)', () => {
+  const i = SRC.indexOf('JLOCK stale-stolen')
+  const branch = SRC.slice(SRC.indexOf('elif [ -n "$(find'), i + 40)
+  assert.ok(branch.includes('rm -f') , 'stale lock is REMOVED, not truncated in place')
+  assert.ok(branch.includes('set -o noclobber'), 're-taken with the same atomic create (racing recreator wins)')
+  assert.ok(SRC.includes(`[ -L \${q(LOCK_PATH)} ] && { echo JLOCK symlink; exit 0; }`), 'symlinked lock refused outright')
+})
+
+test('security: the resume probe emits the seat label via q()/printf, never bare double-quoted interpolation', () => {
+  assert.ok(!SRC.includes('echo "JPRB ${c.label}'), 'a label carrying $(...) must not execute in the probe shell')
+  assert.match(SRC, /printf 'JPRB %s S=%s D=%s P=%s PS=%s RC=%s\\\\n' \$\{q\(c\.label\)\}/, 'label single-quote-escaped through q()')
+})

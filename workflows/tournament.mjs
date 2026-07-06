@@ -4230,8 +4230,12 @@ async function readRunState() {
 // a transient probe error no longer green-lights a concurrent double-launch.
 async function acquireLock() {
   try {
-    const cmd = `[ -L ${q(runDir)} ] && { echo JLOCK symlink; exit 0; }; mkdir -p ${q(runDir)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK acquired; ` +
-      `elif [ -n "$(find ${q(LOCK_PATH)} -mmin +${LOCK_STALE_MIN} 2>/dev/null)" ]; then : > ${q(LOCK_PATH)} 2>/dev/null; echo JLOCK stale-stolen; ` +
+    const cmd = `[ -L ${q(runDir)} ] && { echo JLOCK symlink; exit 0; }; [ -L ${q(LOCK_PATH)} ] && { echo JLOCK symlink; exit 0; }; mkdir -p ${q(runDir)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK acquired; ` +
+      // run-j3 security-x veto finding: the stale-steal branch used to WRITE THROUGH the lock path
+      // (`: > lock`), so a symlink planted at resume.lock truncated an arbitrary writable target.
+      // Steal = rm the stale lock, then RE-TAKE it with the same atomic noclobber create (a racing
+      // launch that recreates it first wins and we refuse); symlinked locks are refused above.
+      `elif [ -n "$(find ${q(LOCK_PATH)} -mmin +${LOCK_STALE_MIN} 2>/dev/null)" ]; then rm -f ${q(LOCK_PATH)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK stale-stolen; else echo JLOCK held-fresh; fi; ` +
       `else echo JLOCK held-fresh; fi`
     const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
       { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'resume-lock' }).catch(() => null)
@@ -4274,7 +4278,7 @@ async function probeSeats(roundName, list) {
     const rcEcho = logf ? `rc=$(grep -a '^JOUST-RC ' ${lp} 2>/dev/null | tail -n1 | sed -n 's/^JOUST-RC \\([0-9][0-9]\\).*/\\1/p'); [ -z "$rc" ] && rc=NONE` : `rc=NONE`
     return `if [ -f ${q(`${c.ws}/_brief.txt`)} ]; then S=1; else S=0; fi; ` +
       `D=$(find ${q(c.ws)} -type f ${excl} 2>/dev/null | grep -c .); ${provChk}; ${psChk}; ${rcEcho}; ` +
-      `echo "JPRB ${c.label} S=$S D=$([ "$D" -gt 0 ] && echo 1 || echo 0) P=$P PS=$PS RC=$rc"`
+      `printf 'JPRB %s S=%s D=%s P=%s PS=%s RC=%s\\n' ${q(c.label)} "$S" "$([ "$D" -gt 0 ] && echo 1 || echo 0)" "$P" "$PS" "$rc"` // run-j3 fix: label goes through q(), never bare interpolation
   }).join('\n')
   const res = await agentLadder(
     `This is an approved internal step of the joust-engine tournament: probe on-disk seat state for a RESUME (read-only). Run this exact shell script in ONE Bash call. It prints one line per seat of the form "JPRB <label> S=<0|1> D=<0|1> P=<0|1> PS=<0|1> RC=<code|NONE>". Then return the structured results: for EACH printed JPRB line an entry {label: the label, started: (S==1), present: (D==1), provenance: (P==1), provStarted: (PS==1), rc: the RC token}. Report exactly what the script printed — do not infer or change values. Do nothing else:\n\n${script}`,
