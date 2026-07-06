@@ -1500,7 +1500,12 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
           // `git init` repo can NEVER pass a modify-patch under --check, so --check there is a
           // false-kill machine (run-i: 11/12 candidates), while --numstat still catches the
           // audited malformed/truncated class and cannot false-kill.
-          `for p in $patches; do ` +
+          // ZSH-PROOF iteration (run-j fix, 2026-07-07): the helper's shell can be zsh, which does
+          // NOT word-split an unquoted $patches — a multi-patch candidate then passed BOTH paths as
+          // ONE filename and died "can't open patch" (false-kill class: every 0001+0002 candidate).
+          // zsh DOES field-split an unquoted command substitution, and so does bash — so re-emit the
+          // list through $(printf) instead of expanding the variable directly.
+          `for p in $(printf '%s\\n' "$patches"); do ` +
             `if [ "$snapmode" = snapshot ]; then ` +
               `if err=$(git -C "$wt" apply $pflag "$p" 2>&1); then :; ` +
               `elif err=$(git -C "$wt" apply --recount $pflag "$p" 2>&1); then recount=1; ` +
@@ -1678,10 +1683,11 @@ async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
     return `(` +
       `dest=${q(dest)}; ev=${q(`${dest}/evidence.txt`)}; base=${baseArg}; ctx=${ctxArg}; ` +
       `cites=$(find "$dest" -type f ! -name evidence.txt -print0 2>/dev/null | xargs -0 grep -ohE ${q(CITE_GREP)} 2>/dev/null | sed -E ${q(CITE_SED)} | sort -u); ` +
-      // Citation paths carry no whitespace/globs by grammar (charset [A-Za-z0-9._-/]), so plain
-      // word-splitting iteration is safe and keeps n/m in THIS shell (no subshell-pipe counter loss).
+      // Citation paths carry no whitespace/globs by grammar (charset [A-Za-z0-9._-/]); counters n/m
+      // stay in THIS shell (no subshell-pipe loss). zsh-proof (run-j class): zsh does NOT word-split
+      // an unquoted $cites — re-emit through $(printf), which BOTH bash and zsh field-split.
       `n=0; m=0; top=$(git rev-parse --show-toplevel 2>/dev/null); ` +
-      `for p in $cites; do n=$((n+1)); ok=0; ` +
+      `for p in $(printf '%s\\n' "$cites"); do n=$((n+1)); ok=0; ` +
         `if [ -e "$p" ]; then ok=1; ` +
         `elif [ -n "$top" ] && [ -e "$top/$p" ]; then ok=1; ` +
         `elif [ -n "$top" ] && [ -n "$base" ] && git -C "$top" cat-file -e "$base:$p" >/dev/null 2>&1; then ok=1; ` +
@@ -2423,7 +2429,13 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
   const flag = CODEX_FLAG[`codex-${judgeEffort}`]
   const prep = `git init -q . 2>/dev/null; cp ${q(poolPath)} _pool.md && `
   const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout, prep, 'JE_CODEX_MODE=review ')
-  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null | cut -d' ' -f1`
+  // Log-segment relay (run-j fix, 2026-07-07): review-mode logs carry the codex session's stderr
+  // stream (the stall-watchdog liveness feed), so on a real council pool the log grows way past
+  // 4KB and `tail -c 4000` alone no longer contains the PROVENANCE line stamped at runner startup —
+  // parse then fail-closed-rejected EVERY seat (3/3 opus fallback in run-j round 1). Prepend the
+  // provenance line explicitly (grep from the top) and keep the tail for the terminal DONE/RC (and
+  // any TIMEOUT/ERROR) markers of the LAST try. A missing log still relays nothing -> still rejects.
+  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; grep -a '^JOUST-CODEX-PROVENANCE' ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null | head -n1; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null | cut -d' ' -f1`
 
   // Two-stage try/catch per try (fold-in A): the classification is STRUCTURAL — a dispatch-stage
   // failure (codex never produced a verdict) stays RC 02; anything past a successful dispatch

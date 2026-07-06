@@ -111,7 +111,7 @@ test('(structural) gate checks ALL patches, sorted — never a head -n1 coin fli
   const i = SRC.indexOf('async function mechanicalPatchGate')
   const gate = SRC.slice(i, SRC.indexOf('\n}', i))
   assert.ok(/-iname '\*\.patch' -o -iname '\*\.diff' \\\\\) 2>\/dev\/null\) \| sort/.test(gate) || gate.includes(`2>/dev/null | sort`), 'patch enumeration must be sorted')
-  assert.ok(gate.includes('for p in $patches'), 'every patch is checked, in order')
+  assert.ok(gate.includes('for p in $(printf'), 'every patch is checked, in order (zsh-proof list re-emit)')
   assert.ok(!gate.includes("-iname '*.diff' \\) 2>/dev/null | head -n1"), 'the single-patch head -n1 pick is gone')
 })
 
@@ -132,4 +132,17 @@ test('(structural) gate baseline: repoMode baseSha, else the HEAD sha pinned at 
   const pin = SRC.indexOf("git rev-parse HEAD 2>/dev/null")
   const attempts = SRC.indexOf('await buildContext()')
   assert.ok(pin > 0 && attempts > 0, 'both present')
+})
+
+// ---- run-j false-kill class (2026-07-07): zsh does not word-split unquoted $vars ----
+test('(structural) patch iteration is zsh-proof: list re-emitted via $(printf), never a bare $patches expansion', () => {
+  assert.ok(SRC.includes(`for p in $(printf '%s\\\\n' "$patches"); do`),
+    'multi-patch candidates iterate via command substitution (field-split in BOTH bash and zsh)')
+  assert.ok(!SRC.includes('for p in $patches; do'),
+    'the bare-variable form passes 0001+0002 as ONE filename under zsh ("can\'t open patch" false-kill)')
+})
+
+test('(structural) evidence-citation iteration is zsh-proof for the same reason', () => {
+  assert.ok(SRC.includes(`for p in $(printf '%s\\\\n' "$cites"); do`))
+  assert.ok(!SRC.includes('for p in $cites; do'))
 })

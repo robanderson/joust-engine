@@ -119,3 +119,13 @@ test('codex-run.sh review mode: a clean exit with an empty report is RC 05, not 
   assert.ok(RUNNER.includes('[ "$MODE" = review ] && [ ! -s "$REPORT" ]'))
   assert.ok(RUNNER.includes('05 no-deliverable-saved'))
 })
+
+// ---- run-j fallback class (2026-07-07): review-mode logs outgrow the 4KB tail ----
+test('dump relay carries the PROVENANCE line explicitly: grep from the log TOP precedes the tail window', () => {
+  const i = SRC.indexOf('const dumpScript =')
+  const seg = SRC.slice(i, i + 700)
+  const g = seg.indexOf(`grep -a '^JOUST-CODEX-PROVENANCE'`)
+  const t = seg.indexOf('tail -c 4000')
+  assert.ok(g > 0 && t > g, 'provenance grep first, then the terminal tail — a >4KB session stream can no longer starve parse of the startup marker')
+  assert.ok(seg.includes('| head -n1'), 'one provenance line, not one per retry')
+})
