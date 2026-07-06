@@ -6,6 +6,19 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Launch-and-poll runner dispatch (supersedes the plain foreground mandate).** A foreground
+  wrapper Bash call is capped (~600s) BELOW the runner wall-clocks (glm 1200s) — a glm seat
+  was TERM-killed at ~10m mid-retry-backoff (RC 08) — while a backgrounded task is reaped when
+  the wrapper agent's turn ends (the run-h impl-4 kill). Runners already self-supervise
+  (watchdogs + guaranteed terminal `JOUST-RC` line), so the wrapper now LAUNCHES the runner
+  detached into its own session (`nohup perl -MPOSIX POSIX::setsid` — macOS ships no setsid
+  binary; perl is already a hard runner dependency; launcher echoes `JOUST-LAUNCHED` and
+  returns in seconds) and POLLS the log with short bounded until-loops for the guaranteed
+  terminal line (`JOUST-SETTLED` sentinel; a timed-out poll is re-issued; ending the turn
+  mid-run is forbidden). No wrapper ceiling ever bounds a runner again; an abandoned runner
+  still terminates itself. `detachLaunch` is shared by `runnerCmd` and `codexRunnerCmd`;
+  both RUNVERBATIM prompts carry the protocol; dispatch-hygiene tests updated.
+
 - **Dedup identity-hash hardening (codex-review security findings).** A three-way
   judge-architecture experiment (native Opus vs `codex exec` vs the `codex review` preset,
   same artifact, same security lens) surfaced two real integrity hazards in the shipped #36

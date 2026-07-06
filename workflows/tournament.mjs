@@ -318,12 +318,27 @@ const codexJudgeTimeout = Number(A.codexJudgeTimeoutSecs) > 0 ? Math.floor(Numbe
 const grokMaxTurns = Number(A.grokMaxTurns) > 0 ? Math.floor(Number(A.grokMaxTurns)) : glmMaxTurns
 const grokTimeout = Number(A.grokTimeoutSecs) > 0 ? Math.floor(Number(A.grokTimeoutSecs)) : 600
 const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
+// DETACHED LAUNCH (2026-07-06, run-i glm post-mortem): the runner command is no longer executed
+// inside one long wrapper Bash call — a foreground tool call is CAPPED (~600s) below the runner
+// wall-clocks (glm 1200s), and a run_in_background task is reaped when the wrapper agent's turn
+// ends (the run-h impl-4 kill). Instead the wrapper runs a LAUNCHER that detaches the runner into
+// its own session (perl POSIX::setsid — macOS ships no setsid binary; perl is already a hard runner
+// dependency) and returns immediately; the runner SELF-SUPERVISES (its own wall-clock + stall
+// watchdogs guarantee exactly one terminal JOUST-RC line), and the wrapper POLLS the log for that
+// line in short bounded calls (the RUNVERBATIM protocol below). No wrapper ceiling ever bounds a
+// runner again; an abandoned runner still terminates itself.
+const detachLaunch = (env, runner, flag) =>
+  `{ ${env}nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' -- bash ${q(runner)} ${flag} </dev/null >/dev/null 2>&1 & } && echo JOUST-LAUNCHED`
 // envExtra (optional): extra `KEY=VAL ` env assignments prepended to the runner call (e.g. grok's JE_GROK_WEB=1).
-const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout, envExtra = '') => `${cmdHead(ws, b)} && ${envExtra}JE_MAX_TURNS=${maxTurns} JE_TIMEOUT_SECS=${timeout} bash ${q(runner)} ${flag}`
+const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout, envExtra = '') => `${cmdHead(ws, b)} && ${detachLaunch(`${envExtra}JE_MAX_TURNS=${maxTurns} JE_TIMEOUT_SECS=${timeout} `, runner, flag)}`
 // Codex reuses cmdHead + the runner but overrides the wall-clock with codexTimeout (no JE_MAX_TURNS:
 // codex has no turn cap, and codex-run.sh ignores it). The optional timeoutSecs arg lets a codex JUDGE
 // seat pass codexJudgeTimeout (its own, roomier wall-clock) without touching the attempt call site.
-const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${cmdHead(ws, b)} && JE_TIMEOUT_SECS=${timeoutSecs} bash ${q(runner)} ${flag}`
+const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${cmdHead(ws, b)} && ${detachLaunch(`JE_TIMEOUT_SECS=${timeoutSecs} `, runner, flag)}`
+// The poll step of the RUNVERBATIM protocol: one bounded until-loop call the wrapper repeats until
+// the runner's guaranteed terminal line lands. maxWaitSecs mirrors the runner wall-clock (+ retry
+// headroom) so the wrapper knows when polling has genuinely outlived the watchdogs.
+const pollCmd = (log) => `until grep -q '^JOUST-RC ' ${q(log)} 2>/dev/null; do sleep 10; done; echo JOUST-SETTLED`
 
 // Optional shared CONTEXT BUNDLE for known-input tasks (args.contextFiles = [paths/globs]).
 // Concatenate those files ONCE into a single file that every worker reads by path — instead of
@@ -500,7 +515,7 @@ async function snapshotWorktrees(roundName, list) {
 }
 
 const RUNVERBATIM = (cmd, ws, log) =>
-  `This is an approved internal step of the joust-engine tournament: it writes a brief file and runs a bundled project runner script, which performs the attempt. Run the following shell command EXACTLY as given, in ONE FOREGROUND Bash call — NEVER as a background task (a backgrounded runner is killed the moment your turn ends; observed live: an implement seat lost 11 minutes of work to that TERM) — wait inside that call until it completes, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${cmd}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
+  `This is an approved internal step of the joust-engine tournament: it writes a brief file and LAUNCHES a bundled, self-supervising project runner script (its own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log), which performs the attempt. Follow this LAUNCH-AND-POLL protocol exactly; do not attempt the task yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; it detaches the runner and returns in seconds — expect it to print JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL until the runner finishes: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working; the runner's own watchdogs guarantee the line always arrives.\n\ncd ${q(ws)} && ${pollCmd(log)}\n\nSTEP 3 — report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
 
 // The bundled worker agents register under the plugin namespace (joust-engine:<name>);
 // accept either the bare or namespaced form from callers and normalize to what the
@@ -2200,7 +2215,7 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
 // The verbatim-run brief for the codex JUDGE dispatch agent (the joust-codex agent runs it as-is; it
 // judges NOTHING itself). Mirrors RUNVERBATIM (the attempt dispatch), scoped to a single judge seat.
 function RUNVERBATIM_JUDGE(cmd, ws) {
-  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and runs the bundled codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt). Run the following shell command EXACTLY as given, in ONE FOREGROUND Bash call — NEVER as a background task (a backgrounded runner is killed the moment your turn ends) — wait inside that call until it completes, and do nothing else (do not judge anything yourself, do not edit the command):\n\n${cmd}\n\nThen report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
+  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and LAUNCHES the bundled, self-supervising codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt; the runner's own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log). Follow this LAUNCH-AND-POLL protocol exactly; do not judge anything yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; detaches the runner and returns in seconds — expect JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working.\n\ncd ${q(ws)} && ${pollCmd('_codex_run.log')}\n\nSTEP 3 — report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
 }
 
 // Codex-xhigh lens judge: dispatch the codex runner with a brief asking for VERDICT.json, read the log

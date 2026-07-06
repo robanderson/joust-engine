@@ -21,11 +21,27 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const read = (p) => readFileSync(resolve(HERE, p), 'utf8')
 const SRC = read('tournament.mjs')
 
-test('every verbatim-run dispatch prompt mandates ONE FOREGROUND Bash call (attempt + codex judge)', () => {
-  const n = (SRC.match(/ONE FOREGROUND Bash call/g) || []).length
-  assert.ok(n >= 2, `expected the foreground mandate on >=2 dispatch prompts, saw ${n}`)
-  const bg = (SRC.match(/NEVER as a background task/g) || []).length
-  assert.ok(bg >= 2, `expected the background prohibition on >=2 dispatch prompts, saw ${bg}`)
+// LAUNCH-AND-POLL protocol (run-i glm post-mortem superseding the plain foreground mandate): a
+// foreground wrapper call is CAPPED (~600s) below the runner wall-clocks (glm 1200s) — the FE run's
+// glm seat was TERM-killed at ~10m mid-retry (RC 08). The runner detaches into its own session and
+// self-supervises; the wrapper polls the log for the guaranteed terminal line.
+test('runner dispatch DETACHES via perl setsid and returns a JOUST-LAUNCHED sentinel', () => {
+  assert.ok(SRC.includes("POSIX::setsid(); exec @ARGV"), 'launcher must new-session the runner (macOS has no setsid binary)')
+  assert.ok(SRC.includes('echo JOUST-LAUNCHED'), 'launcher must confirm the detach')
+  assert.ok(SRC.includes('const detachLaunch ='), 'the launcher helper must exist')
+  const launches = (SRC.match(/\$\{detachLaunch\(/g) || []).length
+  assert.equal(launches, 2, `detachLaunch must be interpolated by BOTH runnerCmd and codexRunnerCmd, saw ${launches}`)
+})
+
+test('both verbatim-run prompts mandate the poll loop on the guaranteed ^JOUST-RC line', () => {
+  assert.ok(SRC.includes("grep -q '^JOUST-RC '"), 'poll watches the line-anchored terminal RC contract')
+  assert.ok(SRC.includes('echo JOUST-SETTLED'), 'poll prints a settle sentinel')
+  const again = (SRC.match(/RUN THE SAME COMMAND AGAIN/g) || []).length
+  assert.ok(again >= 2, `both prompts must tell the wrapper to re-issue a timed-out poll, saw ${again}`)
+  const stay = (SRC.match(/NEVER end your turn/g) || []).length
+  assert.ok(stay >= 2, `both prompts must forbid ending the turn mid-run (the run-h impl-4 kill), saw ${stay}`)
+  const bg = (SRC.match(/never as a background task/g) || []).length
+  assert.ok(bg >= 2, `both prompts must keep the background prohibition on the poll call, saw ${bg}`)
 })
 
 test('attempt brief forbids deleting workspace scratch files (provenance record)', () => {
