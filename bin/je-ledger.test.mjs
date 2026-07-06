@@ -195,3 +195,43 @@ test('CLI: bad usage exits 2', () => {
   assert.equal(r.status, 2)
   assert.match(r.stderr, /usage:/)
 })
+
+// Round-scoped implement-win credit (codex-review correctness finding, 2026-07-06): Round 4 reuses
+// Round 3's blind letters, so a bare candidate .find() credited the ROUND-3 seat's model.
+test('aggregate: implement win credit resolves the winnerRound seat, not the first letter match', async () => {
+  const { aggregate } = await import('./je-ledger.mjs')
+  const rec = {
+    mode: 'two', task: 't', seats: [
+      { phase: 'implement', candidate: 'A', model: 'model-r3', round: 3 },
+      { phase: 'implement', candidate: 'A', model: 'model-r4', round: 4 },
+    ],
+    implementWinner: 'A', implementWinnerRound: 4,
+  }
+  const agg = aggregate([rec])
+  assert.equal(agg.models.get('model-r4').implWins, 1, 'the round-4 winner seat gets the credit')
+  assert.equal(agg.models.get('model-r3').implWins, 0, 'the round-3 letter twin gets nothing')
+  // Rounds unrecorded -> the LAST matching seat (the later round) is preferred.
+  const rec2 = {
+    mode: 'two', task: 't', seats: [
+      { phase: 'implement', candidate: 'B', model: 'model-early' },
+      { phase: 'implement', candidate: 'B', model: 'model-late' },
+    ],
+    implementWinner: 'B',
+  }
+  const agg2 = aggregate([rec2])
+  assert.equal(agg2.models.get('model-late').implWins, 1)
+  // Collapse-group members resolve round-scoped too: the split credits round-4 members only.
+  const rec3 = {
+    mode: 'two', task: 't', seats: [
+      { phase: 'implement', candidate: 'A', model: 'x-r3', round: 3 },
+      { phase: 'implement', candidate: 'A', model: 'x-r4', round: 4, collapse: { rep: 'A', group: ['A', 'B'] } },
+      { phase: 'implement', candidate: 'B', model: 'y-r3', round: 3 },
+      { phase: 'implement', candidate: 'B', model: 'y-r4', round: 4, collapse: { rep: 'A', group: ['A', 'B'] } },
+    ],
+    implementWinner: 'A', implementWinnerRound: 4,
+  }
+  const agg3 = aggregate([rec3])
+  assert.equal(agg3.models.get('x-r4').implWins, 0.5)
+  assert.equal(agg3.models.get('y-r4').implWins, 0.5)
+  assert.equal(agg3.models.get('x-r3').implWins, 0)
+})

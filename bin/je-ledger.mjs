@@ -300,11 +300,24 @@ export function aggregate(records) {
     // crediting the rep's model the full win — convergence must not inflate the aggregate win-rate a
     // future dynamic-M reads. A non-collapsed winner credits its model +1 exactly as before.
     const implSeats = (rec.seats || []).filter((s) => s.phase === 'implement')
-    const winSeat = rec.implementWinner != null ? implSeats.find((s) => s.candidate === rec.implementWinner) : null
+    // Round-scoped seat lookup (codex-review correctness finding, 2026-07-06): Round 4 reuses
+    // Round 3's blind letters, so a bare candidate-letter .find() resolves to the FIRST (round-3)
+    // seat and can credit the wrong model/collapse-group. Prefer the seat whose round matches
+    // implementWinnerRound; when rounds are unrecorded, take the LAST match (the later round).
+    const seatFor = (cand) => {
+      const matches = implSeats.filter((s) => s.candidate === cand)
+      if (!matches.length) return null
+      if (rec.implementWinnerRound != null) {
+        const m = matches.find((s) => s.round === rec.implementWinnerRound)
+        if (m) return m
+      }
+      return matches[matches.length - 1]
+    }
+    const winSeat = rec.implementWinner != null ? seatFor(rec.implementWinner) : null
     if (winSeat && winSeat.model) {
       const group = winSeat.collapse && Array.isArray(winSeat.collapse.group) ? winSeat.collapse.group : null
       if (group && group.length >= 2) {
-        const members = group.map((cand) => implSeats.find((s) => s.candidate === cand)).filter((s) => s && s.model)
+        const members = group.map(seatFor).filter((s) => s && s.model)
         const share = members.length > 0 ? 1 / members.length : 1
         for (const m of members) stat(m.model).implWins += share
       } else {
