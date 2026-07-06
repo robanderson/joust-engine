@@ -734,6 +734,36 @@ cliParseCase('CLI FE M segment errors, exit 0', 'do abc @@FE:6:2',
   { n: null }, { errorIncludes: 'not valid for @@FE' });
 
 // ===========================================================================
+// 2026-07-07: whitespace-joined spec items + loud multiple-fragment refusal.
+// "2 opus 2 codex" (no comma) used to parse as two disjoint 1-item chains and
+// the longest-raw pick SILENTLY DROPPED the other item (live: @@DE dispatched
+// 2x codex-xhigh for a "2 opus 2 codex" request). Whitespace now joins adjacent
+// items into one chain; genuinely separated fragments error loudly instead of
+// silently changing N; phase labels keep owning their own segments.
+// ===========================================================================
+parseCase('whitespace-joined spec: 2 opus 2 codex => N=4, nothing dropped',
+  '@@JE 2 opus 2 codex, a cli hangman game in python',
+  { n: 4, assignment: ['opus', 'opus', 'codex-xhigh', 'codex-xhigh'], task: 'a cli hangman game in python' },
+  { noErrors: true });
+parseCase('comma form still parses identically',
+  '@@JE 2 opus, 2 codex, task x',
+  { n: 4, assignment: ['opus', 'opus', 'codex-xhigh', 'codex-xhigh'] }, { noErrors: true });
+parseCase('mixed joiners: comma + and + whitespace-multiword tokens',
+  '@@JE 2 opus, 2 codex high and 1 sonnet, task x',
+  { n: 5, assignment: ['opus', 'opus', 'codex-high', 'codex-high', 'sonnet'] }, { noErrors: true });
+parseCase('disjoint fragments REFUSE loudly (never a silent longest-wins drop)',
+  '@@JE 2 opus then later 2 codex, task x',
+  { n: null, assignment: null },
+  { errorIncludes: 'separate model-spec fragments' });
+parseCase('phase labels exempt from the top-level fragment refusal; segments parse whitespace-joined',
+  '@@JE Plan: 2 opus 2 sonnet, Implement: 1 opus, do the thing',
+  { n: 4, assignment: ['opus', 'opus', 'sonnet', 'sonnet'], implementAssignment: ['opus'] },
+  { noErrors: true });
+parseCase('ordinary task digits still never spec ("fix 3 bugs")',
+  '@@JE:5 fix 3 bugs in the parser',
+  { n: 5, assignment: null, task: 'fix 3 bugs in the parser' }, { noErrors: true });
+
+// ===========================================================================
 // report.
 // ===========================================================================
 console.log(`\nje-parse tests: ${passed} passed, ${failed} failed`);

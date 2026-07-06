@@ -404,13 +404,18 @@ function locateSpec(msg) {
   // commas / 'and' / whitespace, optionally introduced by a connector.
   // We iterate item-by-item (NOT one giant variable-length capture) to reliably
   // capture middle items.
+  // 2026-07-07 fix: bare WHITESPACE also joins adjacent items ('2 opus 2 codex' is one
+  // chain — it used to parse as two disjoint 1-item chains, and the longest-raw pick below
+  // silently DROPPED the other item, changing N; the skill contract forbids silent drops).
   const chainRx = new RegExp(
     '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +                       // first item
-    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX + ')*', // more
+    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX +
+    '|\\s+' + COUNT_NC + MODEL_TOKEN_RX + ')*',                    // more (joiner OR whitespace)
     'ig'
   );
 
   let best = null;
+  const all = [];
   let m;
   while ((m = chainRx.exec(msg)) !== null) {
     if (m[0].length === 0) { chainRx.lastIndex++; continue; }
@@ -420,10 +425,15 @@ function locateSpec(msg) {
     // are drawn from MODEL_TOKEN_RX (real model families only), a lone
     // '3 glm' is fine; '3 bugs' never matches because 'bugs' isn't a model
     // token. So any match here is already spec-grade.
+    all.push({ start: m.index, end: m.index + m[0].length, raw: m[0] });
     if (!best || m[0].length > best.raw.length) {
       best = { found: true, start: m.index, end: m.index + m[0].length, raw: m[0] };
     }
   }
+  // Multiple DISJOINT spec-grade chains (e.g. '2 opus then 2 codex') can no longer be
+  // resolved by picking one — that silently drops the rest. Surface every fragment so the
+  // caller errors loudly and the user re-states the spec with commas/'and'.
+  if (best && all.length > 1) best.multiple = all.map(c => c.raw.trim());
   return best || { found: false };
 }
 
@@ -532,6 +542,7 @@ function extractPhaseSpecs(msg) {
     // An Implement: label with no model spell-out is still a signal to enable the
     // implement rounds (defaults fill the pool); record an empty expansion for it.
     const exp = loc.found ? expandSpec(loc.raw) : { assignment: [], count: 0, unknowns: [], overflows: [], any: false };
+    if (loc.found && loc.multiple) exp.multiple = loc.multiple; // surfaced by the caller as a loud error
     for (const u of unk) if (!exp.unknowns.includes(u)) exp.unknowns.push(u);
     out[marks[i].name] = exp;
   }
@@ -900,6 +911,18 @@ function parse(rawInput) {
 
   // Locate a recognised-item spec (not Top Mixed).
   const spec = locateSpec(scanMsg);
+  // 2026-07-07: multiple DISJOINT spec fragments = LOUD error (the old longest-wins pick
+  // silently dropped the other fragment's models, changing N — the invariant this parser
+  // exists to protect). Whitespace-adjacent items now merge into one chain above, so this
+  // fires only for genuinely separated fragments ('2 opus … 2 codex' with words between).
+  // Phase-labelled messages are exempt HERE: 'Plan: <chain> … Implement: <chain>' is two
+  // chains by design, and each phase SEGMENT surfaces its own `multiple` below.
+  const hasPhaseLabels = PLAN_LABEL_RX.test(scanMsg) || IMPLEMENT_LABEL_RX.test(scanMsg);
+  if (spec.found && spec.multiple && !hasPhaseLabels) {
+    errors.push('Found ' + spec.multiple.length + ' separate model-spec fragments: ' +
+      spec.multiple.map(f => '"' + f + '"').join(' and ') +
+      '. Join them into ONE list with commas/"and" (e.g. "2 opus, 2 codex") and re-run.');
+  }
 
   // Connector-licensed unknown tokens (loud rejection of typos).
   const unknownHits = locateUnknownNearConnector(scanMsg);
@@ -918,6 +941,10 @@ function parse(rawInput) {
   const implExp = phaseSpecs && phaseSpecs.implement;
   if (implExp && (implExp.any || implExp.unknowns.length || implExp.overflows.length)) {
     if (implExp.overflows.length) { for (const o of implExp.overflows) pushNMaxError(o.total); }
+    else if (implExp.multiple) {
+      errors.push('Implement: spec contains ' + implExp.multiple.length + ' separate model-spec fragments: ' +
+        implExp.multiple.map(f => '"' + f + '"').join(' and ') + '. Join them with commas/"and".');
+    }
     else if (implExp.unknowns.length) {
       errors.push('Unrecognised model token(s) in Implement: spec: ' +
         implExp.unknowns.map(u => '"' + u + '"').join(', ') + '. Re-state the spec.');
@@ -937,6 +964,10 @@ function parse(rawInput) {
     if (planExp && (planExp.any || planExp.unknowns.length || planExp.overflows.length)) {
       if (planExp.overflows.length) {
         for (const o of planExp.overflows) pushNMaxError(o.total);
+        assignment = null; nSpec = null;
+      } else if (planExp.multiple) {
+        errors.push('Plan: spec contains ' + planExp.multiple.length + ' separate model-spec fragments: ' +
+          planExp.multiple.map(f => '"' + f + '"').join(' and ') + '. Join them with commas/"and".');
         assignment = null; nSpec = null;
       } else if (planExp.unknowns.length) {
         errors.push('Unrecognised model token(s) in Plan: spec: ' +
@@ -1134,7 +1165,8 @@ function stripAll(preMarkerTask, spec, fullMsg, marker) {
   const chainRx = new RegExp(
     '(?:\\bwith\\b|\\busing\\b)?\\s*' +
     '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +
-    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX + ')*',
+    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX +
+    '|\\s+' + COUNT_NC + MODEL_TOKEN_RX + ')*',   // lockstep with locateSpec (whitespace joiner)
     'ig'
   );
   t = t.replace(chainRx, ' ');
