@@ -535,7 +535,7 @@ async function snapshotWorktrees(roundName, list) {
 }
 
 const RUNVERBATIM = (cmd, ws, log) =>
-  `This is an approved internal step of the joust-engine tournament: it writes a brief file and LAUNCHES a bundled, self-supervising project runner script (its own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log), which performs the attempt. Follow this LAUNCH-AND-POLL protocol exactly; do not attempt the task yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; it detaches the runner and returns in seconds — expect it to print JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL until the runner finishes: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working; the runner's own watchdogs guarantee the line always arrives.\n\ncd ${q(ws)} && ${pollCmd(log)}\n\nSTEP 3 — report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
+  `Joust-engine tournament dispatch step (all paths are inside this run's scratch directory): it writes a brief file and LAUNCHES a bundled, self-supervising project runner script (its own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log), which performs the attempt. Follow this LAUNCH-AND-POLL protocol exactly; do not attempt the task yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; it detaches the runner and returns in seconds — expect it to print JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL until the runner finishes: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working; the runner's own watchdogs guarantee the line always arrives.\n\ncd ${q(ws)} && ${pollCmd(log)}\n\nSTEP 3 — report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
 
 // The bundled worker agents register under the plugin namespace (joust-engine:<name>);
 // accept either the bare or namespaced form from callers and normalize to what the
@@ -717,10 +717,14 @@ function buildRcSummary(seatRcs) {
 // 'readback'-stage failure means the dispatch agent() call ALREADY succeeded and something AFTER that
 // was bad — sha-verified relay corruption, non-JSON, wrong shape, or a failed integrity check — which
 // is the same class RC 04 already covers for every other seat. Only the class was wrong before.
-function classifyCodexJudgeFailure(stage) {
-  return stage === 'readback'
+function classifyCodexJudgeFailure(stage, detail) {
+  const base = stage === 'readback'
     ? { rc: RC.INVALID, reason: 'codex-verdict-readback-failed' }
     : { rc: RC.UNAVAIL, reason: 'codex-seat-unavailable' }
+  // Optional bounded detail (run-j2: two runoff seats fell back with only the class recorded —
+  // the ACTUAL guard/reformat error was narrator-only and unrecoverable post-run). Additive;
+  // omitted when absent so the classic two-field shape (and its deepEqual pins) is unchanged.
+  return detail ? { ...base, detail: String(detail).slice(0, 140) } : base
 }
 // ---- end: return codes ------------------------------------------------------------------------
 
@@ -2358,7 +2362,9 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
     // "observability, except where behaviour already branches" clause: the seat stays living (Opus) but
     // its codex leg faulted. Fold-in A: a dispatch-stage failure records the pre-existing RC 02; a
     // readback-stage failure (codex RAN, its verdict arrived corrupt/unparseable) records RC 04.
-    recordSeat(`${label}:codex`, phaseTitle, fail.rc, fail.rc === RC.INVALID ? 'codex-seat-fallback-to-opus (verdict-readback-failed)' : 'codex-seat-fallback-to-opus')
+    recordSeat(`${label}:codex`, phaseTitle, fail.rc, fail.rc === RC.INVALID
+      ? `codex-seat-fallback-to-opus (verdict-readback-failed${fail.detail ? `: ${fail.detail}` : ''})`
+      : 'codex-seat-fallback-to-opus')
   } else if (!LEGACY_MIX && lens.judge && lens.judge.kind === 'codex' && !codexRunner && !codexRunnerWarned) {
     log(`JE-COUNCIL-WARNING: codexRunner not supplied — codex judge seat(s) (spec/craft/completeness/simplicity) will run as native Opus this run. Pass args.codexRunner to enable mixed-family judging.`)
     codexRunnerWarned = true
@@ -2399,7 +2405,7 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
 // The verbatim-run brief for the codex JUDGE dispatch agent (the joust-codex agent runs it as-is; it
 // judges NOTHING itself). Mirrors RUNVERBATIM (the attempt dispatch), scoped to a single judge seat.
 function RUNVERBATIM_JUDGE(cmd, ws) {
-  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and LAUNCHES the bundled, self-supervising codex runner script, which performs ONE codex council judge seat (NOT a task attempt; the runner's own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log). Follow this LAUNCH-AND-POLL protocol exactly; do not judge anything yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; detaches the runner and returns in seconds — expect JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working.\n\ncd ${q(ws)} && ${pollCmd('_codex_run.log')}\n\nSTEP 3 — report only whether a file named _review_report.md exists in ${ws} and its byte size. Do not read or relay its contents.`
+  return `Joust-engine tournament judge-dispatch step (all paths are inside this run's scratch directory): it writes a judge brief and LAUNCHES the bundled, self-supervising codex runner script, which performs ONE codex council judge seat (NOT a task attempt; the runner's own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log). Follow this LAUNCH-AND-POLL protocol exactly; do not judge anything yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; detaches the runner and returns in seconds — expect JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working.\n\ncd ${q(ws)} && ${pollCmd('_codex_run.log')}\n\nSTEP 3 — report only whether a file named _review_report.md exists in ${ws} and its byte size. Do not read or relay its contents.`
 }
 
 // Codex lens judge — REVIEW-PRESET pipeline (2026-07-06 judge-architecture experiment; replaces the
@@ -2506,7 +2512,7 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
       return { lens: lens.key, judgeModel: `codex-${judgeEffort}`, ...reconcileLens(verdict, labels) }
     } catch (e) {
       log(`council ${label} (${lens.key}) codex-xhigh readback attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
-      lastFail = classifyCodexJudgeFailure('readback')
+      lastFail = classifyCodexJudgeFailure('readback', String(e))
       if (i === 2) return { __codexFail: lastFail }
     }
   }
@@ -2956,7 +2962,7 @@ async function boostCandidate(origDir, outDir, items, phaseTitle, label) {
   const list = items.map((it, i) => `${i + 1}. ${it.change}\n   (addresses: ${it.addresses})`).join('\n')
   try {
     await agentLadder(
-      `This is an approved internal step of the joust-engine tournament: apply a review-driven improvement pass to a candidate artifact. First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical.\n\nHARD STOP DISCIPLINE (this pass is edit-and-stop, not iterate-until-perfect): make ONE editing pass over the listed items, then STOP and reply "done". Do NOT run test suites, builds, or the artifact itself — a separate staging gate validates the boosted artifact after you finish, so any verification you run here is duplicated spend (observed live: a boost agent burned 88 tool calls re-running full test suites). At most, you may re-read an edited file once to confirm the edit landed. If a change-list item cannot be applied as written, skip it and note the skip in your final reply instead of iterating on it.`,
+      `Joust-engine steelman step: apply a review-driven improvement pass to a COPY of a candidate artifact (both paths are inside this run's scratch directory; the original stays untouched). First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical.\n\nHARD STOP DISCIPLINE (this pass is edit-and-stop, not iterate-until-perfect): make ONE editing pass over the listed items, then STOP and reply "done". Do NOT run test suites, builds, or the artifact itself — a separate staging gate validates the boosted artifact after you finish, so any verification you run here is duplicated spend (observed live: a boost agent burned 88 tool calls re-running full test suites). At most, you may re-read an edited file once to confirm the edit landed. If a change-list item cannot be applied as written, skip it and note the skip in your final reply instead of iterating on it.`,
       { model: 'opus', phase: phaseTitle, label })
     return true
   } catch (e) { log(`steelman boost ${label} failed: ${String(e).slice(0, 100)} — candidate re-enters at its last gated version (ratchet)`); return false }
@@ -3166,7 +3172,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       // ship the version that WON: copy the winning gated artifact over the winner's staged dir so
       // every downstream consumer (plan bundling, adoption, reports) gets the polished artifact.
       if (winEntry.ws !== `${reviewDir}/${finalWinner}`) {
-        await agentLadder(`This is an approved internal step of the joust-engine tournament: adopt the improved winner artifact. Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; find "$DEST" -mindepth 1 -delete 2>/dev/null; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
+        await agentLadder(`Joust-engine staging step: the council's steelman pass produced an improved copy of the winning candidate, and the staged review copy must now be synced to it (BOTH paths are engine-managed scratch dirs inside this run's staging area; nothing outside the run directory is touched). Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; find "$DEST" -mindepth 1 -delete 2>/dev/null; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
           { model: HELPER_MODEL, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`))
       }
     } else if (iter < maxIters) {
@@ -3541,7 +3547,7 @@ async function persist(pairs, phaseTitle) {
   const writeAndMeasure = async (list, allowDerive) => {
     const script = list.map(f => stepFor(f, allowDerive)).join('\n')
     const res = await agentLadder(
-      `This is an approved internal step of the joust-engine tournament: persist result artifacts. ` +
+      `Joust-engine persist step (writes only inside this run's output directory): persist result artifacts. ` +
       `Run this exact shell script in ONE Bash call, reproducing it VERBATIM — every heredoc body byte-for-byte, ` +
       `no reformatting, no abbreviation (the engine verifies checksums; any drift is detected and retried). ` +
       `It prints one line per file of the form "FLP <path> <byte-count> <sha256>". Then return the structured ` +
@@ -3629,7 +3635,7 @@ async function maybeFileEngineIssues(phaseTitle) {
         `GH_REPO=${q(engineRepo)} JE_ISSUE_AUTOFILE=1 bash ${q(A.issueRunner)} new --sev ${sev} --area ${area} ` +
         `--title ${q(title)} --evidence-file ${q(ev)} --run-id ${q(safeRunId)} 2>&1; echo "JEI ${rc} rc=$?"`
       const res = await agentLadder(
-        `This is an approved internal step: file ONE dogfood issue for engine-fault class ${rc}. Run this exact shell command in ONE Bash call and report its stdout verbatim. Do nothing else:\n\n${cmd}`,
+        `Joust-engine auto-issue step (opt-in via args.issueRunner; the command below is the bundled, privacy-filtered issue helper): file ONE dogfood issue for engine-fault class ${rc}. Run this exact shell command in ONE Bash call and report its stdout verbatim. Do nothing else:\n\n${cmd}`,
         { model: HELPER_MODEL, phase: phaseTitle, label: `rc-issue-${rc}` }).catch(() => null)
       const filed = /JEI .* rc=0\b/.test(String(res))
       recordSeat(`issue:${rc}`, phaseTitle, filed ? RC.OK : RC.UNKNOWN, `auto-issue-${filed ? 'filed-or-drafted' : 'FAILED'}`)
