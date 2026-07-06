@@ -69,6 +69,13 @@ let implementSeats = implementAttempts // reassigned by the A/B hook when a seco
 // byte-identical behavior to today. Ignored under implement (investigation precedes implementation
 // by construction — the composite, not the findings pool, seeds implementers).
 const investigate = A.investigate === true && !implement
+// Dynamic M (issue #36): OPT-IN, off by default. When on AND a ledger runner + task bucket are
+// supplied, the engine MAY seat FEWER implementers on a brief prior runs show converges
+// deterministically. Fail-open + reduce-only: any missing input or read failure leaves the seat
+// count exactly as today. A documented no-op until operators run the ledger's record step.
+const DYNAMIC_M_ON = A.dynamicM === true
+const ledgerRunner = A.ledgerRunner || null
+const dynamicMBucket = A.taskBucket || null
 // composeOnly (@@FE Fable Engine): run Round 1 + stage/validate/pool, then STOP — no councils,
 // no round 2, no implement. The caller (the orchestrating model) reads the blind pool and
 // composes/implements itself. Mutually exclusive with implement. `investigate` implies it.
@@ -917,6 +924,95 @@ function mergeEvidence(staged, byBlind) {
   })
 }
 // ---- end: evidence verification -----------------------------------------------------------------
+// ---- begin: identical-candidate dedup (issue #36) ---------------------------------------------
+// PURE — extract-and-eval'able like the return-codes / quorum blocks (no closures over module
+// state, no I/O). Byte-identical implement deliverables collapse to ONE pooled candidate BEFORE the
+// council convenes, so duplicates never split the vote or waste judge attention. The identity hash
+// is computed once in mechanicalPatchGate's helper shell over each candidate's PRE-STAMP deliverable
+// bytes (the same file-set the pool rebuild concatenates) and relayed as one token; the grouping,
+// contention predicate, and stamp text are decided HERE, in code.
+
+// Attach an additive `collapse` field {rep, group:[letters]} to every VALID member of a >=2-member
+// equal-hash group. rep = the LOWEST blind letter in the group (the codebase's existing letter
+// tie-break precedent) — no candidate is ever re-lettered. valid/failReason are NEVER touched.
+// hashByBlind: { <letter>: <non-empty hash string> } (a missing/empty hash => never collapses).
+function groupIdenticalCandidates(staged, hashByBlind) {
+  const byHash = new Map() // hash -> [letters] (valid candidates with a usable hash, first-seen order)
+  for (const c of (staged || [])) {
+    if (!c || !c.valid) continue
+    const h = hashByBlind && hashByBlind[c.blind]
+    if (!h || typeof h !== 'string') continue // fail-safe: no usable hash => singleton, never collapses
+    if (!byHash.has(h)) byHash.set(h, [])
+    byHash.get(h).push(c.blind)
+  }
+  const infoByBlind = {} // letter -> {rep, group} (only for members of a >=2 group)
+  for (const letters of byHash.values()) {
+    if (letters.length < 2) continue // singleton: nothing to merge, no collapse field
+    const group = [...letters].sort() // deterministic; group[0] = lowest letter = representative
+    const rep = group[0]
+    for (const l of letters) infoByBlind[l] = { rep, group }
+  }
+  return (staged || []).map(c => {
+    const info = c && c.valid ? infoByBlind[c.blind] : null
+    return info ? { ...c, collapse: { rep: info.rep, group: info.group } } : c
+  })
+}
+
+// The dedup contention predicate — the ONLY new judging gate. A VALID candidate is in contention
+// unless it is a NON-representative duplicate (collapsed into another letter). A collapsed non-rep
+// stays valid:true but drops out of the pool/council/tally EXACTLY as an invalid candidate already
+// does (it simply never appears in the valid-list), so no tally/veto/no_consensus branch changes.
+function inContention(c) {
+  return !!(c && c.valid) && !(c.collapse && c.collapse.rep !== c.blind)
+}
+
+// The judge-visible convergence stamp line for a representative that absorbed >=1 duplicate, or null
+// (singleton / non-rep => no stamp). Letters + a COUNT only — no hash, path, or model text — so
+// blindness holds structurally. That convergence is itself evidence of the brief's determinism.
+function convergenceLineFor(c) {
+  if (!c || !c.collapse || c.collapse.rep !== c.blind) return null
+  const group = Array.isArray(c.collapse.group) ? c.collapse.group : []
+  if (group.length < 2) return null
+  return `CONVERGENCE: ${group.length} implementers produced this identical artifact (candidates ${group.join(', ')}); that convergence is evidence of the brief's determinism`
+}
+// ---- end: identical-candidate dedup -----------------------------------------------------------
+
+// ---- begin: dynamic M (issue #36) -------------------------------------------------------------
+// PURE seat-trimming + evidence parsing (extract-and-eval'able). When prior SAME-TASK runs show the
+// winning brief converges deterministically (identical implement candidates collapse), the engine
+// MAY seat fewer implementers. Fail-open, reduce-only, floored: any missing/thin/malformed evidence
+// returns the seat list UNCHANGED, and a trim never drops below M_FLOOR. Cross-run evidence comes
+// from bin/je-ledger.mjs (read impurely by the caller); this block only DECIDES.
+const DYNAMIC_M = {
+  MIN_SAMPLES: 5,       // the ledger's own n>=5 hypothesis bar — never act on thinner evidence
+  CONVERGE_RATIO: 0.50, // same-bucket convergence ratio at/above which a trim may fire
+  M_FLOOR: 2,           // never seat fewer than this — a real contest still needs >=2 implementers
+}
+// Parse the ledger runner's one-line convergence readout for a task bucket. Returns
+// { samples, convergenceRatio } or null (no/garbled line => fail-open no-op upstream).
+function parseConvergenceEvidence(text) {
+  const m = /JE-LEDGER-CONVERGENCE\s+samples=(\d+)\s+ratio=([0-9]*\.?[0-9]+)/.exec(String(text == null ? '' : text))
+  if (!m) return null
+  const samples = parseInt(m[1], 10)
+  const convergenceRatio = parseFloat(m[2])
+  if (!Number.isFinite(samples) || !Number.isFinite(convergenceRatio)) return null
+  return { samples, convergenceRatio }
+}
+// Decide the (possibly shorter) implement-seat list. `seats` is returned UNCHANGED (same reference)
+// unless the same-bucket evidence clears BOTH the sample floor and the convergence threshold, in
+// which case exactly one seat is shed (reduce-only ratchet), never below M_FLOOR. The result is
+// always a prefix slice (stable seat identities), never reordered or grown.
+function trimSeatsForConvergence(seats, evidence, opts = DYNAMIC_M) {
+  if (!Array.isArray(seats) || seats.length <= opts.M_FLOOR) return seats
+  if (!evidence || typeof evidence !== 'object') return seats
+  const n = Number(evidence.samples)
+  const ratio = Number(evidence.convergenceRatio)
+  if (!Number.isFinite(n) || n < opts.MIN_SAMPLES) return seats           // sample-size floor
+  if (!Number.isFinite(ratio) || ratio < opts.CONVERGE_RATIO) return seats // below trim threshold
+  const target = Math.max(opts.M_FLOOR, seats.length - 1)                  // shed at most one seat
+  return target >= seats.length ? seats : seats.slice(0, target)
+}
+// ---- end: dynamic M ---------------------------------------------------------------------------
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
 const rcSummaryLive = () => buildRcSummary(seatRcs)
@@ -1242,6 +1338,16 @@ function contractStampShell(dest) {
   const f = `${dest}/contract.txt`
   return `if grep -Eq ${q(CONTRACT_GRAMMAR)} ${q(f)} 2>/dev/null; then printf '\\n--- Contract check ---\\n'; cat ${q(f)}; fi`
 }
+// Issue #36 convergence-stamp plumbing. CONVERGENCE is a provider-neutral literal — like MECHANICAL/
+// CONTRACT it is deliberately NOT a rebrand token and stays byte-identical in the dev copy. `line` is
+// the engine-computed stamp (convergenceLineFor — letters + a count only, blindness holds) for a
+// representative that absorbed duplicates; a null/empty line emits NOTHING (singleton / non-rep).
+// Shared by BOTH pool-rebuild writers (mechanicalPatchGate + enrichBlindPool) so they cannot drift,
+// mirroring mechStampShell/contractStampShell.
+function convergenceStampShell(line) {
+  if (!line) return ':' // no-op shell builtin — emits nothing for singletons / non-reps
+  return `printf '\\n--- Convergence check ---\\n%s\\n' ${q(line)}`
+}
 
 const MECH_SCHEMA = {
   type: 'object', additionalProperties: false,
@@ -1254,7 +1360,10 @@ const MECH_SCHEMA = {
         // way stageAndValidate folds JRC into JEV entries. OPTIONAL and never in `required`, so a
         // helper that forgets the JCON lines degrades only the contract axis (=> 'unavailable',
         // unstamped) and can never knock out the mechanical classification with it.
-        properties: { blind: { type: 'string' }, class: { type: 'string' }, detail: { type: 'string' }, contract: { type: 'string' } },
+        // `hash` (issue #36): the JHASH content-hash token over the pre-stamp deliverable bytes,
+        // folded into the SAME entry. OPTIONAL and never in `required`; a missing hash simply means
+        // that candidate never collapses (fail-safe singleton).
+        properties: { blind: { type: 'string' }, class: { type: 'string' }, detail: { type: 'string' }, contract: { type: 'string' }, hash: { type: 'string' } },
         required: ['blind', 'class'],
       },
     },
@@ -1334,12 +1443,22 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       // Degrade-to-unstamped guard: anything not matching the closed grammar is DELETED, so
       // contractStampShell emits no block for it (run-G fail-safe; no fallback stamp on purpose).
       `grep -Eq ${q(CONTRACT_GRAMMAR)} "$ctr" 2>/dev/null || rm -f "$ctr"; ` +
+      // Identity hash (issue #36): sha256 over the candidate's PRE-STAMP deliverable bytes — the SAME
+      // file enumeration the pool rebuild concatenates, with the engine-written stamp files excluded
+      // so run-to-run stamp jitter never breaks a genuine byte-for-byte match. sort -z makes the set
+      // order-independent; only file CONTENTS are hashed (not their per-blind paths), so identical
+      // deliverables under distinct blind letters produce an identical hash. An empty file-set OR a
+      // missing shasum both degrade to NONE (singleton, never collapses) — so two zero-file valid
+      // deliverables can never false-merge on the sha256 of the empty string.
+      `nfiles=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | tr -dc '\\0' | wc -c | tr -d ' '); ` +
+      `if [ "\${nfiles:-0}" -gt 0 ] && command -v shasum >/dev/null 2>&1; then h=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | sort -z | xargs -0 cat 2>/dev/null | shasum -a 256 2>/dev/null | cut -d' ' -f1); else h=NONE; fi; ` +
       `echo "JMECH ${c.blind} $cls $detail"; ` +
-      `echo "JCON ${c.blind} $ccls"` +
+      `echo "JCON ${c.blind} $ccls"; ` +
+      `echo "JHASH ${c.blind} ${'${h:-NONE}'}"` +
       `)`
   }).join('\n')
   const res = await agentLadder(
-    `Run this exact shell script in ONE Bash call. It prints two lines per candidate: "JMECH <letter> <class> [detail]" and "JCON <letter> <class>". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}; and set that same entry's contract to the class token from the matching letter's JCON line (omit contract if that line is missing). Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
+    `Run this exact shell script in ONE Bash call. It prints three lines per candidate: "JMECH <letter> <class> [detail]", "JCON <letter> <class>", and "JHASH <letter> <hash|NONE>". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}; set that same entry's contract to the class token from the matching letter's JCON line (omit contract if that line is missing); and set that same entry's hash to the token after the letter on the matching JHASH line (omit hash if the line is missing or the token is "NONE"). Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
     { model: HELPER_MODEL, schema: MECH_SCHEMA, phase: phaseTitle, label: 'mechanical-gate' }
   ).catch(() => null)
   const byBlind = {}
@@ -1347,6 +1466,16 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
   // Run G: the contract merge runs AFTER the mechanical merge and is purely additive (attaches
   // c.contract, never touches valid/failReason). byBlind entries carry the optional JCON token.
   const merged = mergeContract(mergeMechanical(staged, byBlind), byBlind, repoMode)
+  // Dedup (issue #36): group byte-identical VALID deliverables by the relayed content hash; attach
+  // an additive `collapse` field to every member (rep = lowest blind letter). Non-rep duplicates
+  // stay valid:true but drop out of judging via inContention below. Fail-safe: a missing/NONE hash
+  // never collapses (singleton). Any hash/parse/rebuild failure leaves staging byte-identical to today.
+  const byHash = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
+    const h = r && typeof r.hash === 'string' ? r.hash.trim() : ''
+    if (h && h !== 'NONE') byHash[String(r.blind).trim()] = h
+  }
+  const grouped = groupIdenticalCandidates(merged, byHash)
   // Observability: a corrupt-patch invalidation records a DISTINCT :mech seat (RC 04) — the main seat
   // already recorded its staging RC; this makes the mechanical exclusion visible without double-counting.
   for (const c of merged) if (c.mechanical && c.mechanical.class === 'corrupt_patch') recordSeatOnce(`${c.label || c.blind}:mech`, phaseTitle, RC.INVALID, 'mechanical-corrupt-patch')
@@ -1355,16 +1484,16 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
   // + the stamp block. repoMode: enrichBlindPool's rebuild carries the stamp via mechStampShell.
   if (!repoMode) {
     const pool = `${reviewDir}/_pool.md`
-    const rebuild = [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(merged.filter(c => c.valid).map(c => {
+    const rebuild = [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(grouped.filter(inContention).map(c => {
       const dest = `${reviewDir}/${c.blind}`
-      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; ${contractStampShell(dest)}; echo; } >> "$tmp"`
+      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; ${contractStampShell(dest)}; ${convergenceStampShell(convergenceLineFor(c))}; echo; } >> "$tmp"`
     })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
     await agentLadder(
       `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
       { model: HELPER_MODEL, phase: phaseTitle, label: 'mechanical-pool' }
     ).catch(() => null)
   }
-  return merged
+  return grouped
 }
 
 // G2 evidence-stamp plumbing (INVESTIGATE→COMPOSITE v1). EVIDENCE/JEVID are provider-neutral
@@ -1611,6 +1740,7 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
            `if grep -Eq ${grammar} ${q(`${dest}/enrichment.txt`)}; then cat ${q(`${dest}/enrichment.txt`)}; else printf '%s' ${fallback}; fi; ` +
            `${mechStampShell(dest)}; ` +
            `${contractStampShell(dest)}; ` +
+           `${convergenceStampShell(convergenceLineFor(c))}; ` +
            `printf '\\n'; } >> "$tmp"`
   }), `mv -f "$tmp" ${q(pool)}`].join('\n')
   const script = `${perCandidate}\n${rebuild}`
@@ -3376,6 +3506,31 @@ function implGatePassed(r) {
   return { pass: true, reason: 'code-council majority on a valid, non-vetoed candidate', winner: rv.winner }
 }
 
+// Read the SAME-TASK convergence aggregate from the run ledger (bin/je-ledger.mjs) via the opt-in
+// ledger runner. Fail-open end to end: no runner / no bucket / dead agent / garbled output => null,
+// which trimSeatsForConvergence treats as "leave the seat count unchanged". The runner is expected
+// to print ONE line for the bucket: `JE-LEDGER-CONVERGENCE samples=<int> ratio=<float>`; the engine
+// (parseConvergenceEvidence), not the LLM, is the source of truth for the numbers.
+async function readConvergenceEvidence(taskBucket) {
+  if (!DYNAMIC_M_ON || !ledgerRunner || !taskBucket) return null
+  // Fail-open (issue #36): the opt-in dynamic-M path must NEVER throw. Guard the optional
+  // CODEX_JUDGE_DUMP_SCHEMA — if it is absent, degrade to an inline {raw} schema rather than a
+  // ReferenceError — and wrap the whole read so any failure returns null (seats stay unchanged).
+  try {
+    const dumpSchema = (typeof CODEX_JUDGE_DUMP_SCHEMA !== 'undefined' && CODEX_JUDGE_DUMP_SCHEMA)
+      || { type: 'object', additionalProperties: false, properties: { raw: { type: 'string' } }, required: ['raw'] }
+    const cmd = `node ${q(ledgerRunner)} convergence ${q(taskBucket)} 2>/dev/null`
+    const res = await agent(
+      `Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do not summarize or interpret it. Do nothing else:\n\n${cmd}`,
+      { model: HELPER_MODEL, schema: dumpSchema, phase: 'Implement Round 3', label: 'ledger-convergence' }
+    ).catch(() => null)
+    const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    return parseConvergenceEvidence(raw)
+  } catch {
+    return null
+  }
+}
+
 // Run ONE implement round: dispatch the implement pool seeded with the plan, stage, enrich, and
 // judge with the CODE lenses. `wantGuidance` distils round-3 → round-4 priors (round 3 only).
 async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance, reviewDir, wantGuidance) {
@@ -3393,10 +3548,13 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
   // Run F: mechanical pre-council gate — classify/stamp every valid candidate, invalidate corrupt
   // patches, BEFORE the code council (or legacy judge) sees the pool. Implement rounds only.
   staged = await mechanicalPatchGate(staged, reviewDir, phaseTitle)
-  const blind = staged.filter(c => c.valid)
+  // issue #36: inContention drops NON-representative byte-identical duplicates from judging while
+  // leaving them valid:true (they never enter blindList, exactly as an invalid candidate doesn't).
+  const blind = staged.filter(inContention)
   const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
     ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
     ...(c.contract ? { contract: c.contract.class } : {}), // run G: layout-conformance class (audit only; never gates)
+    ...(c.collapse ? { collapse: c.collapse } : {}), // issue #36: dedup group (rep + all letters) — unblinding bookkeeping, never judge-visible
     ...(c.seedBrief ? { seedBrief: c.seedBrief } : {}), // A/B lineage — bookkeeping only, judges never see it
     ...(c.valid ? {} : { failReason: c.failReason }) }))
   if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables (post-mechanical-gate)' } }
@@ -3706,6 +3864,23 @@ if (implement) {
   const planWinner = blindF.find(c => c.blind === finalRank.winner) || champ || blindF[0]
   const seedPlanPath = `${runDir}/_winning-plan/plan.md`
   await bundlePlan(planWinner.ws, seedPlanPath)
+  // Dynamic M (issue #36): OPT-IN spend optimization — decided BEFORE the A/B-brief assignment so the
+  // reduce-only prefix trim shrinks the BASE pool and the A/B split re-alternates the TRIMMED pool
+  // below (a prefix slice of an already-alternated pool would unbalance brief-1/brief-2).
+  // Reduce-only + fail-open: on high same-task convergence in the ledger, seat one fewer implementer
+  // (never below the floor). Any missing input / read failure / thin evidence leaves the count as-is.
+  // Safe by construction: dedup already dissolves the duplicate-deadlock before judging, so a wrong
+  // or stale read can only ever spend slightly less — it can never recreate the deadlock #36 targets.
+  if (DYNAMIC_M_ON) {
+    const ev = await readConvergenceEvidence(dynamicMBucket)
+    const trimmed = trimSeatsForConvergence(implementSeats, ev)
+    if (trimmed.length < implementSeats.length) {
+      log(`JE-DYNAMIC-M: same-task convergence high (samples=${ev.samples}, ratio=${ev.convergenceRatio}) — trimming implementers ${implementSeats.length} → ${trimmed.length} (reduce-only; floor ${DYNAMIC_M.M_FLOOR}).`)
+      implementSeats = trimmed
+    } else {
+      log(`JE-DYNAMIC-M: no trim (dynamicM on; evidence ${ev ? `samples=${ev.samples} ratio=${ev.convergenceRatio}` : 'unavailable'} — seats unchanged at ${implementSeats.length}).`)
+    }
+  }
   // A/B briefs: seed the implementer pool alternately with the winner's AND the runner-up finalist's
   // briefs. The runner-up comes from the steelman's seeded finalists (top-2 NON-VETOED by
   // construction — a vetoed candidate can never be a finalist), so a vetoed brief can never seed an
@@ -3724,7 +3899,9 @@ if (implement) {
     if (ru) {
       const brief2Path = `${runDir}/_winning-plan/brief-2.md`
       await bundlePlan(ru.ws, brief2Path)
-      implementSeats = assignAbSeeds(implementAttempts, [seedPlanPath, brief2Path])
+      // Re-alternate the (possibly trimmed) pool so the A/B split stays balanced — never slice a
+      // prefix of an already-alternated pool (issue #36: trim precedes this assignment).
+      implementSeats = assignAbSeeds(implementSeats, [seedPlanPath, brief2Path])
       abInfo = { 'brief-1': finalRank.winner, 'brief-2': ruLetter }
       log(`A/B BRIEFS: implementers split alternately across brief-1 (final-rank ${finalRank.winner}) and brief-2 (final-rank ${ruLetter}). Judges are blind to lineage — the A/B readout is derived from mapping, never from votes.`)
     } else {
@@ -3734,7 +3911,7 @@ if (implement) {
   const impl = await implementPhase(seedPlanPath)
   await persist([
     { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...(abInfo ? { ab: abInfo } : {}), ...impl }) },
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   return {
