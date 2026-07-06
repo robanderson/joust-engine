@@ -6,6 +6,20 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Dedup identity-hash hardening (codex-review security findings).** A three-way
+  judge-architecture experiment (native Opus vs `codex exec` vs the `codex review` preset,
+  same artifact, same security lens) surfaced two real integrity hazards in the shipped #36
+  dedup path — which Opus and the run-h council had both passed: (1) the identity hash was a
+  boundary-blind byte concatenation (`xargs -0 cat | shasum`), so different file trees
+  (`'ab'+'c'` vs `'abc'`) alias to one identity without any SHA collision — now a MANIFEST
+  hash (per-file `shasum` lines with $dest-relative paths, sorted, hashed again; identical
+  trees still match across blind letters, empirically verified); (2) the relayed hash token
+  was trusted if non-empty, letting a corrupted/dishonest relay forge collapses with a junk
+  token — now a strict `^[0-9a-f]{64}$` shape guard (non-hex degrades to no-collapse
+  singleton). Both fixes fail-open. Third finding (fail-open pool rewrite after collapse)
+  queued — needs a read-back verify design. Tests: 2 new structural guards in
+  `tournament-dedup.test.mjs`.
+
 - **Dispatch + workspace hygiene guards (run-h codex-implementer post-mortem).** Run H's
   "3/6 codex implementers failed staging" cluster decomposed into three distinct defects —
   none of them codex code quality — each now guarded: (1) every verbatim-run dispatch prompt

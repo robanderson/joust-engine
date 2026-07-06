@@ -1444,15 +1444,17 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
       // Degrade-to-unstamped guard: anything not matching the closed grammar is DELETED, so
       // contractStampShell emits no block for it (run-G fail-safe; no fallback stamp on purpose).
       `grep -Eq ${q(CONTRACT_GRAMMAR)} "$ctr" 2>/dev/null || rm -f "$ctr"; ` +
-      // Identity hash (issue #36): sha256 over the candidate's PRE-STAMP deliverable bytes — the SAME
-      // file enumeration the pool rebuild concatenates, with the engine-written stamp files excluded
-      // so run-to-run stamp jitter never breaks a genuine byte-for-byte match. sort -z makes the set
-      // order-independent; only file CONTENTS are hashed (not their per-blind paths), so identical
-      // deliverables under distinct blind letters produce an identical hash. An empty file-set OR a
-      // missing shasum both degrade to NONE (singleton, never collapses) — so two zero-file valid
-      // deliverables can never false-merge on the sha256 of the empty string.
+      // Identity hash (issue #36): sha256 over a MANIFEST of the candidate's PRE-STAMP deliverable —
+      // one `shasum -a 256` line per file (digest + ./relative-path), sorted, hashed again. The
+      // manifest (not a bare byte concatenation) encodes file boundaries, names, and count, so two
+      // DIFFERENT trees can never alias to one identity by shifting bytes across file boundaries
+      // (codex-review security finding, 2026-07-06: 'ab'+'c' vs 'abc' concatenate identically).
+      // Paths are $dest-RELATIVE (cd + find .), so identical deliverables under distinct blind
+      // letters still produce an identical hash; engine-written stamp files stay excluded so stamp
+      // jitter never breaks a genuine match. An empty file-set OR a missing shasum both degrade to
+      // NONE (singleton, never collapses) — two zero-file valid deliverables can never false-merge.
       `nfiles=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | tr -dc '\\0' | wc -c | tr -d ' '); ` +
-      `if [ "\${nfiles:-0}" -gt 0 ] && command -v shasum >/dev/null 2>&1; then h=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | sort -z | xargs -0 cat 2>/dev/null | shasum -a 256 2>/dev/null | cut -d' ' -f1); else h=NONE; fi; ` +
+      `if [ "\${nfiles:-0}" -gt 0 ] && command -v shasum >/dev/null 2>&1; then h=$(cd "$dest" && find . -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | sort | shasum -a 256 2>/dev/null | cut -d' ' -f1); else h=NONE; fi; ` +
       `echo "JMECH ${c.blind} $cls $detail"; ` +
       `echo "JCON ${c.blind} $ccls"; ` +
       `echo "JHASH ${c.blind} ${'${h:-NONE}'}"` +
@@ -1473,8 +1475,13 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
   // never collapses (singleton). Any hash/parse/rebuild failure leaves staging byte-identical to today.
   const byHash = {}
   for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
-    const h = r && typeof r.hash === 'string' ? r.hash.trim() : ''
-    if (h && h !== 'NONE') byHash[String(r.blind).trim()] = h
+    const h = r && typeof r.hash === 'string' ? r.hash.trim().toLowerCase() : ''
+    // STRICT sha256 shape required (codex-review security finding, 2026-07-06): the hash is a
+    // RELAYED token, and grouping on any non-empty string lets a corrupted/dishonest relay return
+    // the same junk token (e.g. "same") for unrelated candidates — forging a collapse + convergence
+    // stamp and suppressing a real candidate from judging. Non-hex tokens degrade to no-collapse
+    // (fail-open singleton), exactly like NONE.
+    if (/^[0-9a-f]{64}$/.test(h)) byHash[String(r.blind).trim()] = h
   }
   const grouped = groupIdenticalCandidates(merged, byHash)
   // Observability: a corrupt-patch invalidation records a DISTINCT :mech seat (RC 04) — the main seat

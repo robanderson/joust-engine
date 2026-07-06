@@ -178,6 +178,25 @@ test('dedup runs AFTER the mechanical/contract merge and BEFORE the pool rebuild
   assert.ok(at('return grouped') > group)
 })
 
+// Codex-review security findings (2026-07-06 judge-architecture experiment, both confirmed live
+// in the adopted implementation and fixed same-day):
+test('identity hash is a MANIFEST hash (boundaries+names), not a bare byte concatenation', () => {
+  // 'ab'+'c' vs 'abc' concatenate identically — a manifest of per-file `shasum` lines (digest +
+  // ./relative-path, sorted, hashed again) cannot alias across file boundaries or names.
+  assert.ok(SRC.includes('| sort -z | xargs -0 shasum -a 256'), 'per-file digests, not xargs -0 cat, feed the identity hash')
+  const jhashBlock = SRC.slice(at('Identity hash (issue #36)'), at('echo "JHASH ${c.blind}'))
+  assert.ok(jhashBlock.includes('cd "$dest" && find .'), 'enumeration is $dest-relative so identical deliverables match across blind letters')
+  assert.ok(!jhashBlock.includes('xargs -0 cat'), 'the identity hash must never be a boundary-blind concatenation')
+})
+
+test('relayed hash must be a strict 64-hex sha256 before it can group (forged-collapse guard)', () => {
+  // Grouping on any non-empty token lets a corrupted/dishonest relay return the same junk token
+  // for unrelated candidates — forging a collapse + convergence stamp. Non-hex degrades to singleton.
+  const guard = at('/^[0-9a-f]{64}$/.test(h)')
+  const group = at('groupIdenticalCandidates(merged, byHash)')
+  assert.ok(guard < group, 'the shape guard must run while BUILDING byHash, before grouping consumes it')
+})
+
 test('identity hash is guarded (nfiles>0 AND shasum present) before it can collapse anything', () => {
   const guard = at('command -v shasum')
   const emit = at('echo "JHASH ${c.blind}')
