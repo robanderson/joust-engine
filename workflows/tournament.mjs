@@ -15,6 +15,9 @@ export const meta = {
     { title: 'Implement Review' },
     { title: 'Implement Round 4' },
     { title: 'Implement Final rank' },
+    // Rejudge mode (only when args.rejudgeCandidates): no generation rounds at all — fixed
+    // mechanical gate + code council over an existing staged pool (run-i salvage class).
+    { title: 'Rejudge' },
   ],
 }
 
@@ -3768,6 +3771,78 @@ async function implementPhase(seedPlanPath) {
     no_consensus: !!(r4.review && r4.review.no_consensus),
     ...(r4pick ? { needs_orchestrator_pick: r4pick } : {}),
     needs_human: !g4.pass && !r4pick, // R4 failed the gate → needs-human; a steelman tie routes to the orchestrator instead
+  }
+}
+
+// ================= REJUDGE MODE (args.rejudgeCandidates) ======================================
+// Salvage/re-judge entry: judge an EXISTING pool of staged implement candidates without running
+// any plan or implement round. Motivated by run-i (2026-07-06): a mechanical-gate bug false-killed
+// 11/12 staged candidates AFTER the expensive dispatch had already succeeded — the artifacts were
+// intact on disk, only the judgment was wrong. Rejudge re-runs the (fixed) mechanical gate over
+// the staged dirs under FRESH blind letters (cold re-judge: no letter aligns with the source run),
+// rebuilds the pool, and runs the full CODE council (majority + dual security veto + steelman).
+// args.rejudgeCandidates = [{ dir: <abs staged-candidate dir>, model: <displayModel>, source: <tag> }]
+// args.rejudgeRot (optional int) rotates the fresh letter assignment. `attempts` still needs one
+// well-formed (never-dispatched) seat to satisfy the top-of-file guard.
+if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
+  phase('Rejudge')
+  log(`▶ REJUDGE: ${A.rejudgeCandidates.length} staged candidate(s) — fixed mechanical gate + code council, no generation rounds`)
+  await buildContext() // pins gateBaseShaFile (HEAD) for the gate's real-apply snapshot baseline
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const rjN = A.rejudgeCandidates.length
+  const rjRot = Number.isInteger(A.rejudgeRot) ? A.rejudgeRot : 3
+  const reviewDir = `${runDir}/review-rejudge`
+  const rjAssign = A.rejudgeCandidates.map((r, i) => ({ ...r, blind: letters[(i + rjRot) % rjN] }))
+  // Stage: copy each source dir into its fresh blind slot; STRIP the source run's engine stamps
+  // (mechanical/contract/convergence/enrichment) so the fixed gate re-derives them — a stale
+  // corrupt-patch stamp from the buggy gate must never leak into the rebuilt pool.
+  const copyScript = [`mkdir -p ${q(reviewDir)}`].concat(rjAssign.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `rm -rf ${q(dest)}; mkdir -p ${q(dest)}; cp -R ${q(c.dir)}/. ${q(dest)}/ 2>/dev/null; ` +
+           `rm -f ${q(dest)}/mechanical.txt ${q(dest)}/contract.txt ${q(dest)}/convergence.txt ${q(dest)}/enrichment.txt; ` +
+           `echo "JRJ ${c.blind} $(find ${q(dest)} -type f 2>/dev/null | grep -c .)"`
+  })).join('\n')
+  await agentLadder(
+    `Run this exact shell script in ONE Bash call. It stages candidate directories for re-judging and prints one "JRJ <letter> <filecount>" line per candidate. Report the printed lines; do nothing else:\n\n${copyScript}`,
+    { model: HELPER_MODEL, phase: 'Rejudge', label: 'rejudge-stage' }
+  ).catch(() => null)
+  let rjStaged = rjAssign.map((c, i) => ({
+    label: c.source || `rejudge-${i + 1}`, dispatch: 'anthropic', displayModel: c.model || 'unknown',
+    blind: c.blind, ws: `${reviewDir}/${c.blind}`, valid: true, failReason: '', roundName: 'rejudge',
+  }))
+  rjStaged = await mechanicalPatchGate(rjStaged, reviewDir, 'Rejudge')
+  const rjBlind = rjStaged.filter(inContention)
+  const rjMapping = rjStaged.map(c => ({ candidate: c.blind, model: c.displayModel, source: c.label, valid: c.valid,
+    ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
+    ...(c.contract ? { contract: c.contract.class } : {}),
+    ...(c.collapse ? { collapse: c.collapse } : {}),
+    ...(c.valid ? {} : { failReason: c.failReason }) }))
+  if (!rjBlind.length) {
+    await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: null }) }], 'Rejudge')
+    return { mode: 'rejudge', n: rjN, mapping: rjMapping, winner: null, __failed: 'no valid candidates survived the mechanical gate', rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+  }
+  const rjReview = await judge('code reviewer', rjBlind, false, `${reviewDir}/_pool.md`, RANK_SCHEMA, 'Rejudge', 'rejudge-review', LENSES, 'final')
+  await persist([
+    ...(rjReview && !rjReview.__failed ? [
+      ...verdictEntries(reviewDir, rjReview, 'rejudge-review'),
+      { path: `${reviewDir}/verdict.md`, content: verdictToMd(rjReview, 'Rejudge verdict'), derive: { mode: 'verdict-md', from: `${reviewDir}/verdict.json`, title: 'Rejudge verdict' } },
+    ] : []),
+    ...(rjReview && rjReview.council ? [{ path: `${reviewDir}/council.json`, content: json(rjReview.council), derive: { mode: 'council-json', from: `${reviewDir}/verdict.json` } }] : []),
+  ], 'Rejudge')
+  const rjGate = implGatePassed({ review: rjReview, blind: rjBlind })
+  const rjWinnerEntry = rjGate.pass ? rjMapping.find(m => m.candidate === rjGate.winner) : null
+  const rjPick = !rjGate.pass && rjReview && rjReview.needs_orchestrator_pick ? rjReview.needs_orchestrator_pick : null
+  await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}), no_consensus: !!(rjReview && rjReview.no_consensus) }) }], 'Rejudge')
+  await maybeFileEngineIssues('Rejudge')
+  return {
+    mode: 'rejudge', n: rjN, mapping: rjMapping,
+    winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}),
+    no_consensus: !!(rjReview && rjReview.no_consensus),
+    ...(rjPick ? { needs_orchestrator_pick: rjPick } : {}),
+    ranking: (rjReview && rjReview.ranking) || null,
+    reasoning: (rjReview && typeof rjReview.reasoning === 'string') ? rjReview.reasoning.slice(0, 2000) : null,
+    rc_summary: rcSummaryLive(),
+    model_downgrades: modelDowngrades,
   }
 }
 

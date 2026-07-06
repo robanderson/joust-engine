@@ -204,11 +204,11 @@ test('(structural) steelman runoffs persist the ORIG-LETTER-mapped verdicts unde
   assert.ok(idx >= 0 && cj.indexOf('persistSeatFiles(steelmanVerdicts.map', idx) > idx, 'runoff persist reads the mapped verdicts')
 })
 
-test('(structural) every council checkpoint verdict.json goes through verdictEntries (7 call sites, no bare typed writes left)', () => {
+test('(structural) every council checkpoint verdict.json goes through verdictEntries (8 call sites, no bare typed writes left)', () => {
   const calls = SRC.match(/\.\.\.verdictEntries\(/g) || []
-  assert.equal(calls.length, 7, 'review-1 x2 (P1b/P2), review-final x3 (P5b/pick/P6), review-impl-3, review-impl-4')
+  assert.equal(calls.length, 8, 'review-1 x2 (P1b/P2), review-final x3 (P5b/pick/P6), review-impl-3, review-impl-4, review-rejudge')
   assert.ok(!/verdict\.json`, content: json\(/.test(SRC), 'no checkpoint may bypass the assemble path with a bare typed verdict.json')
-  for (const label of ["'review'", "'final-rank'", "'impl-3-review'", "'impl-4-review'"]) {
+  for (const label of ["'review'", "'final-rank'", "'impl-3-review'", "'impl-4-review'", "'rejudge-review'"]) {
     assert.ok(SRC.includes(`, ${label})`) || SRC.includes(`, ${label}),`), `checkpoint label ${label} wired`)
   }
 })
