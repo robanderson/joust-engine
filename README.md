@@ -29,6 +29,7 @@ That one line triggers the loop: it asks which model(s) to run the 5 attempts on
 - [Model providers](#model-providers)
 - [Diversity injection](#diversity-injection-pool-a--pool-b)
 - [Grand loops (`Z >= 2`)](#grand-loops-z--2)
+- [Run state: heartbeat, abort stamping, resume](#run-state-heartbeat-abort-stamping-resume)
 - [The dogfood backlog](#the-dogfood-backlog)
 - [Installation & setup](#installation--setup)
 - [The benchmarking system (`je-bench`)](#the-benchmarking-system-je-bench)
@@ -55,9 +56,9 @@ The tournament is a **cheap, wide planning phase** (always) followed by an **opt
 
 | Round | Runs | What happens | Pool default |
 |---|---|---|---|
-| **Plan Round 1** | always | N parallel, isolated plan attempts, one diversity nudge each → the blind plan-lens council reviews, votes a round-1 winner, **and distils guidance** | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
-| **Plan Round 2** | always (two-pass; `:1` stops after Round 1) | winner's plan **saved**, every other artifact discarded; N **fresh** attempts get the task + guidance (never round-1 content); final pool = N + the carried winner, re-labelled blind → the council ranks and elects the **winning plan** | same pool, fresh nudges |
-| **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning plan verbatim** (a deliberate exception to "never seed prior artifacts" — the plan *is* the specification); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
+| **Plan Round 1** | always | N parallel, isolated attempts each produce a **design brief** (≤10 bullets: approach, surfaces, risks, testable acceptance criteria — never code or diffs), one diversity nudge each → the blind plan-lens council reviews, votes a round-1 winner, **and distils guidance** | wide + diverse: `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10) |
+| **Plan Round 2** | always (two-pass; `:1` stops after Round 1) | winner's brief **saved**, every other artifact discarded; N **fresh** attempts get the task + guidance (never round-1 content); final pool = N + the carried winner, re-labelled blind → the council ranks and elects the **winning design brief** | same pool, fresh nudges |
+| **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning design brief** (a deliberate exception to "never seed prior artifacts" — the brief is the spec: approach + acceptance criteria, implementation details are theirs); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
 | **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate (no council majority, all vetoed, or verify failure) | M fresh implementers, guided by the R3 review; still no consensus → **needs-human**, never a silently-picked winner | same pool |
 
 ```text
@@ -71,10 +72,10 @@ PLAN (always)
            final plan pool = N round-2 + saved winner ◀──────────┘
                              │
                              ▼
-                  plan council rank ──▶ WINNING PLAN ✓        (no implement flag → done)
+                  plan council rank ──▶ WINNING BRIEF ✓       (no implement flag → done)
 
 IMPLEMENT (only with the `implement` keyword)
-  winning plan ──▶ [M implementers, plan seeded verbatim] ──▶ code council + gate ──▶ winner ✓
+  winning brief ──▶ [M implementers, brief seeded] ──▶ code council + gate ──▶ winner ✓
                                                                     │ gate fails
                                                                     ▼
                    [M fresh implementers + R3 guidance] ──▶ code council + gate ──▶ winner ✓ / needs-human
@@ -284,6 +285,29 @@ At the end the driver switches back to your starting branch. Safety rails:
 The orchestration home is the skill procedure plus `bin/je-git.sh` (which owns *all* git/gh side effects). The tournament engine (`workflows/tournament.mjs`) is **unchanged** and never touches the repo — that purity is its safety guarantee.
 
 ---
+
+## Run state: heartbeat, abort stamping, resume
+
+Every run writes a `run-state.json` sidecar into its run directory — the same trust class
+as `mapping.json` (unblinding bookkeeping; never judge-visible). It is updated atomically
+at every phase boundary through the engine's verified persist dataplane, and it is an
+**index, never an authority**: resume decisions are re-derived from the artifacts on disk.
+
+- **Heartbeat** — phase, a monotonic `phase_index`, and a per-seat status table land at
+  each phase boundary, so a dead run is inspectable at a glance.
+- **Abort stamping** — seats that were in flight when a run died are reclassified
+  `aborted` on the next launch from on-disk truth (empty workspace, no `JOUST-RC` line),
+  never from the file's own claims.
+- **Resume** — relaunch with `resume: true` and the SAME `runDir`: completed seats are
+  reused **in place** (same blind-letter index, so blind judging determinism holds) and
+  only missing/failed seats re-dispatch. Reuse is gated by a config fingerprint (attempts,
+  rotations, task); any drift refuses reuse and falls back to a clean full run. A
+  `resume.lock` (atomic, symlink-refusing) stops two resumes racing one run directory.
+  The SUMMARY of a resumed run discloses exactly which seats were reused vs re-run.
+
+A hand-edited `run-state.json` cannot inject a fake completed seat: there is no code path
+from its status fields to any reuse decision — the on-disk probe is the single source of
+truth, so the worst a forged file can cause is a re-dispatch.
 
 ## The dogfood backlog
 

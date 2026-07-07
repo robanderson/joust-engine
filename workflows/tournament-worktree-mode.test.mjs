@@ -44,8 +44,10 @@ check('(legacy) repoMode flag read from args',
   SRC.includes('const repoMode = A.repoMode === true'))
 check('(legacy) baseRef read from args',
   SRC.includes('const baseRef = A.baseRef || null'))
-check('(legacy) cmdHead is byte-identical',
-  SRC.includes("const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`"))
+// security-sweep L1 (2026-07-07): cmdHead now refuses a SYMLINKED workspace path before writing;
+// the mkdir/cd/brief tail is otherwise byte-identical.
+check('(legacy) cmdHead body unchanged after the L1 symlink guard',
+  SRC.includes("[ -L ${q(ws)} ] && { echo \"JE-WS-REFUSE ${q(ws)} is a symlink\" >&2; exit 3; }; mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`"))
 check('(legacy) self-contained brief opening unchanged',
   briefSrc.includes('return `You are solving a self-contained task. Produce ONE complete solution in a single focused pass.'))
 check('(legacy) self-contained save-dir line unchanged',
@@ -183,3 +185,11 @@ check('(worktree-root) repoMode:true worktreePath is untouched by the issue #34 
 
 console.log(failed ? `\n${failed} check(s) FAILED` : '\nAll checks passed')
 process.exit(failed ? 1 : 0)
+
+// security-sweep M14/M17/M21/L1 (2026-07-07): path-traversal + symlink + stale-derive hardening.
+check('(M14) attempt labels are validated against path traversal before any path is built',
+  SRC.includes('unsafe attempt label') && SRC.includes("/^[A-Za-z0-9._-]+$/.test(l)"))
+check('(M17) derived writes rm the stale target before render (failed render -> bytes 0 -> retry)',
+  SRC.includes('rm -f ${q(f.path)} 2>/dev/null; node ${q(`${PLUGIN_BIN}/je-render.mjs`)}'))
+check('(M21) run-state.json is not cat through a symlink',
+  SRC.includes('[ -L ${q(RUN_STATE_PATH)} ] || cat ${q(RUN_STATE_PATH)}'))

@@ -47,14 +47,19 @@ for (const rel of JSON_FILES) {
 
 // 2 & 3. plugin.json component files must exist on disk.
 const plugin = parsed['.claude-plugin/plugin.json']
+// security-sweep M12 (2026-07-07): plugin.json component names are joined into filesystem paths;
+// a name with `/` or `..` would probe existence OUTSIDE the tree. Reject non-simple names.
+const badName = (n) => typeof n !== 'string' || n === '' || n.includes('/') || n.includes('\\') || n.split(/[/\\]/).includes('..') || n.includes('..')
 if (plugin) {
   const components = plugin.components || {}
   for (const agent of components.agents || []) {
+    if (badName(agent)) { note(`plugin.json agent name "${agent}" is unsafe (path chars/traversal) — ignored`); continue }
     const rel = join('agents', `${agent}.md`)
     if (existsSync(join(ROOT, rel))) console.log(`✓ agent file  ${rel}`)
     else note(`plugin.json lists agent "${agent}" but ${rel} is missing`)
   }
   for (const skill of components.skills || []) {
+    if (badName(skill)) { note(`plugin.json skill name "${skill}" is unsafe (path chars/traversal) — ignored`); continue }
     const rel = join('skills', skill, 'SKILL.md')
     if (existsSync(join(ROOT, rel))) console.log(`✓ skill file  ${rel}`)
     else note(`plugin.json lists skill "${skill}" but ${rel} is missing`)

@@ -15,6 +15,9 @@ export const meta = {
     { title: 'Implement Review' },
     { title: 'Implement Round 4' },
     { title: 'Implement Final rank' },
+    // Rejudge mode (only when args.rejudgeCandidates): no generation rounds at all — fixed
+    // mechanical gate + code council over an existing staged pool (run-i salvage class).
+    { title: 'Rejudge' },
   ],
 }
 
@@ -26,6 +29,9 @@ export const meta = {
 //   codexTimeoutSecs: number,             // optional wall-clock backstop for codex (default 600)
 //   grokTimeoutSecs: number,              // optional wall-clock backstop for grok (default 600); grok ALSO honours grokMaxTurns
 //   grokWebSearch: boolean,               // optional — true enables grok's web search (default false = hermetic, like the other providers)
+//   quorumClose: boolean,                 // optional — false disables N-1 quorum close (default on where the runtime has timers+clock)
+//   quorumGraceSecs: number,              // optional — grace buffer added to 2x a seat's wall clock (default 90)
+//   aspectVerifiers: boolean,             // optional — true adds 4 cheap binary aspect verifiers per decision point (BoN-MAV, arXiv:2502.20379); tiebreak + steelman context ONLY, never the tally/veto (default off)
 //   attempts: [ {                         // one per attempt, length N
 //      label: 'candidate-1',
 //      dispatch: 'anthropic' | 'glm' | 'local' | 'codex' | 'minimax' | 'grok',
@@ -42,6 +48,18 @@ const { task, runDir, attempts } = A
 if (!Array.isArray(attempts) || attempts.length === 0) {
   return { error: 'no attempts provided', argsType: typeof args, keys: Object.keys(A || {}) }
 }
+// security-sweep M14 (2026-07-07): attempt `label`s are joined RAW into workspace/worktree/staging
+// paths (scratchPath/worktreePath: `${root}/${roundName}/${label}`). A label containing `../` or a
+// leading `/` escapes the intended root (shell quoting stops injection, not traversal), letting a
+// worker's _brief.txt / logs / staging reads target attacker-chosen locations. Require every label to
+// be a simple filename token BEFORE any path is built from it — reject the whole run otherwise.
+{
+  const okLabel = (l) => typeof l === 'string' && /^[A-Za-z0-9._-]+$/.test(l) && l !== '.' && l !== '..'
+  const badAttempt = (A.attempts || []).concat(A.implementAttempts || []).find(a => a && !okLabel(a.label))
+  if (badAttempt) {
+    return { error: `unsafe attempt label ${JSON.stringify(badAttempt.label)} — labels must match [A-Za-z0-9._-]+ (path-traversal guard)`, keys: Object.keys(A || {}) }
+  }
+}
 // ---- Plan/Implement round split (2026-07-03) ----------------------------------------------
 // `attempts` seat the PLAN phase (Plan Round 1 + Plan Round 2). `implement` (default off) gates
 // the IMPLEMENT phase (Implement Round 3, + Round 4 only if R3 yields no gate-passing candidate).
@@ -51,7 +69,39 @@ if (!Array.isArray(attempts) || attempts.length === 0) {
 // 'two' under `implement`. A plan-only run keeps its @@JE:N:M single/two semantics unchanged.
 const implement = A.implement === true
 const implementAttempts = (Array.isArray(A.implementAttempts) && A.implementAttempts.length) ? A.implementAttempts : attempts
-const mode = implement ? 'two' : A.mode
+// A/B briefs (design-brief A/B test): when true AND the final rank produced a second gated,
+// non-vetoed finalist, the implementer pool is seeded ALTERNATELY with both design briefs.
+// Judges stay blind to brief lineage (they judge code against the ORIGINAL task + fundamentals,
+// never against a brief); the A/B readout is derived from mapping afterwards, never from votes.
+const AB_BRIEFS = A.abBriefs === true
+let implementSeats = implementAttempts // reassigned by the A/B hook when a second finalist exists
+// investigate (INVESTIGATE→COMPOSITE pipeline v1, spec 2026-07-06, gap G1): Round 1 attempts use
+// the 'investigate' brief kind — each returns a short FINDINGS.md (diagnosis + VERIFIABLE evidence
+// citations + a candidate improvement sketch; findings only, never fixes) — and the run IMPLIES
+// composeOnly semantics (stage/validate/pool, then return {poolPath, mapping, candidates} for the
+// orchestrating composer; no councils, no round 2). A G2 evidence-verification pass stamps each
+// pooled candidate with `EVIDENCE: n cited, m verified` before the pool returns. Off (default) =>
+// byte-identical behavior to today. Ignored under implement (investigation precedes implementation
+// by construction — the composite, not the findings pool, seeds implementers).
+const investigate = A.investigate === true && !implement
+// Dynamic M (issue #36): OPT-IN, off by default. When on AND a ledger runner + task bucket are
+// supplied, the engine MAY seat FEWER implementers on a brief prior runs show converges
+// deterministically. Fail-open + reduce-only: any missing input or read failure leaves the seat
+// count exactly as today. A documented no-op until operators run the ledger's record step.
+const DYNAMIC_M_ON = A.dynamicM === true
+const ledgerRunner = A.ledgerRunner || null
+const dynamicMBucket = A.taskBucket || null
+// composeOnly (@@FE Fable Engine): run Round 1 + stage/validate/pool, then STOP — no councils,
+// no round 2, no implement. The caller (the orchestrating model) reads the blind pool and
+// composes/implements itself. Mutually exclusive with implement. `investigate` implies it.
+const composeOnly = (A.composeOnly === true || investigate) && !implement
+// Run depth (Rob, 2026-07-07): the steelman shootout already iterates 1..N times on the BEST
+// brief, so 'fast' and DEFAULT implement runs skip the whole Round-2 plan rewrite — the R1
+// review becomes the FINAL plan decision point (steelman included) and its winner feeds the
+// implementers. Only a 'deep' run keeps the guided Round-2 rewrite. An EXPLICIT :2 (A.mode
+// 'two' from the sigil) is always honoured — the user asked for two-pass by name.
+const RUN_DEPTH = A.depth === 'deep' ? 'deep' : A.depth === 'fast' ? 'fast' : 'default' // parser field: depth
+const mode = implement ? (RUN_DEPTH === 'deep' || A.mode === 'two' ? 'two' : 'single') : A.mode
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 
 // Judge council (issue #22). The default judge at BOTH decision points (Phase 3 review, Phase 5 final
@@ -66,6 +116,15 @@ const COUNCIL = Number(A.judges) !== 1
 // completeness-class/simplicity-class seats); judgeMix:'anthropic' forces every seat native Opus,
 // byte-identical to pre-feature output. Ignored when judges:1 (no council to mix).
 const LEGACY_MIX = A.judgeMix === 'anthropic'
+
+// Aspect verifiers (BoN-MAV, arXiv:2502.20379; default OFF via args.aspectVerifiers === true):
+// many cheap BINARY aspect checks beat a single continuous score — spend marginal budget on
+// verification, not candidates. 4 HELPER_MODEL verifiers (one per aspect) run CONCURRENTLY with
+// the council's round-1 lens fan-out against the same staged pool. Their approval counts ONLY
+// break EXACT ties inside nonVetoedOrder (slotting between mean-rank and blind-letter) and are
+// surfaced to the steelman as context — NEVER the majority tally, the veto, or the judges:1
+// legacy path. A dead aspect agent ABSTAINS; the feature can never crash or shrink a run.
+const ASPECT_VERIFIERS = A.aspectVerifiers === true
 
 // Run-purpose summary for the live /workflows heading (issue #38). meta.name/description is a static
 // PURE LITERAL (Workflow spec — it CANNOT be dynamic per-run), so the only runtime lever into the live
@@ -92,11 +151,14 @@ function deriveSummary() {
 // strings — treat a string as a tentative, evidence-less item so the live system never crashes on cached data.
 
 // brief() frames one attempt. `kind` selects the phase framing:
-//   'plan'      — Plan Round 1/2: produce a PLAN artifact (a concrete, file-level change
-//                 proposal). Plans NEVER touch the repo, so this is always the scratch path.
-//   'implement' — Implement Round 3/4: apply the change. `seedPlanPath` (when set) seeds the
-//                 attempt with the WINNING PLAN verbatim — the deliberate exception to the
-//                 "never seed prior artifacts" rule (the plan IS the spec).
+//   'plan'        — Plan Round 1/2: produce a PLAN artifact (a concrete, file-level change
+//                   proposal). Plans NEVER touch the repo, so this is always the scratch path.
+//   'investigate' — Investigate Round 1 (investigate: true): produce a FINDINGS.md — diagnosis +
+//                   verifiable evidence citations + an improvement sketch. Findings only, never
+//                   fixes; same single-pass + save contract + hard stop as the other kinds.
+//   'implement'   — Implement Round 3/4: apply the change. `seedPlanPath` (when set) seeds the
+//                   attempt with the WINNING PLAN verbatim — the deliberate exception to the
+//                   "never seed prior artifacts" rule (the plan IS the spec).
 function brief(nudge, ws, guidance, ctx, kind = 'implement', seedPlanPath = null) {
   let g = ''
   if (guidance) {
@@ -109,33 +171,58 @@ function brief(nudge, ws, guidance, ctx, kind = 'implement', seedPlanPath = null
     ? `\nShared context for this task has ALREADY been gathered for you in one file: ${ctx}\nRead that single file at the start — it contains the source material you need. Do NOT re-read the underlying source files one by one (that work is already done).\n`
     : ''
 
-  // ---- PLAN phase (Plan Round 1/2): produce a PLAN artifact, never touch the repo. ----
-  if (kind === 'plan') {
-    return `You are producing a PLAN — a concrete, file-level change proposal for a task. You do NOT implement anything and you do NOT touch any real repository.
+  // ---- INVESTIGATE round (investigate: true, Round 1 only): produce FINDINGS, never fixes. ----
+  if (kind === 'investigate') {
+    return `You are INVESTIGATING a problem — establishing WHAT is actually true, not designing or writing a fix. Your deliverable is FINDINGS ONLY.
 
-Task to plan:
+Task to investigate:
 ${task}
 ${g}${ctxLine}
 ${nudge}
 
-Write ONE plan file, PLAN.md, in your workspace. A strong plan is:
-- CONCRETE and FILE-LEVEL: name each file to add / edit / delete, and say exactly what changes in each (functions, signatures, data shapes, config), enough that an implementer could execute it without guessing.
-- COMPLETE: cover every requirement, edge case, migration, test, and doc update the task implies — do not hand-wave the hard parts.
-- FEASIBLE: reference only real, reachable files/APIs/mechanisms; each step must follow from the last.
-- RISK-AWARE and SECURE-BY-DESIGN: name the execution risks (breaking changes, coupling, data/compat, ordering) and the security posture (least privilege, input validation, safe secrets/supply-chain), and how the plan mitigates them.
-- PROPORTIONATE: the smallest coherent change that fully solves the task — no gold-plating.
+Write ONE file, FINDINGS.md, in your workspace, organised as:
+- DIAGNOSIS (1-3 bullets): what is actually wrong/slow/missing, in decision-level language.
+- EVIDENCE (2-6 bullets): VERIFIABLE citations backing each diagnosis bullet — exact file paths with line numbers (e.g. src/foo.js:123), artifact/log paths, or short quoted log/telemetry excerpts naming their source path, plus measured numbers where you have them. Every claim must be checkable by a reader with the same files; a claim you could not verify is speculation and MUST be labelled as such.
+- CANDIDATE IMPROVEMENT SKETCH (1-3 bullets): the direction a fix could take, at design-brief altitude — what KIND of change, where, and why it would address the diagnosis.
+
+ALTITUDE RULE (hard): FINDINGS ONLY — NO code blocks, NO diffs, NO function bodies, NO fixes, NO line-level edit instructions. Citing a file:line as evidence is citing, not editing. A findings file that reads like a patch or an implementation will be judged DOWN for altitude violation; a diagnosis without checkable evidence will be weighed as speculation.
 
 Rules:
-- This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your plan.
-- Produce the PLAN ONLY. Do NOT write the implementation, do NOT edit real source files, do NOT run anything. A plan, not a patch.
+- This task is fully specified and self-contained. Do NOT ask clarifying questions or stop for input — investigate with what you can read; where you cannot verify, say so honestly rather than speculate.
+- Produce the FINDINGS ONLY. Do NOT write a fix, do NOT edit real source files, do NOT run anything beyond what you need to verify your claims.
+- Work in a SINGLE pass and then STOP. Your first version is final; do not rewrite or polish it.
+- Save FINDINGS.md into: ${ws} (create the directory if needed). To save a file, just write it; if a file-edit tool refuses because the file "must be read first", overwrite it directly with the shell (\`cat > FILE <<'EOF' ... EOF\`).
+- End FINDINGS.md with a 2 to 4 sentence note on your confidence and what you could not verify (outside the bullet budget).`
+  }
+
+  // ---- PLAN phase (Plan Round 1/2): produce a PLAN artifact, never touch the repo. ----
+  if (kind === 'plan') {
+    return `You are producing a DESIGN BRIEF — a decision-level proposal for HOW to solve a task. You do NOT implement anything, you do NOT write line-level edits, and you do NOT touch any real repository.
+
+Task to design for:
+${task}
+${g}${ctxLine}
+${nudge}
+
+Write ONE file, PLAN.md, in your workspace: AT MOST 10 bullets total, organised as:
+- APPROACH (2-4 bullets): the approach you choose and WHY. If a genuinely competitive alternative exists, name it in one bullet and say why you rejected it.
+- SURFACES (1-3 bullets): which files/areas change and what KIND of change each takes (new module, extend function X's contract, config addition) — never line-level edits.
+- RISKS (1-2 bullets): the riskiest assumptions or side effects (breaking changes, coupling, data/compat, security posture) and the mitigation.
+- ACCEPTANCE CRITERIA (2-4 bullets): testable, approach-neutral checks that define done ("<metric> improves by >=X", "no existing test regresses", "behaviour Z is preserved", "a new test covers case W").
+
+ALTITUDE RULE (hard): NO code blocks, NO diffs, NO line numbers, NO function bodies. Every factual claim about the codebase must be true — reviewers verify that named surfaces and constraints actually exist. A brief that reads like an implementation will be judged DOWN for altitude violation, however good its code is; a brief that hand-waves the hard 20% will be judged down for incompleteness. Decisions and criteria are the deliverable — implementation details belong to the implementers.
+
+Rules:
+- This task is fully specified and self-contained. Do NOT ask clarifying questions or stop for input — make reasonable default choices and commit to them.
+- Produce the BRIEF ONLY. Do NOT write the implementation, do NOT edit real source files, do NOT run anything beyond what you need to verify your claims.
 - Work in a SINGLE pass and then STOP. Your first version is final; do not rewrite or polish it.
 - Save PLAN.md into: ${ws} (create the directory if needed). To save a file, just write it; if a file-edit tool refuses because the file "must be read first", overwrite it directly with the shell (\`cat > FILE <<'EOF' ... EOF\`).
-- End PLAN.md with a 2 to 4 sentence note on your approach, tradeoffs, and known limitations.`
+- End PLAN.md with a 2 to 4 sentence note on your approach, tradeoffs, and known limitations (outside the 10-bullet budget).`
   }
 
   // ---- IMPLEMENT phase (Implement Round 3/4): the winning plan IS the spec. ----
   const seedBlock = seedPlanPath
-    ? `\nAn APPROVED PLAN for this task has already been chosen by a review council. It is your specification — follow it. Read it in full at the start:\n${seedPlanPath}\nImplement THAT plan. Where the plan is concrete, follow it verbatim; where it leaves a small detail open, make the smallest reasonable choice consistent with it. Do NOT re-plan or second-guess the overall approach.\n`
+    ? `\nAn APPROVED DESIGN BRIEF for this task has already been chosen by a review council. It is your specification — read it in full at the start:\n${seedPlanPath}\nFollow its APPROACH and satisfy its ACCEPTANCE CRITERIA. The implementation details are yours: make the smallest coherent implementation consistent with the brief. Where the brief is explicit, honour it; where it is silent, choose well. Do NOT re-plan or second-guess the overall approach.\n`
     : ''
 
   if (repoMode) {
@@ -158,6 +245,9 @@ Rules:
 - Work only in this checkout: ${ws}
 - To save a file, just write it. If a file-edit tool refuses because the file "must be read first" (a stale copy exists), do NOT spend turns reading/retrying — overwrite it directly with the shell instead, e.g. \`cat > FILE <<'EOF' ... EOF\`.`
   }
+  // Run G (non-repoMode implement only — 'plan' returned above, repoMode returned above): ONE
+  // mandated deliverable layout + a bounded git-apply self-verify. The engine's pre-council gate
+  // stamps conformance (CONTRACT:) but v1 never invalidates a freeform layout (grandfathered).
   return `You are solving a self-contained task. Produce ONE complete solution in a single focused pass.
 
 Task:
@@ -165,12 +255,19 @@ ${task}
 ${g}${ctxLine}${seedBlock}
 ${nudge}
 
+DELIVERABLE CONTRACT (mandatory layout — a deterministic engine gate checks it before judging):
+- PRIMARY (preferred): a \`patches/\` directory holding one or more ordered unified-diff files (\`patches/0001-<name>.patch\` or \`.diff\`, applied in filename order), PLUS \`APPLY.md\` (the exact, ORDERED shell commands to apply every patch, e.g. \`git apply patches/0001-<name>.patch\`), PLUS \`VERIFY.md\` (the exact commands to verify the change and the expected result).
+- SELF-VERIFY before you stop: you have no repository checkout here, so prove your diffs are well-formed — \`git init -q\` a throwaway scratch directory (seed it with your best reconstruction of the touched files from the shared context), run \`git apply --check\` (add \`--recount\` if needed) on each patch, and FIX the diff until it exits 0. This one bounded check is REQUIRED and explicitly allowed — it is NOT the forbidden run-the-tests-and-iterate loop. If you cannot reach exit 0, switch to the FALLBACK below instead of shipping a corrupt patch.
+- FALLBACK (only if you cannot produce a clean patch): a \`files/\` directory mirroring each changed file at its full repo-relative path (e.g. \`files/src/foo.js\`), PLUS \`APPLY.md\` (the exact, ordered copy commands, and any deletions). \`VERIFY.md\` is encouraged here too.
+- Use these exact directory and file names; do NOT invent another layout or leave a bare patch in the workspace root. A conforming layout lets reviewers judge your CODE instead of your packaging (a non-conforming layout is stamped but still judged in this version).
+
 Rules:
 - This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your solution.
-- Work in a SINGLE pass and then STOP: write your solution file ONCE, then stop immediately. Do NOT run it, do NOT test or inspect it, and do NOT rewrite, re-align, "improve", or polish it. Your first version is final — even if it is imperfect or not to your taste. Perfecting it is explicitly NOT wanted here and only wastes effort.
+- Work in a SINGLE pass and then STOP: write your solution file ONCE, then stop immediately. Do NOT run it, do NOT test or inspect it, and do NOT rewrite, re-align, "improve", or polish it (sole exception: the \`git apply --check\` self-verify the DELIVERABLE CONTRACT requires). Your first version is final — even if it is imperfect or not to your taste. Perfecting it is explicitly NOT wanted here and only wastes effort.
 - Your text reply is discarded; ONLY the file(s) you save are kept. You MUST save your solution to a file (an empty workspace is a total failure) — but it does NOT need to be flawless or fully working.
 - Save all deliverable files to: ${ws}
 - Work only in that directory. Create it if needed.
+- NEVER delete or rewrite the workspace scratch files (\`_brief.txt\` and any \`_*.log\` / \`_*.txt\`): they are the run's provenance record, and a "tidied" workspace is indistinguishable from a spoofed run — it invalidates your deliverable (observed live: a worker cleaned them up alongside a good patch and was rejected).
 - To save a file, just write it. If a file-edit tool refuses because the file "must be read first" (a stale copy exists), do NOT spend turns reading/retrying — overwrite it directly with the shell instead, e.g. \`cat > FILE <<'EOF' ... EOF\`.
 - End with a 2 to 4 sentence note on your approach, plus any tradeoffs or known limitations (an honest note about what is rough or unfinished is useful, not a mark against you).`
 }
@@ -241,13 +338,35 @@ const codexJudgeTimeout = Number(A.codexJudgeTimeoutSecs) > 0 ? Math.floor(Numbe
 // grokMaxTurns (default = glm's 30) as the primary iteration cap + grokTimeout as the wall-clock backstop.
 const grokMaxTurns = Number(A.grokMaxTurns) > 0 ? Math.floor(Number(A.grokMaxTurns)) : glmMaxTurns
 const grokTimeout = Number(A.grokTimeoutSecs) > 0 ? Math.floor(Number(A.grokTimeoutSecs)) : 600
-const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
+// security-sweep L1 (2026-07-07): the per-attempt workspace lives under a predictable, world-writable
+// `/tmp/je-workspaces/<runId>` root (guessable), and `mkdir -p`/`cd` FOLLOW symlinks — so a local
+// co-tenant who pre-plants the guessed path as a symlink can redirect a worker's writes (and the
+// deliverable that later feeds the judged/applied pool) outside the workspace. Refuse a symlinked
+// workspace path before writing (mirrors the contextCatCmd `[ ! -L ]` guard added for issue #23).
+const cmdHead = (ws, b) => `[ -L ${q(ws)} ] && { echo "JE-WS-REFUSE ${q(ws)} is a symlink" >&2; exit 3; }; mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
+// DETACHED LAUNCH (2026-07-06, run-i glm post-mortem): the runner command is no longer executed
+// inside one long wrapper Bash call — a foreground tool call is CAPPED (~600s) below the runner
+// wall-clocks (glm 1200s), and a run_in_background task is reaped when the wrapper agent's turn
+// ends (the run-h impl-4 kill). Instead the wrapper runs a LAUNCHER that detaches the runner into
+// its own session (perl POSIX::setsid — macOS ships no setsid binary; perl is already a hard runner
+// dependency) and returns immediately; the runner SELF-SUPERVISES (its own wall-clock + stall
+// watchdogs guarantee exactly one terminal JOUST-RC line), and the wrapper POLLS the log for that
+// line in short bounded calls (the RUNVERBATIM protocol below). No wrapper ceiling ever bounds a
+// runner again; an abandoned runner still terminates itself.
+const detachLaunch = (env, runner, flag) =>
+  `{ ${env}nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' -- bash ${q(runner)} ${flag} </dev/null >/dev/null 2>&1 & } && echo JOUST-LAUNCHED`
 // envExtra (optional): extra `KEY=VAL ` env assignments prepended to the runner call (e.g. grok's JE_GROK_WEB=1).
-const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout, envExtra = '') => `${cmdHead(ws, b)} && ${envExtra}JE_MAX_TURNS=${maxTurns} JE_TIMEOUT_SECS=${timeout} bash ${q(runner)} ${flag}`
+const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout, envExtra = '') => `${cmdHead(ws, b)} && ${detachLaunch(`${envExtra}JE_MAX_TURNS=${maxTurns} JE_TIMEOUT_SECS=${timeout} `, runner, flag)}`
 // Codex reuses cmdHead + the runner but overrides the wall-clock with codexTimeout (no JE_MAX_TURNS:
 // codex has no turn cap, and codex-run.sh ignores it). The optional timeoutSecs arg lets a codex JUDGE
 // seat pass codexJudgeTimeout (its own, roomier wall-clock) without touching the attempt call site.
-const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${cmdHead(ws, b)} && JE_TIMEOUT_SECS=${timeoutSecs} bash ${q(runner)} ${flag}`
+// prep (optional): extra shell run INSIDE the workspace between the brief write and the launch (the
+// review-mode judge stages the pool file + a scratch git repo there). envExtra as in runnerCmd.
+const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout, prep = '', envExtra = '') => `${cmdHead(ws, b)} && ${prep}${detachLaunch(`${envExtra}JE_TIMEOUT_SECS=${timeoutSecs} `, runner, flag)}`
+// The poll step of the RUNVERBATIM protocol: one bounded until-loop call the wrapper repeats until
+// the runner's guaranteed terminal line lands. maxWaitSecs mirrors the runner wall-clock (+ retry
+// headroom) so the wrapper knows when polling has genuinely outlived the watchdogs.
+const pollCmd = (log) => `until grep -q '^JOUST-RC ' ${q(log)} 2>/dev/null; do sleep 10; done; echo JOUST-SETTLED`
 
 // Optional shared CONTEXT BUNDLE for known-input tasks (args.contextFiles = [paths/globs]).
 // Concatenate those files ONCE into a single file that every worker reads by path — instead of
@@ -260,6 +379,31 @@ const codexRunnerCmd = (runner, flag, ws, b, timeoutSecs = codexTimeout) => `${c
 // (2026-07-05): Sonnet 5's agentic reliability is worth the negligible cost delta on these small
 // steps, and persist specifically corrupted artifacts on haiku (issue #33; 9/9 audited runs).
 const HELPER_MODEL = 'sonnet'
+// Quorum close (run E): capability-gated on BOTH host timer APIs it needs — setTimeout AND a usable
+// clock. Neither is core-ECMAScript-guaranteed here: this sandbox deliberately makes Date.now() THROW
+// (resume-safety), so we PROBE by calling it, not by typeof. When either is missing, rounds block on
+// every seat exactly as before this feature (one log line, fail-safety unaffected). `quorumClose:false`
+// is the operator-reversible escape hatch, independent of capability.
+const HAS_TIMERS = typeof setTimeout === 'function'
+let HAS_CLOCK = false
+try { Date.now(); HAS_CLOCK = true } catch { /* sandbox clock disabled — quorum close stays inert */ }
+const QUORUM_ENABLED = HAS_TIMERS && HAS_CLOCK && A.quorumClose !== false
+const QUORUM_GRACE_SECS = Number(A.quorumGraceSecs) > 0 ? Number(A.quorumGraceSecs) : 90
+const QUORUM_POLL_MS = 5000
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+let quorumCapabilityWarned = false
+
+// Idempotent seat-record guard: a quorum-closed straggler is written to seatRcs synthetically when the
+// round closes, but its real promise may STILL resolve later and record the same seat again.
+// recordSeatOnce keys on `${label} ${phaseTitle}` and lets only the FIRST write per key win —
+// a no-op for every normal seat (each records its label+phase exactly once).
+const _seatRecorded = new Set()
+function recordSeatOnce(label, phaseTitle, rc, reason) {
+  const key = `${label} ${phaseTitle}`
+  if (_seatRecorded.has(key)) return
+  _seatRecorded.add(key)
+  recordSeat(label, phaseTitle, rc, reason)
+}
 const contextFiles = Array.isArray(A.contextFiles) ? A.contextFiles.filter(Boolean) : []
 const contextPath = contextFiles.length ? `${runDir}/_context/_context.md` : null
 // repoMode (Phase 1, worktree-per-attempt): gated OFF by default so the scratch-directory path is
@@ -280,12 +424,27 @@ const safeRunId = String(runDir || 'run').split('/').filter(Boolean).pop().repla
 function contextCatCmd(files) {
   return files.map(f => `printf '===== %s =====\\n' ${q(f)}; if [ ! -L ${q(f)} ] && [ -f ${q(f)} ]; then cat ${q(f)} 2>/dev/null || printf '(unreadable: %s)\\n' ${q(f)}; else printf '(skipped non-regular: %s)\\n' ${q(f)}; fi; echo`).join('; ')
 }
+// Gate baseline pin (run-i mechanical-gate post-mortem): capture the host repo's HEAD sha ONCE at
+// bundle time into a runDir file the mechanical gate reads directly (file-relayed, no model transit).
+// Non-repoMode tournaments still execute FROM a git checkout — the very tree the context bundle was
+// cut from — so this sha gives the gate a REAL apply-check baseline instead of an empty `git init`
+// repo (where a patch MODIFYING any existing file can never pass; that false-killed 11/12 implement
+// candidates in run-i and made run-h's two "clean" stamps a find-order coin-flip). Pinning at BUNDLE
+// time (not gate time) keeps the check honest when the checkout drifts mid-run (commits landed
+// during run-i's implement rounds). Fail-soft: no repo => empty file => the gate degrades to the
+// parse-only structure check.
+const gateBaseShaFile = `${runDir}/_context/base-sha`
 async function buildContext() {
-  if (!contextPath) return
+  const pin = `mkdir -p ${q(`${runDir}/_context`)} && { git rev-parse HEAD 2>/dev/null || printf ''; } > ${q(gateBaseShaFile)}`
+  if (!contextPath) {
+    await agentLadder(`Run this exact shell command in ONE Bash call; do not print or expose its output. Do nothing else:\n\n${pin}`,
+      { model: HELPER_MODEL, phase: 'Round 1', label: 'context' }).catch(() => null)
+    return
+  }
   const cat = contextCatCmd(contextFiles)
-  const cmd = `mkdir -p ${q(`${runDir}/_context`)} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
+  const cmd = `${pin} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
   log(`Bundling ${contextFiles.length} context file(s) → ${contextPath}`)
-  await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
+  await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
     { model: HELPER_MODEL, phase: 'Round 1', label: 'context' }).catch(() => null)
 }
 
@@ -332,6 +491,17 @@ const judgeWorkspaceRoot = `${workspaceRoot}/_judges`
 const judgeWs = (label) => `${judgeWorkspaceRoot}/${label}`
 let codexRunnerWarned = false // one-time (not per-seat/round) missing-runner warning
 const engineFiles = ['_brief.txt', '_glm_run.log', '_local_run.log', '_codex_run.log', '_codex_last.txt', '_minimax_run.log', '_grok_run.log']
+// Shared runner dispatch->(log file, provenance token) lookup — the single mapping the resume probe
+// reuses so a newly-added provider is registered ONCE (no drifting parallel ternary chain). Native
+// anthropic (no runner) has no log/token: dispatchRunner returns empty strings for it.
+const DISPATCH_RUNNERS = {
+  glm: { logf: '_glm_run.log', tok: 'GLM' },
+  local: { logf: '_local_run.log', tok: 'LOCAL' },
+  codex: { logf: '_codex_run.log', tok: 'CODEX' },
+  minimax: { logf: '_minimax_run.log', tok: 'MINIMAX' },
+  grok: { logf: '_grok_run.log', tok: 'GROK' },
+}
+const dispatchRunner = d => DISPATCH_RUNNERS[d] || { logf: '', tok: '' }
 const engineLogPath = (c, log) => {
   if (!repoMode || !log) return log ? `${c.ws}/${log}` : ''
   // Implement rounds carry an explicit roundName ('impl-3'/'impl-4'); plan rounds fall back to
@@ -357,7 +527,7 @@ async function buildWorktrees(roundName, list) {
   if (!baseSha) throw new Error('repoMode requires args.baseRef')
   const script = list.map(c => worktreeSetupShell(c, roundName)).join('\n')
   log(`Preparing ${list.length} git worktree(s) for ${roundName} from ${baseSha}`)
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It serially creates git worktrees for the tournament attempts; do not parallelize it and do not do anything else.\n\n${script}`,
     { model: HELPER_MODEL, phase: roundName === 'round-1' ? 'Round 1' : 'Round 2', label: `${roundName}-worktrees` }
   ).catch(() => null)
@@ -392,19 +562,128 @@ async function snapshotWorktrees(roundName, list) {
     ...list.map(c => snapshotShell(c, roundName)),
   ].join('\n')
   log(`Snapshotting ${list.length} worktree(s) for ${roundName}`)
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It serially snapshots each worktree into at most one fixed-identity commit; do not parallelize it and do not do anything else.\n\n${script}`,
     { model: HELPER_MODEL, phase: roundName === 'round-1' ? 'Review' : 'Final rank', label: `${roundName}-snapshot` }
   ).catch(() => null)
 }
 
 const RUNVERBATIM = (cmd, ws, log) =>
-  `This is an approved internal step of the joust-engine tournament: it writes a brief file and runs a bundled project runner script, which performs the attempt. Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${cmd}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
+  `Joust-engine tournament dispatch step (all paths are inside this run's scratch directory): it writes a brief file and LAUNCHES a bundled, self-supervising project runner script (its own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log), which performs the attempt. Follow this LAUNCH-AND-POLL protocol exactly; do not attempt the task yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; it detaches the runner and returns in seconds — expect it to print JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL until the runner finishes: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working; the runner's own watchdogs guarantee the line always arrives.\n\ncd ${q(ws)} && ${pollCmd(log)}\n\nSTEP 3 — report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
 
 // The bundled worker agents register under the plugin namespace (joust-engine:<name>);
 // accept either the bare or namespaced form from callers and normalize to what the
 // agent registry actually resolves.
 const nsAgent = t => (t && !t.includes(':')) ? `joust-engine:${t}` : t
+
+// ---- begin: model ladder ------------------------------------------------------------------------
+// Model fallback ladder (operator-requested resilience, 2026-07-06). The orchestrating session may
+// run on a model (Fable) whose safety sensitivity can block a sub-agent call outright or downgrade
+// it; a blocked NATIVE anthropic seat must degrade ONE rung down this ladder instead of dying.
+// PURE (extract-and-eval'able like the return-codes block): no closures over module state, no I/O.
+// haiku is RETIRED by operator policy (no haiku sub-agents until a Haiku 5.x base ships), so sonnet
+// is the hard FLOOR: nextModelDown('sonnet') === null, and unknown ids (incl. 'haiku') -> null.
+const MODEL_LADDER = ['fable', 'opus', 'sonnet']
+function nextModelDown(model) {
+  const i = MODEL_LADDER.indexOf(String(model == null ? '' : model).trim().toLowerCase())
+  if (i < 0) return null                 // unknown / haiku (retired): no rung below
+  return MODEL_LADDER[i + 1] || null     // sonnet -> null: NEVER below sonnet
+}
+// ---- end: model ladder --------------------------------------------------------------------------
+
+// ---- begin: agent ladder wrapper (impure; the ONE downgrade-retry chokepoint) --------------------
+// Downgrade bookkeeping: one entry per successful ladder rescue. Surfaced in the workflow return
+// value as `model_downgrades` (observability only — it never gates dispatch/judging/any return).
+const modelDowngrades = [] // { label, phase, from, to }
+// ---- Seat-model audit (Q1, 2026-07-07): "did every judge seat run as the model the config
+// intended?" — run-h's security-x seat silently ran as opus (fallback) and nothing surfaced it at
+// summary level. Every LIVING lens verdict records intended vs actual here; rcSummaryLive attaches
+// the list as `judge_seats` so mapping.json / the result make silent-fallback councils auditable.
+// security-sweep M15 (2026-07-07): audit against the EXACT configured effort, not just the family.
+// The old `actual.startsWith('codex-')` marked a codex-xhigh seat that actually ran codex-LOW as
+// healthy — a judge-strength DOWNGRADE was hidden. CODEX_JUDGE_EFFORT is the single resolved effort
+// (same resolution askLensCodex uses to tag judgeModel), so intended = `codex-${CODEX_JUDGE_EFFORT}`
+// and an exact compare flags any effort drift while never false-positiving on the effort default.
+const CODEX_JUDGE_EFFORT = /^(low|medium|high|xhigh)$/.test(String(A.codexJudgeEffort || '')) ? String(A.codexJudgeEffort) : 'high'
+const seatModelAudit = [] // { seat, lens, phase, intended, actual, as_intended }
+function auditSeatModel(phaseTitle, label, lens, dispatchMode, verdict) {
+  if (!verdict) return verdict
+  const intended = dispatchMode === 'codex' ? `codex-${CODEX_JUDGE_EFFORT}` : 'opus'
+  const actual = String(verdict.judgeModel || 'opus')
+  const as_intended = actual === intended
+  seatModelAudit.push({ seat: label, lens: lens.key, phase: phaseTitle, intended, actual, as_intended })
+  if (!as_intended) log(`JE-SEAT-AUDIT [${phaseTitle}] ${label} (${lens.key}): ran as ${actual}, intended ${intended}`)
+  return verdict
+}
+// ---- Run N (S2, 2026-07-07): SPECULATIVE IMPLEMENT overlap — flag-gated, DEFAULT OFF ----------
+// The steelman shootout is the long pole between "tally leader known" and "winner crowned" (~30-50
+// min live). With args.speculativeImplement === true, the final-rank council fires a seed callback
+// the moment the shootout SEEDS its finalists: Implement Round 3 starts immediately, seeded with
+// the tally leader's PRE-STEELMAN brief (disclosed). If the shootout crowns the leader, the round
+// is adopted as-is; a FLIP discards it (awaited to completion, staging + workspaces wiped) and
+// re-runs Round 3 clean — flip cost = the wasted speculative round, wall-clock = baseline. The
+// seed-time path deliberately SKIPS dynamic-M (spend guard stays decided on the normal path only).
+const SPECULATIVE_IMPLEMENT = A.speculativeImplement === true
+let speculativeImpl = null   // { leader, ab?, promise } — set by the seed callback
+let onSteelmanSeeds = null   // registered ONLY before the plan final-rank judge call; cleared on fire
+
+// ---- Codex review-seat concurrency cap (S1, 2026-07-07): the judge-architecture experiment
+// measured 4-way concurrent `codex review` at ~4x single-seat latency (account-level backpressure,
+// cap ~2 useful lanes). Serialize LIVE codex judge processes through this semaphore — dispatch
+// only (readback/reformat are cheap and run outside the slot). while-loop re-check on wake so a
+// released slot claimed by a fresh arrival can never over-admit a waiter.
+const CODEX_JUDGE_MAX_CONCURRENT = Math.max(1, Number(A.codexJudgeConcurrency) || 2)
+let codexSlotActive = 0
+const codexSlotWaiters = []
+async function acquireCodexSlot() {
+  while (codexSlotActive >= CODEX_JUDGE_MAX_CONCURRENT) await new Promise(r => codexSlotWaiters.push(r))
+  codexSlotActive++
+}
+function releaseCodexSlot() {
+  codexSlotActive = Math.max(0, codexSlotActive - 1)
+  const w = codexSlotWaiters.shift()
+  if (w) w()
+}
+
+// agentLadder(prompt, opts, ladder) — agent() plus ONE downgrade-retry rung for NATIVE anthropic
+// seats. The SINGLE shared wrapper (no per-site copies). Contract:
+//   * opts.agentType (runner dispatch) passes straight through: command runners are exempt.
+//   * opts.model is REQUIRED otherwise — no engine sub-agent may inherit the session model.
+//   * a thrown/blocked attempt (throw OR null result) retries ONCE at nextModelDown(opts.model);
+//     rung success records {label, phase, from, to} in modelDowngrades + logs LOUDLY
+//     (JE-MODEL-DOWNGRADE) and sets ladder.used to the model that ACTUALLY answered (so council
+//     seats tag judge_model truthfully); a rung failure propagates the ORIGINAL outcome so every
+//     existing dead/fallback path stays byte-for-byte.
+//   * ladder.eligible === false disables the rung entirely: the security lenses (primary
+//     'security' AND the 'security-x' opus-fallback seat) stay opus minimum — a sonnet retry is
+//     FORBIDDEN for them (their failure keeps today's dead-judge path) — and a retry-loop site
+//     passes eligible only on its FINAL same-model try, so the rung slots AFTER the site's own
+//     retries and BEFORE its dead path (askLensNative: opus try, opus retry, THEN sonnet rung).
+//   * sonnet floor by construction: nextModelDown('sonnet') === null, so every sonnet-seated
+//     helper (persist/stage/etc.) keeps today's exact behaviour — no rung below sonnet.
+async function agentLadder(prompt, opts, ladder = {}) {
+  if (opts && opts.agentType) return agent(prompt, opts) // runner dispatch: exempt (command runners)
+  if (!opts || !opts.model) throw new Error('agentLadder: opts.model or opts.agentType is required — no engine sub-agent may inherit the session model')
+  const from = opts.model
+  ladder.used = from
+  const to = ladder.eligible === false ? null : nextModelDown(from)
+  let res, failure = null
+  try { res = await agent(prompt, opts) } catch (e) { failure = e }
+  if (!failure && res != null) return res
+  if (to == null) { if (failure) throw failure; return res } // no rung: today's outcome, unchanged
+  const label = opts.label || '?'
+  const phase = opts.phase || '?'
+  log(`JE-MODEL-DOWNGRADE [${phase}] ${label}: '${from}' seat ${failure ? `threw (${String(failure).slice(0, 120)})` : 'returned null (blocked/empty)'} — retrying ONCE at '${to}' (model fallback ladder; floor=sonnet, haiku retired).`)
+  let res2
+  try { res2 = await agent(prompt, { ...opts, model: to }) }
+  catch (e2) { if (failure) throw failure; throw e2 } // rung also failed: surface the ORIGINAL class
+  if (res2 == null) { if (failure) throw failure; return res2 }
+  ladder.used = to
+  modelDowngrades.push({ label, phase, from, to })
+  log(`JE-MODEL-DOWNGRADE [${phase}] ${label}: '${to}' rung answered — downgrade recorded (${from} -> ${to}); verdict metadata carries the ACTUAL model.`)
+  return res2
+}
+// ---- end: agent ladder wrapper -------------------------------------------------------------------
 
 // ---- dispatch-failure classification (#45) -------------------------------
 // A worker attempt fails in two very different ways: (a) the model RAN but produced a
@@ -482,10 +761,389 @@ function buildRcSummary(seatRcs) {
   }
   return { seats, by_code, non00 }
 }
+// Codex judge VERDICT read-back failure classification (fold-in A, run E). STRUCTURAL, not
+// message-sniffing: a 'dispatch'-stage failure means the codex runner never produced a verdict at all
+// (never ran / not registered / genuine throttle) -> RC 02 (unavailable, unchanged meaning). A
+// 'readback'-stage failure means the dispatch agent() call ALREADY succeeded and something AFTER that
+// was bad — sha-verified relay corruption, non-JSON, wrong shape, or a failed integrity check — which
+// is the same class RC 04 already covers for every other seat. Only the class was wrong before.
+function classifyCodexJudgeFailure(stage, detail) {
+  const base = stage === 'readback'
+    ? { rc: RC.INVALID, reason: 'codex-verdict-readback-failed' }
+    : { rc: RC.UNAVAIL, reason: 'codex-seat-unavailable' }
+  // Optional bounded detail (run-j2: two runoff seats fell back with only the class recorded —
+  // the ACTUAL guard/reformat error was narrator-only and unrecoverable post-run). Additive;
+  // omitted when absent so the classic two-field shape (and its deepEqual pins) is unchanged.
+  return detail ? { ...base, detail: String(detail).slice(0, 140) } : base
+}
 // ---- end: return codes ------------------------------------------------------------------------
+
+// ---- begin: quorum close ------------------------------------------------------------------------
+// Pure decision logic for engine-side N-1 quorum close (run E item 4). The async orchestration that
+// calls these (parallelQuorum) is impure and exercised by system testing; only the arithmetic here,
+// where an off-by-one or a missed fail-closed check would matter, is unit tested.
+
+// A seat's total "must-still-be-alive" budget in seconds: 2x its per-try wall clock (one original try
+// + the runner's own one built-in stall/timeout retry, see bin/_je-run-lib.sh) plus a grace buffer.
+// timeoutSecs == null (a seat with NO engine-known wall clock — every native Anthropic attempt/judge)
+// returns null: NEVER eligible, by construction. NOTE: the 2x factor is tied to the runner's
+// retry-once policy — if that policy changes, revisit this together with bin/_je-run-lib.sh.
+function quorumDeadlineSecs(timeoutSecs, graceSecs) {
+  if (timeoutSecs == null || !(timeoutSecs > 0)) return null
+  return 2 * timeoutSecs + (graceSecs > 0 ? graceSecs : 0)
+}
+
+// Should the round close now, leaving exactly `straggler` behind? Fail-closed on every axis: requires
+// >=2 seats, EXACTLY one unsettled, never a security-gate seat (neverClose), never a no-deadline seat,
+// and only once elapsed is STRICTLY past the deadline.
+function shouldQuorumClose({ settledCount, totalCount, straggler }) {
+  if (totalCount < 2) return false
+  if (settledCount !== totalCount - 1) return false
+  if (!straggler || straggler.neverClose) return false
+  const deadline = quorumDeadlineSecs(straggler.timeoutSecs, straggler.graceSecs)
+  if (deadline == null) return false
+  return (straggler.elapsedSecs || 0) > deadline
+}
+// ---- end: quorum close --------------------------------------------------------------------------
+
+// parallelQuorum(entries, thunkFor, phaseTitle, opts): drop-in for
+// `parallel(entries.map((e, i) => () => thunkFor(e, i)))` that additionally allows the round to close
+// when all but one seat have returned and that seat has blown its budget (shouldQuorumClose). It NEVER
+// forks a competing scheduler: the same thunks go to the real parallel() (individually instrumented for
+// start/settle time), and this only RACES that call's resolution against a side-channel poll. Returns
+// the SAME array shape (aligned to entries; a quorum-closed straggler's slot is null, like dispatch()'s
+// own dropped-seat null, so every existing .filter(Boolean) call site is unaffected).
+// opts: { timeoutSecsFor(entry)->number|null, neverClose(entry)->boolean, seatLabelFor(entry)->string,
+//         graceSecs (default QUORUM_GRACE_SECS) }
+async function parallelQuorum(entries, thunkFor, phaseTitle, opts) {
+  const { timeoutSecsFor, neverClose = () => false, seatLabelFor = (e) => String((e && (e.label || e.key)) || '?'), graceSecs = QUORUM_GRACE_SECS } = opts
+  if (!QUORUM_ENABLED || entries.length < 2) {
+    if (!(HAS_TIMERS && HAS_CLOCK) && !quorumCapabilityWarned) {
+      log('JE-QUORUM-DISABLED: this runtime lacks setTimeout and/or a usable clock — rounds block on every seat exactly as before this feature; fail-safety is unaffected.')
+      quorumCapabilityWarned = true
+    }
+    return parallel(entries.map((e, i) => () => thunkFor(e, i)))
+  }
+  const state = entries.map((e, i) => ({
+    index: i, settled: false, startedAt: null, result: null,
+    timeoutSecs: timeoutSecsFor(e), neverClose: !!neverClose(e), graceSecs, label: seatLabelFor(e),
+  }))
+  const thunks = state.map((st, i) => () => {
+    st.startedAt = Date.now()
+    return Promise.resolve(thunkFor(entries[i], i))
+      .then((r) => { st.settled = true; st.result = r; return r })
+      .catch(() => { st.settled = true; st.result = null; return null }) // dispatch()/askLens() never throw; belt-and-suspenders
+  })
+  const allPromise = parallel(thunks)
+  for (;;) {
+    const unsettled = state.filter((s) => !s.settled)
+    if (!unsettled.length) return await allPromise
+    if (unsettled.length === 1) {
+      const s = unsettled[0]
+      const elapsedSecs = s.startedAt ? (Date.now() - s.startedAt) / 1000 : 0
+      if (shouldQuorumClose({ settledCount: state.length - 1, totalCount: state.length, straggler: { ...s, elapsedSecs } })) {
+        const deadline = quorumDeadlineSecs(s.timeoutSecs, s.graceSecs)
+        recordSeatOnce(s.label, phaseTitle, RC.TIMEOUT, `quorum-close: exceeded ${deadline}s (2x timeout + ${s.graceSecs}s grace) with the round otherwise complete`)
+        log(`JE-QUORUM-CLOSE [${phaseTitle}]: ${state.length - 1}/${state.length} seats returned — '${s.label}' exceeded ${deadline}s; closing the round without it. Its process is NOT killed by this decision (the engine has no handle into a sub-agent's subprocess) and may keep running until the runner's own watchdog/timeout ends it.`)
+        s.settled = true; s.result = null
+        allPromise.catch(() => {}) // the abandoned background wait must never surface an unhandled rejection
+        return state.map((x) => x.result)
+      }
+    }
+    await sleepMs(QUORUM_POLL_MS)
+  }
+}
+
+// attempt/lens -> engine-known per-try timeout (null = no engine-known wall clock => never
+// quorum-closable). Function declarations: they reference module consts defined later in the file
+// (glmTimeoutSecs, codexJudgeTimeout, chooseJudgeDispatch, ...) but are only CALLED at await time,
+// long after module evaluation.
+function attemptTimeoutSecsFor(a) {
+  switch (a.dispatch) {
+    case 'glm': return glmTimeoutSecs
+    case 'local': return attemptTimeout
+    case 'codex': return codexTimeout
+    case 'minimax': return minimaxTimeoutSecs
+    case 'grok': return grokTimeout
+    default: return null // native anthropic: agent() exposes no timeout primitive
+  }
+}
+function lensTimeoutSecsFor(lens) {
+  return (chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner) === 'codex') ? codexJudgeTimeout : null
+}
+
+// ---- begin: mechanical patch gate ------------------------------------------------------------
+// Deterministic pre-council classification of a staged implement candidate's deliverable (run F).
+// PURE — extract-and-eval'able like the return-codes block. The IMPURE runner (mechanicalPatchGate)
+// composes these onto one HELPER_MODEL shell step. Classes: clean_patch | corrupt_patch |
+// full_files | empty | unavailable. ONLY corrupt_patch invalidates (a corrupt patch cannot win a
+// code round; full files are a legitimate deliverable under the loose contract; a gate the engine
+// could not run must never shrink the field).
+const MECH_CLASSES = new Set(['clean_patch', 'corrupt_patch', 'full_files', 'empty', 'unavailable'])
+
+// Blindness hardening: strip path-shaped text (a scratch/workspace path could hint at dispatch),
+// collapse newlines, cap length. Never throws, never returns empty.
+function sanitizeMechDetail(raw) {
+  const s = String(raw == null ? '' : raw)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\/[^\s'"()<>]+/g, '<path>')
+    .trim()
+    .slice(0, 160)
+  return s || 'no further detail'
+}
+
+// class (+detail) -> the exact judge-visible stamp line. detail: 'recount' | 'structure' for
+// clean_patch nuance; the sanitized first git error line for corrupt_patch.
+function mechanicalStampFor(cls, detail) {
+  switch (cls) {
+    case 'clean_patch':
+      if (detail === 'structure') return 'MECHANICAL: patch is well-formed (structure-only; no snapshot to context-check)'
+      if (detail === 'recount') return 'MECHANICAL: patch applies cleanly (--recount)'
+      return 'MECHANICAL: patch applies cleanly'
+    case 'corrupt_patch': return `MECHANICAL: git apply --check FAILED: ${sanitizeMechDetail(detail)}`
+    case 'full_files': return 'MECHANICAL: no patch found (full-files deliverable)'
+    case 'empty': return 'MECHANICAL: no deliverable'
+    default: return 'MECHANICAL: check unavailable'
+  }
+}
+const isMechanicalInvalid = (cls) => cls === 'corrupt_patch'
+
+// Merge parsed script results onto the staged list (the routing decision lives HERE, in pure code).
+// byBlind = { <letter>: { class, detail } }; missing/unknown/null => 'unavailable' — a candidate the
+// gate could not classify is NEVER invalidated (fail-safe), and an upstream-invalid candidate is
+// never revalidated or reclassified into contention.
+function mergeMechanical(staged, byBlind) {
+  return staged.map(c => {
+    const r = byBlind && byBlind[c.blind]
+    const cls = r && MECH_CLASSES.has(r.class) ? r.class : 'unavailable'
+    const stamp = mechanicalStampFor(cls, r && r.detail)
+    if (!c.valid) return { ...c, mechanical: { class: cls, stamp } }
+    if (isMechanicalInvalid(cls)) {
+      return { ...c, valid: false, failReason: `mechanical: patch does not apply (${sanitizeMechDetail(r && r.detail)})`, mechanical: { class: cls, stamp } }
+    }
+    return { ...c, mechanical: { class: cls, stamp } }
+  })
+}
+// ---- end: mechanical patch gate --------------------------------------------------------------
+
+// ---- begin: deliverable contract gate ----------------------------------------------------------
+// Deterministic LAYOUT-conformance classification of a staged implement candidate (run G) —
+// ORTHOGONAL to the mechanical patch gate above: MECHANICAL answers "does a found patch apply?",
+// CONTRACT answers "did the candidate use the ONE mandated deliverable layout?" (patches/ +
+// APPLY.md + VERIFY.md, or the files/ + APPLY.md full-files fallback). The axes cross freely — a
+// clean_patch can sit in a freeform layout, and a full_files deliverable can conform via files/.
+// A PARALLEL `CONTRACT:` stamp was chosen over extending the MECHANICAL: vocabulary because
+// fusing two independent axes into one grammar would need a class cross-product and would edit
+// the shipped, tested run-F gate; this block is purely additive (run F stays byte-identical).
+// v1 grandfathers: a non-conforming (freeform) layout is stamped, NEVER invalidated. Every stamp
+// is a FIXED literal (no interpolated detail), so — unlike corrupt_patch — no sanitizer is needed
+// and blindness holds structurally. Classes: patch_layout | files_layout | engine_diff | freeform
+// | unavailable ('unavailable' is bookkeeping-only: see contractStampFor).
+const CONTRACT_CLASSES = new Set(['patch_layout', 'files_layout', 'engine_diff', 'freeform', 'unavailable'])
+
+// class -> the exact judge-visible stamp line. 'unavailable' is deliberately NEVER pooled: the
+// run-G fail-safe degrades to UNSTAMPED — contractStampShell emits nothing without a grammar-
+// clean contract.txt — so gate-infra noise never becomes a judge-visible signal (contrast
+// MECH_FALLBACK, which always stamps). The freeform literal carries the anti-relitigation nudge
+// so a judge cannot see the non-conforming flag without also seeing it must not gate the rank.
+function contractStampFor(cls) {
+  switch (cls) {
+    case 'patch_layout': return 'CONTRACT: conforming (patch layout: patches/ + APPLY.md + VERIFY.md)'
+    case 'files_layout': return 'CONTRACT: conforming (full-files fallback: files/ + APPLY.md)'
+    case 'engine_diff': return 'CONTRACT: conforming (engine-generated diff; repoMode)'
+    case 'freeform': return 'CONTRACT: non-conforming layout (grandfathered v1; judge code quality, not packaging)'
+    default: return 'CONTRACT: check unavailable'
+  }
+}
+
+// Merge parsed JCON tokens onto the staged list. PURELY ADDITIVE — attaches c.contract and NEVER
+// touches valid/failReason in either direction (v1 grandfathering is structural: there is no
+// invalidation branch to flip by accident). repoModeFlag is an explicit PARAMETER (not a closure
+// over the module-level const) so this block stays extract-and-eval testable; repoMode candidates
+// are engine-generated worktree diffs — trivially conformant — so their class is forced to
+// engine_diff in pure code here, immune to helper death/garbling. Missing/unknown => 'unavailable'
+// (fail-safe: an unclassifiable candidate is never penalized, merely left unstamped in the pool).
+function mergeContract(staged, byBlind, repoModeFlag) {
+  return staged.map(c => {
+    if (repoModeFlag) return { ...c, contract: { class: 'engine_diff', stamp: contractStampFor('engine_diff') } }
+    const r = byBlind && byBlind[c.blind]
+    const cls = r && CONTRACT_CLASSES.has(r.contract) ? r.contract : 'unavailable'
+    return { ...c, contract: { class: cls, stamp: contractStampFor(cls) } }
+  })
+}
+// ---- end: deliverable contract gate ------------------------------------------------------------
+
+// ---- begin: ab briefs --------------------------------------------------------------------------
+// PURE: alternate two design-brief seed paths across the implementer pool. Even index -> brief-1
+// (the final-rank winner), odd -> brief-2 (the runner-up finalist). Anything but exactly two paths
+// returns the pool unchanged (fail-safe: never partially seeded).
+function assignAbSeeds(attempts, seedPaths) {
+  if (!Array.isArray(seedPaths) || seedPaths.length !== 2 || !seedPaths[0] || !seedPaths[1]) return attempts.map(a => ({ ...a }))
+  return attempts.map((a, i) => ({ ...a, seedPlanPath: seedPaths[i % 2], seedBrief: i % 2 === 0 ? 'brief-1' : 'brief-2' }))
+}
+// ---- end: ab briefs ----------------------------------------------------------------------------
+
+// ---- begin: evidence verification ---------------------------------------------------------------
+// G2 evidence-verification pass (INVESTIGATE→COMPOSITE v1) — PURE, extract-and-eval'able like the
+// mechanical/contract gates. The IMPURE runner (evidenceVerificationPass) composes these onto one
+// HELPER_MODEL shell step AFTER staging: extract each valid candidate's cited file paths from its
+// FINDINGS deliverable, grep-check they exist in the snapshot/context, and stamp
+// `EVIDENCE: n cited, m verified` into the pool. FAIL-SAFE end to end: an unverifiable citation is
+// counted-but-unverified (stamp only), a garbled/dead helper degrades to UNSTAMPED, and nothing
+// here ever invalidates a candidate or touches valid/failReason (contrast corrupt_patch).
+//
+// Citation grammar (the contract both extractors implement): a path-shaped token — one or more
+// directory segments then a dotted filename (optionally absolute), with an optional :line suffix —
+// preceded by start-of-text or a separator (whitespace/quote/backtick/paren/bracket), so URL
+// interiors (https://host/a/b.js — every path-ish substring is preceded by ':' '/' or '.') and
+// mid-word fragments never match. Bare slashless filenames (package.json) deliberately do NOT
+// count: requiring a directory segment is what keeps prose mentions from inflating `n cited`.
+// CITE_GREP is the POSIX-ERE twin of parseCitations' JS regex; the two MUST stay in sync (the
+// extract-and-eval suite pins parseCitations; the structural suite pins CITE_GREP into the shell).
+const CITE_GREP = `(^|[[:space:]"'\`(\\[])\\/?([A-Za-z0-9._-]+\\/)+[A-Za-z0-9._-]+\\.[A-Za-z0-9_]+(:[0-9]+)?`
+// Shell post-processing for `grep -ohE CITE_GREP` output: strip the one leading separator char the
+// alternation may have captured, then the :line suffix — leaving one bare path per line (sort -u
+// then counts DISTINCT cited paths, the same dedupe parseCitations applies).
+const CITE_SED = `s/^[[:space:]"'\`(\\[]//; s/:[0-9]+$//`
+
+// parseCitations(text) -> [{ path, line }] — the marked-block citation parser. Dedupes by PATH
+// (first-seen line number kept), so its length is exactly the runner's `n cited`. Never throws.
+function parseCitations(text) {
+  const re = /(?:^|[\s"'`(\[])(\/?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.[A-Za-z0-9_]+)(?::(\d+))?/g
+  const out = []
+  const seen = new Set()
+  const s = String(text == null ? '' : text)
+  let m
+  while ((m = re.exec(s))) {
+    const path = m[1]
+    if (seen.has(path)) continue
+    seen.add(path)
+    out.push({ path, line: m[2] ? Number(m[2]) : null })
+  }
+  return out
+}
+
+// counts -> the exact judge/composer-visible stamp line (closed grammar; letters only — no
+// candidate text, no paths, no model identity ever enters the stamp).
+const EVIDENCE_GRAMMAR = '^EVIDENCE: [0-9]+ cited, [0-9]+ verified$'
+function evidenceStampFor(cited, verified) {
+  const n = Number.isInteger(cited) && cited >= 0 ? cited : 0
+  const m = Math.min(Number.isInteger(verified) && verified >= 0 ? verified : 0, n)
+  return `EVIDENCE: ${n} cited, ${m} verified`
+}
+
+// Merge parsed JEVID counts onto the staged list. PURELY ADDITIVE — attaches c.evidence and NEVER
+// touches valid/failReason in either direction (fail-safe by construction: there is no
+// invalidation branch). Missing/garbled/non-numeric => NO evidence attached (degrade to unstamped,
+// the contract-gate discipline: helper noise never reads as a candidate signal).
+function mergeEvidence(staged, byBlind) {
+  return staged.map(c => {
+    const r = byBlind && byBlind[c.blind]
+    const cited = r == null ? NaN : Number(r.cited)
+    const verified = r == null ? NaN : Number(r.verified)
+    if (!Number.isInteger(cited) || cited < 0 || !Number.isInteger(verified) || verified < 0) return { ...c }
+    const m = Math.min(verified, cited)
+    return { ...c, evidence: { cited, verified: m, stamp: evidenceStampFor(cited, m) } }
+  })
+}
+// ---- end: evidence verification -----------------------------------------------------------------
+// ---- begin: identical-candidate dedup (issue #36) ---------------------------------------------
+// PURE — extract-and-eval'able like the return-codes / quorum blocks (no closures over module
+// state, no I/O). Byte-identical implement deliverables collapse to ONE pooled candidate BEFORE the
+// council convenes, so duplicates never split the vote or waste judge attention. The identity hash
+// is computed once in mechanicalPatchGate's helper shell over each candidate's PRE-STAMP deliverable
+// bytes (the same file-set the pool rebuild concatenates) and relayed as one token; the grouping,
+// contention predicate, and stamp text are decided HERE, in code.
+
+// Attach an additive `collapse` field {rep, group:[letters]} to every VALID member of a >=2-member
+// equal-hash group. rep = the LOWEST blind letter in the group (the codebase's existing letter
+// tie-break precedent) — no candidate is ever re-lettered. valid/failReason are NEVER touched.
+// hashByBlind: { <letter>: <non-empty hash string> } (a missing/empty hash => never collapses).
+function groupIdenticalCandidates(staged, hashByBlind) {
+  const byHash = new Map() // hash -> [letters] (valid candidates with a usable hash, first-seen order)
+  for (const c of (staged || [])) {
+    if (!c || !c.valid) continue
+    const h = hashByBlind && hashByBlind[c.blind]
+    if (!h || typeof h !== 'string') continue // fail-safe: no usable hash => singleton, never collapses
+    if (!byHash.has(h)) byHash.set(h, [])
+    byHash.get(h).push(c.blind)
+  }
+  const infoByBlind = {} // letter -> {rep, group} (only for members of a >=2 group)
+  for (const letters of byHash.values()) {
+    if (letters.length < 2) continue // singleton: nothing to merge, no collapse field
+    const group = [...letters].sort() // deterministic; group[0] = lowest letter = representative
+    const rep = group[0]
+    for (const l of letters) infoByBlind[l] = { rep, group }
+  }
+  return (staged || []).map(c => {
+    const info = c && c.valid ? infoByBlind[c.blind] : null
+    return info ? { ...c, collapse: { rep: info.rep, group: info.group } } : c
+  })
+}
+
+// The dedup contention predicate — the ONLY new judging gate. A VALID candidate is in contention
+// unless it is a NON-representative duplicate (collapsed into another letter). A collapsed non-rep
+// stays valid:true but drops out of the pool/council/tally EXACTLY as an invalid candidate already
+// does (it simply never appears in the valid-list), so no tally/veto/no_consensus branch changes.
+function inContention(c) {
+  return !!(c && c.valid) && !(c.collapse && c.collapse.rep !== c.blind)
+}
+
+// The judge-visible convergence stamp line for a representative that absorbed >=1 duplicate, or null
+// (singleton / non-rep => no stamp). Letters + a COUNT only — no hash, path, or model text — so
+// blindness holds structurally. That convergence is itself evidence of the brief's determinism.
+function convergenceLineFor(c) {
+  if (!c || !c.collapse || c.collapse.rep !== c.blind) return null
+  const group = Array.isArray(c.collapse.group) ? c.collapse.group : []
+  if (group.length < 2) return null
+  return `CONVERGENCE: ${group.length} implementers produced this identical artifact (candidates ${group.join(', ')}); that convergence is evidence of the brief's determinism`
+}
+// ---- end: identical-candidate dedup -----------------------------------------------------------
+
+// ---- begin: dynamic M (issue #36) -------------------------------------------------------------
+// PURE seat-trimming + evidence parsing (extract-and-eval'able). When prior SAME-TASK runs show the
+// winning brief converges deterministically (identical implement candidates collapse), the engine
+// MAY seat fewer implementers. Fail-open, reduce-only, floored: any missing/thin/malformed evidence
+// returns the seat list UNCHANGED, and a trim never drops below M_FLOOR. Cross-run evidence comes
+// from bin/je-ledger.mjs (read impurely by the caller); this block only DECIDES.
+const DYNAMIC_M = {
+  MIN_SAMPLES: 5,       // the ledger's own n>=5 hypothesis bar — never act on thinner evidence
+  CONVERGE_RATIO: 0.50, // same-bucket convergence ratio at/above which a trim may fire
+  M_FLOOR: 2,           // never seat fewer than this — a real contest still needs >=2 implementers
+}
+// Parse the ledger runner's one-line convergence readout for a task bucket. Returns
+// { samples, convergenceRatio } or null (no/garbled line => fail-open no-op upstream).
+function parseConvergenceEvidence(text) {
+  const m = /JE-LEDGER-CONVERGENCE\s+samples=(\d+)\s+ratio=([0-9]*\.?[0-9]+)/.exec(String(text == null ? '' : text))
+  if (!m) return null
+  const samples = parseInt(m[1], 10)
+  const convergenceRatio = parseFloat(m[2])
+  if (!Number.isFinite(samples) || !Number.isFinite(convergenceRatio)) return null
+  return { samples, convergenceRatio }
+}
+// Decide the (possibly shorter) implement-seat list. `seats` is returned UNCHANGED (same reference)
+// unless the same-bucket evidence clears BOTH the sample floor and the convergence threshold, in
+// which case exactly one seat is shed (reduce-only ratchet), never below M_FLOOR. The result is
+// always a prefix slice (stable seat identities), never reordered or grown.
+function trimSeatsForConvergence(seats, evidence, opts = DYNAMIC_M) {
+  if (!Array.isArray(seats) || seats.length <= opts.M_FLOOR) return seats
+  if (!evidence || typeof evidence !== 'object') return seats
+  const n = Number(evidence.samples)
+  const ratio = Number(evidence.convergenceRatio)
+  if (!Number.isFinite(n) || n < opts.MIN_SAMPLES) return seats           // sample-size floor
+  if (!Number.isFinite(ratio) || ratio < opts.CONVERGE_RATIO) return seats // below trim threshold
+  const target = Math.max(opts.M_FLOOR, seats.length - 1)                  // shed at most one seat
+  return target >= seats.length ? seats : seats.slice(0, target)
+}
+// ---- end: dynamic M ---------------------------------------------------------------------------
 // Snapshot of the accumulator at each terminal site (return value, mapping.json, SUMMARY.md). Computed
 // fresh at every call so the summary reflects all seats observed so far (including auto-issue outcomes).
-const rcSummaryLive = () => buildRcSummary(seatRcs)
+const rcSummaryLive = () => {
+  const s = buildRcSummary(seatRcs)
+  // Q1 seat-model audit: attach intended-vs-actual per living judge seat (additive; absent until
+  // the first council point, so pure-attempt phases keep the exact legacy shape).
+  return seatModelAudit.length ? { ...s, judge_seats: seatModelAudit.slice() } : s
+}
 // Auto-issue args (spec §3, default-ON for engine-fault classes; fail-closed + fire-and-forget):
 //   noAutoIssue:true  -> skip filing entirely
 //   issueRunner       -> absolute path to bin/je-issue.sh (absent => skip, logged once)
@@ -548,7 +1206,12 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
   // phaseKind selects the framing: 'plan' (Rounds 1–2, produce a PLAN artifact) or 'implement'
   // (Rounds 3–4, apply the change, seeded with the winning plan verbatim via seedPlanPath).
   const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance, contextPath, phaseKind, seedPlanPath)
-  const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle }
+  // model: HELPER_MODEL is set even for agentType (runner-wrapper) dispatches: an explicit model
+  // OVERRIDES the agent definition's frontmatter, and the harness does NOT reliably honour that
+  // frontmatter for workflow agentType calls (observed live: 28 codex-dispatch wrappers ran on
+  // HAIKU despite `model: sonnet` frontmatter — operator policy is sonnet MINIMUM for all engine
+  // work; haiku's base predates strong agentic training). Native branches overwrite with a.model.
+  const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle, model: HELPER_MODEL }
   let prompt
   if (a.dispatch === 'glm') {
     opts.agentType = nsAgent(a.agentType)
@@ -592,7 +1255,9 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
     opts.model = a.model
     prompt = b
   }
-  return agent(prompt, opts)
+  // agentLadder: runner dispatches (opts.agentType) pass straight through; a NATIVE anthropic
+  // attempt that is blocked (throw/null) gets ONE downgrade-retry rung (model fallback ladder).
+  return agentLadder(prompt, opts)
     .then(res => ({ label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws, res }))
     .catch(e => {
       const msg = String(e)
@@ -744,7 +1409,10 @@ const ENRICHMENT_GRAMMAR = '^automated_checks: enrichment_ok=[01] checks_ok=[01]
 function provCheckShell(log, tok, lp, carriedOver) {
   if (!log) return `P=1`              // native Anthropic: no provenance log, unchanged
   if (carriedOver) return `P=1`       // already validated in round 1; do NOT re-grep the stripped dir
-  return `if [ -f ${lp} ]; then if grep -q '^JOUST-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^JOUST-${tok}-DONE exit=0' ${lp} && ! grep -q '^JOUST-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
+  // KILLED added to the reject set (run E, belt-and-suspenders): only finish() ever writes it, on a
+  // genuine watchdog/external kill — never on a log that ends in success (the interim -RETRY word is
+  // non-terminal and deliberately NOT matched here, so a try that succeeds after a retry still passes).
+  return `if [ -f ${lp} ]; then if grep -q '^JOUST-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^JOUST-${tok}-DONE exit=0' ${lp} && ! grep -q '^JOUST-${tok}-\\(TIMEOUT\\|ERROR\\|KILLED\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
 }
 
 // Persist-verification schema: the write-agent reports, per FINAL target path, the byte count
@@ -773,6 +1441,360 @@ const PERSIST_SCHEMA = {
 //  - concatenate the valid deliverables into ONE blind-labelled pool file the judge reads once (read-cost).
 // The agent returns per-candidate {deliverable, provenance} via a SCHEMA (not scraped prose) (#4), and we
 // FAIL CLOSED (#1): any candidate missing from the return, or not deliverable+provenance, is invalid.
+// Mechanical patch gate stamp plumbing (run F). MECHANICAL/JMECH are provider-neutral literals —
+// like JOUST-, they are deliberately NOT rebrand tokens and stay byte-identical in the dev copy.
+const MECH_FALLBACK = 'MECHANICAL: check unavailable\n'
+const MECH_GRAMMAR = '^MECHANICAL: (patch applies cleanly.*|patch is well-formed .*|git apply --check FAILED:.*|no patch found .*|no deliverable|check unavailable)$'
+// Shell snippet: emit the pooled "--- Mechanical check ---" block for one candidate dir, grammar-
+// guarded. Shared by mechanicalPatchGate's pool rebuild AND enrichBlindPool's rebuild loop, so the
+// two pool writers can never drift.
+function mechStampShell(dest) {
+  const f = `${dest}/mechanical.txt`
+  return `printf '\\n--- Mechanical check ---\\n'; if grep -Eq ${q(MECH_GRAMMAR)} ${q(f)} 2>/dev/null; then cat ${q(f)}; else printf '%s' ${q(MECH_FALLBACK)}; fi`
+}
+// Run G contract-stamp plumbing. CONTRACT/JCON are provider-neutral literals — like MECHANICAL/
+// JMECH they are deliberately NOT rebrand tokens and stay byte-identical in the dev copy.
+// There is NO CONTRACT fallback constant on purpose: the run-G fail-safe is DEGRADE TO UNSTAMPED —
+// a missing or grammar-violating contract.txt emits no "--- Contract check ---" block at all
+// (contrast MECH_FALLBACK, which always stamps), so a gate that could not run leaves the pool
+// exactly as it was pre-run-G and infra noise never reads as a candidate signal.
+const CONTRACT_GRAMMAR = '^CONTRACT: (conforming \\(.*\\)|non-conforming layout \\(.*\\))$'
+// Shell snippet: emit the pooled "--- Contract check ---" block for one candidate dir, grammar-
+// guarded. Shared by mechanicalPatchGate's pool rebuild AND enrichBlindPool's rebuild loop, so
+// the two pool writers can never drift (exactly mirrors mechStampShell).
+function contractStampShell(dest) {
+  const f = `${dest}/contract.txt`
+  return `if grep -Eq ${q(CONTRACT_GRAMMAR)} ${q(f)} 2>/dev/null; then printf '\\n--- Contract check ---\\n'; cat ${q(f)}; fi`
+}
+// Issue #36 convergence-stamp plumbing. CONVERGENCE is a provider-neutral literal — like MECHANICAL/
+// CONTRACT it is deliberately NOT a rebrand token and stays byte-identical in the dev copy. `line` is
+// the engine-computed stamp (convergenceLineFor — letters + a count only, blindness holds) for a
+// representative that absorbed duplicates; a null/empty line emits NOTHING (singleton / non-rep).
+// Shared by BOTH pool-rebuild writers (mechanicalPatchGate + enrichBlindPool) so they cannot drift,
+// mirroring mechStampShell/contractStampShell.
+function convergenceStampShell(line) {
+  if (!line) return ':' // no-op shell builtin — emits nothing for singletons / non-reps
+  return `printf '\\n--- Convergence check ---\\n%s\\n' ${q(line)}`
+}
+
+// R4 (2026-07-07): the pool-rebuild relay returns the script's final JPOOL line so the engine can
+// READ-BACK VERIFY the rebuilt pool against the set it judged into contention. Fail-safe only: a
+// corrupted relay can merely cause a spurious disarm (collapse off = pre-dedup behaviour).
+const POOL_VERIFY_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { raw: { type: 'string' } },
+  required: ['raw'],
+}
+const MECH_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        // `contract` (run G): the JCON layout-conformance token, folded into the SAME entry the
+        // way stageAndValidate folds JRC into JEV entries. OPTIONAL and never in `required`, so a
+        // helper that forgets the JCON lines degrades only the contract axis (=> 'unavailable',
+        // unstamped) and can never knock out the mechanical classification with it.
+        // `hash` (issue #36): the JHASH content-hash token over the pre-stamp deliverable bytes,
+        // folded into the SAME entry. OPTIONAL and never in `required`; a missing hash simply means
+        // that candidate never collapses (fail-safe singleton).
+        properties: { blind: { type: 'string' }, class: { type: 'string' }, detail: { type: 'string' }, contract: { type: 'string' }, hash: { type: 'string' } },
+        required: ['blind', 'class'],
+      },
+    },
+  },
+  required: ['results'],
+}
+
+// Pre-council mechanical gate (run F): classify each VALID staged implement candidate's deliverable
+// BEFORE the code council convenes — one HELPER_MODEL agent, one deterministic script, once per
+// round, never per judge (retires the 5-6x duplicated apply-checks the 9-run audit observed).
+// Run G: the SAME script/call also classifies deliverable-contract layout conformance (JCON lines
+// -> the deliverable-contract-gate block) — no second helper round-trip, no new agent step.
+// Snapshot-pinned: repoMode verifies against a DETACHED scratch worktree at baseSha; without a
+// snapshot it degrades to a structure-only well-formedness check in a throwaway `git init` repo
+// (catches the audited corrupt class: malformed/truncated diffs); no git/scratch => 'unavailable'.
+// Fail-safe end to end: any infra failure degrades to 'unavailable' and invalidates nothing.
+async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
+  const targets = staged.filter(c => c.valid)
+  if (!targets.length) return staged
+  const baseArg = repoMode && baseSha ? q(baseSha) : `''`
+  const perCandidate = targets.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `(` +
+      `dest=${q(dest)}; mech=${q(`${dest}/mechanical.txt`)}; base=${baseArg}; ` +
+      // Baseline fallback (run-i post-mortem): no repoMode baseSha => use the HEAD sha pinned at
+      // context-bundle time, so non-repo runs get a REAL apply baseline instead of an empty repo.
+      `[ -z "$base" ] && [ -s ${q(gateBaseShaFile)} ] && base=$(cat ${q(gateBaseShaFile)} 2>/dev/null); ` +
+      // ALL patches, sorted (0001, 0002, ...): run-i showed `head -n1` made a multi-patch
+      // deliverable's fate a find-order coin flip. candidate.diff (engine-generated, repoMode)
+      // stays a single -p0 diff.
+      `patches=''; p0=0; ` +
+      `if [ -s "$dest/candidate.diff" ]; then patches="$dest/candidate.diff"; p0=1; ` +
+      `else patches=$(find "$dest" -maxdepth 3 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) 2>/dev/null | sort); ` +
+      `  if [ -z "$patches" ]; then patches=$(grep -rlE '^(diff --git |@@ -[0-9]|--- (a/|/dev/null))' "$dest" 2>/dev/null | head -n1); fi; fi; ` +
+      `nfiles=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt 2>/dev/null | grep -c .); ` +
+      `cls=''; detail=''; ` +
+      `if [ "$nfiles" -eq 0 ]; then cls=empty; ` +
+      `elif [ -z "$patches" ]; then cls=full_files; ` +
+      `elif ! command -v git >/dev/null 2>&1; then cls=unavailable; ` +
+      `else ` +
+        `scratch=$(mktemp -d 2>/dev/null) || scratch=''; snapmode=''; top=''; ` +
+        `if [ -n "$scratch" ] && [ -n "$base" ] && top=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$top" ]; then ` +
+          `git -C "$top" worktree add --detach "$scratch/wt" "$base" >/dev/null 2>&1 && snapmode=snapshot; fi; ` +
+        `wt="$scratch/wt"; ` +
+        `if [ -z "$snapmode" ] && [ -n "$scratch" ]; then wt="$scratch/wt"; mkdir -p "$wt" && git init -q "$wt" >/dev/null 2>&1 && snapmode=structure; fi; ` +
+        `if [ -z "$snapmode" ]; then cls=unavailable; else ` +
+          `pflag=''; [ "$p0" -eq 1 ] && pflag='-p0'; recount=''; cls=clean_patch; ` +
+          // snapshot: APPLY each patch FOR REAL in sorted order (numbered patches may stack —
+          // 0002 can depend on 0001; independent --check of each against base false-fails those).
+          // The worktree is disposable, so a real apply is safe and mirrors APPLY.md semantics.
+          // structure (no repo reachable): parse-only well-formedness via --numstat — an empty
+          // `git init` repo can NEVER pass a modify-patch under --check, so --check there is a
+          // false-kill machine (run-i: 11/12 candidates), while --numstat still catches the
+          // audited malformed/truncated class and cannot false-kill.
+          // ZSH-PROOF iteration (run-j fix, 2026-07-07): the helper's shell can be zsh, which does
+          // NOT word-split an unquoted $patches — a multi-patch candidate then passed BOTH paths as
+          // ONE filename and died "can't open patch" (false-kill class: every 0001+0002 candidate).
+          // zsh DOES field-split an unquoted command substitution, and so does bash — so re-emit the
+          // list through $(printf) instead of expanding the variable directly.
+          `for p in $(printf '%s\\n' "$patches"); do ` +
+            `if [ "$snapmode" = snapshot ]; then ` +
+              `if err=$(git -C "$wt" apply $pflag "$p" 2>&1); then :; ` +
+              `elif err=$(git -C "$wt" apply --recount $pflag "$p" 2>&1); then recount=1; ` +
+              `else cls=corrupt_patch; detail=$(printf '%s' "$err" | head -n1 | cut -c1-200); break; fi; ` +
+            `else ` +
+              `if err=$(git -C "$wt" apply --numstat $pflag "$p" 2>&1 >/dev/null); then :; ` +
+              `else cls=corrupt_patch; detail=$(printf '%s' "$err" | head -n1 | cut -c1-200); break; fi; ` +
+            `fi; ` +
+          `done; ` +
+          `if [ "$cls" = clean_patch ]; then if [ "$snapmode" = structure ]; then detail=structure; elif [ -n "$recount" ]; then detail=recount; else detail=''; fi; fi; ` +
+        `fi; ` +
+        `if [ -n "$scratch" ]; then [ "$snapmode" = snapshot ] && git -C "$top" worktree remove --force "$wt" >/dev/null 2>&1; rm -rf "$scratch"; fi; ` +
+      `fi; ` +
+      `case "$cls" in ` +
+      `clean_patch) if [ "$detail" = structure ]; then printf 'MECHANICAL: patch is well-formed (structure-only; no snapshot to context-check)\\n' > "$mech"; elif [ "$detail" = recount ]; then printf 'MECHANICAL: patch applies cleanly (--recount)\\n' > "$mech"; else printf 'MECHANICAL: patch applies cleanly\\n' > "$mech"; fi;; ` +
+      `corrupt_patch) printf 'MECHANICAL: git apply --check FAILED: %s\\n' "$detail" > "$mech";; ` +
+      `full_files) printf 'MECHANICAL: no patch found (full-files deliverable)\\n' > "$mech";; ` +
+      `empty) printf 'MECHANICAL: no deliverable\\n' > "$mech";; ` +
+      `*) printf 'MECHANICAL: check unavailable\\n' > "$mech";; esac; ` +
+      `grep -Eq ${q(MECH_GRAMMAR)} "$mech" || printf '%s' ${q(MECH_FALLBACK)} > "$mech"; ` +
+      // ---- contract layout detection (run G) — see the deliverable-contract-gate block. repoMode
+      // is injected as a JS literal (engine_diff by construction: the shell must never misread a
+      // candidate-authored file named candidate.diff as engine output); non-repoMode checks the
+      // fixed contract names only — presence + non-emptiness, never candidate file CONTENT, and no
+      // candidate text is ever interpolated into the stamp (fixed literals, blind letters only).
+      `ccls=${repoMode ? 'engine_diff' : `''`}; ` +
+      `if [ -z "$ccls" ]; then ` +
+        `pn=$(find "$dest/patches" -maxdepth 1 -type f \\( -iname '*.patch' -o -iname '*.diff' \\) -size +0c 2>/dev/null | grep -c .); ` +
+        `fn=$(find "$dest/files" -type f -size +0c 2>/dev/null | grep -c .); ` +
+        `if [ "$pn" -gt 0 ] && [ -s "$dest/APPLY.md" ] && [ -s "$dest/VERIFY.md" ]; then ccls=patch_layout; ` +
+        `elif [ "$fn" -gt 0 ] && [ -s "$dest/APPLY.md" ]; then ccls=files_layout; ` +
+        `else ccls=freeform; fi; ` +
+      `fi; ` +
+      `ctr="$dest/contract.txt"; ` +
+      `case "$ccls" in ` +
+      `patch_layout) printf 'CONTRACT: conforming (patch layout: patches/ + APPLY.md + VERIFY.md)\\n' > "$ctr";; ` +
+      `files_layout) printf 'CONTRACT: conforming (full-files fallback: files/ + APPLY.md)\\n' > "$ctr";; ` +
+      `engine_diff) printf 'CONTRACT: conforming (engine-generated diff; repoMode)\\n' > "$ctr";; ` +
+      `freeform) printf 'CONTRACT: non-conforming layout (grandfathered v1; judge code quality, not packaging)\\n' > "$ctr";; ` +
+      `*) rm -f "$ctr";; esac; ` +
+      // Degrade-to-unstamped guard: anything not matching the closed grammar is DELETED, so
+      // contractStampShell emits no block for it (run-G fail-safe; no fallback stamp on purpose).
+      `grep -Eq ${q(CONTRACT_GRAMMAR)} "$ctr" 2>/dev/null || rm -f "$ctr"; ` +
+      // Identity hash (issue #36): sha256 over a MANIFEST of the candidate's PRE-STAMP deliverable —
+      // one `shasum -a 256` line per file (digest + ./relative-path), sorted, hashed again. The
+      // manifest (not a bare byte concatenation) encodes file boundaries, names, and count, so two
+      // DIFFERENT trees can never alias to one identity by shifting bytes across file boundaries
+      // (codex-review security finding, 2026-07-06: 'ab'+'c' vs 'abc' concatenate identically).
+      // Paths are $dest-RELATIVE (cd + find .), so identical deliverables under distinct blind
+      // letters still produce an identical hash; engine-written stamp files stay excluded so stamp
+      // jitter never breaks a genuine match. An empty file-set OR a missing shasum both degrade to
+      // NONE (singleton, never collapses) — two zero-file valid deliverables can never false-merge.
+      `nfiles=$(find "$dest" -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | tr -dc '\\0' | wc -c | tr -d ' '); ` +
+      `if [ "\${nfiles:-0}" -gt 0 ] && command -v shasum >/dev/null 2>&1; then h=$(cd "$dest" && find . -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt ! -name enrichment.txt -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | sort | shasum -a 256 2>/dev/null | cut -d' ' -f1); else h=NONE; fi; ` +
+      `echo "JMECH ${c.blind} $cls $detail"; ` +
+      `echo "JCON ${c.blind} $ccls"; ` +
+      `echo "JHASH ${c.blind} ${'${h:-NONE}'}"` +
+      `)`
+  }).join('\n')
+  const res = await agentLadder(
+    `Run this exact shell script in ONE Bash call. It prints three lines per candidate: "JMECH <letter> <class> [detail]", "JCON <letter> <class>", and "JHASH <letter> <hash|NONE>". Then return the structured results: for EACH printed JMECH line an entry {blind: the letter, class: the class token, detail: the rest of the line after the class (omit if empty)}; set that same entry's contract to the class token from the matching letter's JCON line (omit contract if that line is missing); and set that same entry's hash to the token after the letter on the matching JHASH line (omit hash if the line is missing or the token is "NONE"). Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
+    { model: HELPER_MODEL, schema: MECH_SCHEMA, phase: phaseTitle, label: 'mechanical-gate' }
+  ).catch(() => null)
+  const byBlind = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) byBlind[String(r.blind).trim()] = r
+  // Run G: the contract merge runs AFTER the mechanical merge and is purely additive (attaches
+  // c.contract, never touches valid/failReason). byBlind entries carry the optional JCON token.
+  const merged = mergeContract(mergeMechanical(staged, byBlind), byBlind, repoMode)
+  // Dedup (issue #36): group byte-identical VALID deliverables by the relayed content hash; attach
+  // an additive `collapse` field to every member (rep = lowest blind letter). Non-rep duplicates
+  // stay valid:true but drop out of judging via inContention below. Fail-safe: a missing/NONE hash
+  // never collapses (singleton). Any hash/parse/rebuild failure leaves staging byte-identical to today.
+  const byHash = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
+    const h = r && typeof r.hash === 'string' ? r.hash.trim().toLowerCase() : ''
+    // STRICT sha256 shape required (codex-review security finding, 2026-07-06): the hash is a
+    // RELAYED token, and grouping on any non-empty string lets a corrupted/dishonest relay return
+    // the same junk token (e.g. "same") for unrelated candidates — forging a collapse + convergence
+    // stamp and suppressing a real candidate from judging. Non-hex tokens degrade to no-collapse
+    // (fail-open singleton), exactly like NONE.
+    // security-sweep H6/H7 (2026-07-07): the residual — a helper relaying the SAME valid 64-hex hash
+    // (H6) or a wrong mechanical `class` (H7) — is assessed as HELPER-RELAY INTEGRITY (the relayer is
+    // the operator's own HELPER_MODEL, not an attacker), and every failure direction is FAIL-SAFE or
+    // downstream-caught: a forged collapse only DROPS a real candidate from judging (never injects a
+    // winner) and verifyPool's read-back (Run M) rejects a pool that disagrees with the judged set; a
+    // misrelayed corrupt_patch drops a valid candidate (fail-safe), a misrelayed clean_patch is caught
+    // downstream (judges read the actual patch bytes; the implementer re-applies it for real). The
+    // engine can't recompute these in-sandbox (no shell), so the strict-shape guard + read-back +
+    // downstream re-apply are the defense-in-depth. No behavioural change.
+    if (/^[0-9a-f]{64}$/.test(h)) byHash[String(r.blind).trim()] = h
+  }
+  const grouped = groupIdenticalCandidates(merged, byHash)
+  // Observability: a corrupt-patch invalidation records a DISTINCT :mech seat (RC 04) — the main seat
+  // already recorded its staging RC; this makes the mechanical exclusion visible without double-counting.
+  for (const c of merged) if (c.mechanical && c.mechanical.class === 'corrupt_patch') recordSeatOnce(`${c.label || c.blind}:mech`, phaseTitle, RC.INVALID, 'mechanical-corrupt-patch')
+  // Non-repoMode: stageAndValidate already built _pool.md and enrichBlindPool will NOT run, so rebuild
+  // the pool here from the still-valid candidates (mirrors stageAndValidate's section format exactly)
+  // + the stamp block. repoMode: enrichBlindPool's rebuild carries the stamp via mechStampShell.
+  if (!repoMode) {
+    const pool = `${reviewDir}/_pool.md`
+    // R4 read-back verify (2026-07-07): the rebuild used to be fire-and-forget — a silently failed
+    // rebuild left judges reading a STALE pool (duplicate sections, no stamps) that disagreed with
+    // the collapsed contention set. Now the script prints a terminal JPOOL line (section count +
+    // sorted letters, parsed from the pool ON DISK after the mv) and the engine verifies it against
+    // the exact set it is about to judge. Verified => collapse stands. Two failures => DISARM the
+    // collapse (uncollapsed contention = pre-dedup behaviour, matching whatever pool rebuild we can
+    // still land) — a mismatched relay can only ever disarm, never mis-collapse. NOTE: a candidate
+    // whose own file content contains a line starting "===== Candidate " inflates the count and
+    // causes a spurious disarm — fail-safe direction, accepted.
+    const rebuildFor = (set) => [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(set.map(c => {
+      const dest = `${reviewDir}/${c.blind}`
+      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; ${mechStampShell(dest)}; ${contractStampShell(dest)}; ${convergenceStampShell(convergenceLineFor(c))}; echo; } >> "$tmp"`
+    })).concat([
+      `mv -f "$tmp" ${q(pool)}`,
+      `echo "JPOOL $(grep -c '^===== Candidate ' ${q(pool)} 2>/dev/null | tr -d ' ') $(grep '^===== Candidate ' ${q(pool)} 2>/dev/null | awk '{print $3}' | sort | tr '\\n' ' ')"`,
+    ]).join('\n')
+    const verifyPool = async (set, vlabel) => {
+      const res = await agentLadder(
+        `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with mechanical-check stamps and prints ONE final line starting with "JPOOL". Return that final JPOOL line VERBATIM in the "raw" field — do not summarize, alter, or expose any other output:\n\n${rebuildFor(set)}`,
+        { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: phaseTitle, label: vlabel }
+      ).catch(() => null)
+      const raw = res && typeof res.raw === 'string' ? res.raw : ''
+      const m = raw.match(/JPOOL\s+(\d+)\s*(.*)$/)
+      if (!m) return false
+      const want = set.map(c => c.blind).sort()
+      const got = m[2].trim().split(/\s+/).filter(Boolean).sort()
+      return Number(m[1]) === want.length && got.length === want.length && want.every((l, i) => got[i] === l)
+    }
+    const contenders = grouped.filter(inContention)
+    let poolOk = await verifyPool(contenders, 'mechanical-pool')
+    if (!poolOk) poolOk = await verifyPool(contenders, 'mechanical-pool-retry')
+    if (!poolOk) {
+      log(`JE-DEDUP-POOL-VERIFY [${phaseTitle}]: rebuilt pool failed read-back verification against the collapsed contention set after a retry — DISARMING dedup collapse this round (fail-safe: judges must never read a pool that disagrees with the judged set).`)
+      const uncollapsed = merged.map(c => { const { collapse, ...rest } = c; return rest })
+      await verifyPool(uncollapsed.filter(inContention), 'mechanical-pool-uncollapsed')
+      return uncollapsed
+    }
+  }
+  return grouped
+}
+
+// G2 evidence-stamp plumbing (INVESTIGATE→COMPOSITE v1). EVIDENCE/JEVID are provider-neutral
+// literals — like MECHANICAL/JMECH they are deliberately NOT rebrand tokens and stay byte-identical
+// in the dev copy. The fail-safe is DEGRADE TO UNSTAMPED (the contract-gate discipline): a missing
+// or grammar-violating evidence.txt emits no "--- Evidence check ---" block at all, so pass-infra
+// noise never becomes a composer-visible signal.
+function evidenceStampShell(dest) {
+  const f = `${dest}/evidence.txt`
+  return `if grep -Eq ${q(EVIDENCE_GRAMMAR)} ${q(f)} 2>/dev/null; then printf '\\n--- Evidence check ---\\n'; cat ${q(f)}; fi`
+}
+
+const EVIDENCE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { blind: { type: 'string' }, cited: { type: 'number' }, verified: { type: 'number' } },
+        required: ['blind', 'cited', 'verified'],
+      },
+    },
+  },
+  required: ['results'],
+}
+
+// G2 evidence-verification pass (investigate runs only): one HELPER_MODEL agent, one deterministic
+// shell script, once per round — mechanicalPatchGate's shape exactly. AFTER staging (and the
+// repoMode enrichment rebuild), BEFORE the composeOnly pool return: for each VALID candidate,
+// extract its cited paths (grep -ohE CITE_GREP — the shell twin of parseCitations), grep-check each
+// against the snapshot/context (working tree at the repo top, the pinned baseSha via git cat-file,
+// or the shared context bundle), stamp `EVIDENCE: n cited, m verified` into evidence.txt, and
+// rebuild the blind pool with the stamp (letters only — no path, no candidate text, no identity).
+// FAIL-SAFE: an unverifiable citation is stamped-but-unverified; a dead helper / garbled counts
+// degrade to unstamped; NOTHING here invalidates a candidate (mergeEvidence is purely additive).
+async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
+  if (!investigate) return staged
+  const targets = staged.filter(c => c.valid)
+  if (!targets.length) return staged
+  const baseArg = repoMode && baseSha ? q(baseSha) : `''`
+  const ctxArg = contextPath ? q(contextPath) : `''`
+  const perCandidate = targets.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `(` +
+      `dest=${q(dest)}; ev=${q(`${dest}/evidence.txt`)}; base=${baseArg}; ctx=${ctxArg}; ` +
+      `cites=$(find "$dest" -type f ! -name evidence.txt -print0 2>/dev/null | xargs -0 grep -ohE ${q(CITE_GREP)} 2>/dev/null | sed -E ${q(CITE_SED)} | sort -u); ` +
+      // Citation paths carry no whitespace/globs by grammar (charset [A-Za-z0-9._-/]); counters n/m
+      // stay in THIS shell (no subshell-pipe loss). zsh-proof (run-j class): zsh does NOT word-split
+      // an unquoted $cites — re-emit through $(printf), which BOTH bash and zsh field-split.
+      `n=0; m=0; top=$(git rev-parse --show-toplevel 2>/dev/null); ` +
+      `for p in $(printf '%s\\n' "$cites"); do n=$((n+1)); ok=0; ` +
+        // security-sweep M1: a citation is verifiable ONLY inside the pinned snapshot scope. An
+        // ABSOLUTE path (/etc/hosts) or a `..` path SEGMENT escapes that scope, so it earns NO
+        // verified credit — it is still counted as cited (n), never as verified (m). This blocks a
+        // candidate inflating its evidence stamp by citing a real out-of-snapshot file. Guard first,
+        // so the resolution branches below only ever see in-scope relative paths.
+        `case "$p" in ` +
+          `/*|..|../*|*/..|*/../*) ok=0 ;; ` +          // absolute or a .. path segment -> out of scope, no credit
+          `*) ` +
+            `if [ -e "$p" ]; then ok=1; ` +
+            `elif [ -n "$top" ] && [ -e "$top/$p" ]; then ok=1; ` +
+            `elif [ -n "$top" ] && [ -n "$base" ] && git -C "$top" cat-file -e "$base:$p" >/dev/null 2>&1; then ok=1; ` +
+            `elif [ -n "$ctx" ] && grep -qF -- "$p" "$ctx" 2>/dev/null; then ok=1; fi ;; ` +
+        `esac; ` +
+        `[ "$ok" -eq 1 ] && m=$((m+1)); ` +
+      `done; ` +
+      `printf 'EVIDENCE: %s cited, %s verified\\n' "$n" "$m" > "$ev"; ` +
+      // Degrade-to-unstamped guard: anything not matching the closed grammar is DELETED, so
+      // evidenceStampShell emits no block for it (fail-safe; no fallback stamp on purpose).
+      `grep -Eq ${q(EVIDENCE_GRAMMAR)} "$ev" 2>/dev/null || rm -f "$ev"; ` +
+      `echo "JEVID ${c.blind} $n $m"` +
+      `)`
+  }).join('\n')
+  const res = await agentLadder(
+    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEVID <letter> <cited> <verified>". Then return the structured results: for EACH printed JEVID line an entry {blind: the letter, cited: the first number, verified: the second number}. Report exactly what the script printed — do not infer, judge, or change values. Do not expose any other command output.\n\n${perCandidate}`,
+    { model: HELPER_MODEL, schema: EVIDENCE_SCHEMA, phase: phaseTitle, label: 'evidence-gate' }
+  ).catch(() => null)
+  const byBlind = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) byBlind[String(r.blind).trim()] = r
+  const merged = mergeEvidence(staged, byBlind)
+  // Rebuild the pool from the still-valid candidates (stageAndValidate's section format + the
+  // grammar-guarded stamp block — the mechanical-gate rebuild discipline; engine stamp files are
+  // excluded from the cat and re-emitted only through their guarded stamp shells).
+  const pool = `${reviewDir}/_pool.md`
+  const rebuild = [`tmp=${q(`${pool}.evid`)}`, `: > "$tmp"`].concat(merged.filter(c => c.valid).map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name evidence.txt ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; ${evidenceStampShell(dest)}; echo; } >> "$tmp"`
+  })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
+  await agentLadder(
+    `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with evidence-verification stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
+    { model: HELPER_MODEL, phase: phaseTitle, label: 'evidence-pool' }
+  ).catch(() => null)
+  return merged
+}
+
 async function stageAndValidate(list, reviewDir, phaseTitle) {
   const pool = `${reviewDir}/_pool.md`
   const script = [`mkdir -p ${q(reviewDir)}; : > ${q(pool)}`].concat(list.map(c => {
@@ -808,22 +1830,22 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
       // worktree), so copy it forward and keep the D-0004 provenance skip (provChk -> P=1 for carryover).
       if (c.carriedOver) {
         return `mkdir -p ${q(dest)}; if [ -s ${q(`${c.ws}/candidate.diff`)} ]; then cp ${q(`${c.ws}/candidate.diff`)} ${q(diffPath)}; D=1; else D=0; fi; ${provChk}; ` +
-               `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
+               `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> ${q(pool)}; fi; ` +
                `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
       }
       return `mkdir -p ${q(dest)}; git -C ${q(c.ws)} diff ${q(baseSha)} HEAD --no-color --no-prefix > ${q(diffPath)} 2>/dev/null; ` +
              `if [ -s ${q(diffPath)} ]; then D=1; else D=0; fi; ${provChk}; ` +
-             `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
+             `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> ${q(pool)}; fi; ` +
              `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
     }
     return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
            `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt ${q(dest)}/_minimax_run.log ${q(dest)}/_grok_run.log; ` +
            `find ${q(dest)} -mindepth 1 ! -type f ! -type d -delete 2>/dev/null; ` +
            `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
-           `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
+           `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> ${q(pool)}; fi; ` +
            `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
   })).join('\n')
-  const res = await agent(
+  const res = await agentLadder(
     `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "JEV <letter> d=<0|1> p=<0|1>", and (for runner candidates only) a matching line "JRC <letter> JOUST-RC <code> <reason>" or "JRC <letter> NONE". Then return the structured results: for EACH printed JEV line, an entry {blind: the letter, deliverable: (d==1), provenance: (p==1)}; and for the matching JRC line, set that blind's rc to the two-digit <code> and rcReason to the <reason> text after "JOUST-RC" ("NONE" or no JRC line => omit rc/rcReason). Report exactly what the script printed — do not infer or change values.\n\n${script}`,
     { model: HELPER_MODEL, schema: STAGE_SCHEMA, phase: phaseTitle, label: 'stage' }
   ).catch(() => null)
@@ -931,10 +1953,13 @@ async function enrichBlindPool(list, reviewDir, phaseTitle) {
            `cat ${q(`${dest}/candidate.diff`)} 2>/dev/null; ` +
            `printf '\\n--- Automated checks ---\\n'; ` +
            `if grep -Eq ${grammar} ${q(`${dest}/enrichment.txt`)}; then cat ${q(`${dest}/enrichment.txt`)}; else printf '%s' ${fallback}; fi; ` +
+           `${mechStampShell(dest)}; ` +
+           `${contractStampShell(dest)}; ` +
+           `${convergenceStampShell(convergenceLineFor(c))}; ` +
            `printf '\\n'; } >> "$tmp"`
   }), `mv -f "$tmp" ${q(pool)}`].join('\n')
   const script = `${perCandidate}\n${rebuild}`
-  await agent(
+  await agentLadder(
     `Run this exact shell script in ONE Bash call. It runs blind tournament checks and atomically rebuilds the blind pool. Do not print, summarize, or expose command output; do nothing else:\n\n${script}`,
     { model: HELPER_MODEL, phase: phaseTitle, label: 'test-lint-enrichment' }
   ).catch(() => null)
@@ -1024,6 +2049,17 @@ function guidanceIntegrityIssue(g) {
   if (thin.length === items.length) return `all ${items.length} guidance item(s) have near-empty/placeholder text or why — looks like schema-valid junk`
   return null
 }
+// Round-2/R4 LAUNCH guard (run F fold-in): is this guidance a STUB — empty, or schema-valid junk?
+// Returns a short reason (stub) or null (usable). guidanceIntegrityIssue deliberately passes an
+// EMPTY set (legitimate for its producer: "nothing salient this round"), but an empty set is a stub
+// for SEEDING a guided round — that gap let placeholder guidance reach round-2 briefs in 3 audited
+// runs. A stub round falls back to task-only dispatch (null guidance == the round-1 shape).
+function guidanceStub(g) {
+  if (!g || typeof g !== 'object') return 'guidance missing'
+  const n = (Array.isArray(g.positives) ? g.positives.length : 0) + (Array.isArray(g.challenges) ? g.challenges.length : 0)
+  if (n === 0) return 'guidance empty (no positives or challenges)'
+  return guidanceIntegrityIssue(g)
+}
 // ---- end: verdict integrity guard ------------------------------------------------------------
 
 
@@ -1042,6 +2078,8 @@ function guidanceIntegrityIssue(g) {
 // security behaviour keys off this predicate; the fail-closed security-DEAD policy stays keyed
 // to the PRIMARY 'security' seat only (security-x already falls back to Opus like other codex seats).
 const isSecurityLens = (key) => key === 'security' || key === 'security-x'
+// A PLAN decision point (design-brief artifacts): the same phase split defaultLensesFor uses.
+const isPlanPoint = (phaseTitle) => phaseTitle === 'Review' || phaseTitle === 'Final rank'
 
 function chooseJudgeDispatch(lens, legacyMix, codexRunnerConfigured) {
   if (legacyMix) return 'native'
@@ -1101,6 +2139,82 @@ function checksRunRootsIssue(checksRun, allowedRoots) {
 const CODEX_JUDGE_LOG_MARK = '===JE-CODEX-JUDGE-LOG==='
 const CODEX_JUDGE_VERDICT_MARK = '===JE-CODEX-JUDGE-VERDICT==='
 const CODEX_JUDGE_SHA_MARK = '===JE-CODEX-JUDGE-SHA==='
+
+// ---- begin: codex review-judge parsing ----------------------------------------------------------
+// Review-preset judge seats (2026-07-06 judge-architecture experiment): codex judges via the
+// purpose-built `codex review` preset (bounded plain-text report) instead of authoring VERDICT.json
+// at the end of an open-ended exec session — VERDICT authorship was the 100%-fallback failure class
+// two full runs straight. A sonnet helper then MECHANICALLY reformats the report into the verdict
+// shape under a strict traceability rule (it reformats, it never judges): ranking/vote/safety MUST
+// come from the report's explicit machine lines, or the seat fails over to opus exactly as before.
+// parseCodexReviewDump validates the relayed dump (log tail + report, sentinel-joined) BEFORE any
+// reformat spend: provenance + clean exit + a non-trivial report carrying the RANKING/VOTE lines.
+function parseCodexReviewDump(rawDump) {
+  const s = String(rawDump == null ? '' : rawDump)
+  const li = s.indexOf(CODEX_JUDGE_LOG_MARK)
+  const vi = s.indexOf(CODEX_JUDGE_VERDICT_MARK)
+  if (li < 0 || vi < 0 || vi < li) return { ok: false, reason: 'codex review judge dump missing log/report markers — runner or read-back step failed' }
+  const logPart = s.slice(li + CODEX_JUDGE_LOG_MARK.length, vi)
+  const report = s.slice(vi + CODEX_JUDGE_VERDICT_MARK.length).trim()
+  if (!/^JOUST-CODEX-PROVENANCE endpoint=/m.test(logPart)) return { ok: false, reason: 'codex review judge: no PROVENANCE marker — runner never ran' }
+  if (!/^JOUST-CODEX-DONE exit=0/m.test(logPart)) return { ok: false, reason: 'codex review judge: runner did not report exit=0' }
+  if (/^JOUST-CODEX-(TIMEOUT|ERROR)/m.test(logPart)) return { ok: false, reason: 'codex review judge: runner reported TIMEOUT/ERROR' }
+  if (report.length < 80) return { ok: false, reason: `codex review judge: report too short (${report.length} bytes) to be a real review` }
+  if (!/^RANKING:/m.test(report)) return { ok: false, reason: 'codex review judge: report has no explicit RANKING: line' }
+  if (!/^VOTE:/m.test(report)) return { ok: false, reason: 'codex review judge: report has no explicit VOTE: line' }
+  return { ok: true, report }
+}
+// security-sweep L2 (2026-07-07): the set of candidate letters the SECURITY report flagged UNSAFE,
+// derived DETERMINISTICALLY from the verbatim (sha-verified) report — the ground truth the sonnet
+// reformatter must not silently drop. A veto is the highest-stakes exclusion; validating only the
+// flags the reformatter KEPT can never catch a MISSING one, so the engine re-derives the UNSAFE set
+// here and fails closed if the reformatted verdict lost any. PURE (extract-and-eval'able). Matches
+// the prompt's "SAFETY <letter>: UNSAFE ..." grammar; SAFE lines and prose are ignored. Uppercased.
+function codexReportUnsafeLabels(reportText) {
+  const out = new Set()
+  const re = /^\s*SAFETY\s+([A-Za-z])\s*:\s*UNSAFE\b/gim
+  let m
+  while ((m = re.exec(String(reportText == null ? '' : reportText)))) out.add(m[1].toUpperCase())
+  return out
+}
+// checks_run is exec-mode honesty telemetry (commands the agentic session ran); the review preset's
+// evidence discipline lives in the report's inline quotes instead. The verdict still needs the field
+// for shape validity, so it carries this engine-written constant — never model-invented content.
+const REVIEW_CHECKS_RUN = ['_pool.md (codex-review preset: evidence quoted inline in the report)']
+// ---- end: codex review-judge parsing ------------------------------------------------------------
+
+// Structured-output schema for the review-report REFORMAT helper. `found` is the traceability
+// escape hatch: when the report lacks the explicit machine lines, the helper reports found:false
+// (and the seat falls over) instead of inventing a ranking — the reformatter must never judge.
+const CODEX_REVIEW_VERDICT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    found: { type: 'boolean' },
+    candidates: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { label: { type: 'string' }, pros: { type: 'array', items: { type: 'string' } }, cons: { type: 'array', items: { type: 'string' } } },
+        required: ['label', 'pros', 'cons'],
+      },
+    },
+    ranking: { type: 'array', items: { type: 'string' } },
+    vote: { type: 'string' },
+    reasoning: { type: 'string' },
+    safety: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { label: { type: 'string' }, safety: { type: 'string' }, severity: { type: 'string' }, evidence: { type: 'string' } },
+        required: ['label', 'safety'],
+      },
+    },
+    response_to_peers: { type: 'string' },
+    changed_this_round: { type: 'boolean' },
+    changed_from_round1: { type: 'boolean' },
+  },
+  required: ['found', 'candidates', 'ranking', 'vote', 'reasoning'],
+}
 
 // Parse+validate a codex judge seat's raw dump (log tail + VERDICT.json body, sentinel-joined). Pure:
 // no I/O, no agent() calls. Reuses the EXISTING guards (verdictIntegrityIssue/checksRunIssue) rather
@@ -1216,12 +2330,12 @@ const LENSES = [
 // work UNCHANGED) but is DISPLAYED as 'security-by-design' via `title`. lensPrompt renders
 // `title || key`; every logic path (schema selection, tally, safety) still keys off `key`.
 const PLAN_LENSES = [
-  { key: 'feasibility', owns: 'can this plan actually be built as written — are the named files, APIs, and mechanisms real and reachable, does each step follow from the last, and DO THE PLAN\'S FACTUAL CLAIMS about the current tree check out (demand the proof: verify cited files, functions, and behaviours against the snapshot — a plan built on a misread codebase is infeasible however coherent)', special: 'You are the reality judge; audit the claims, not just the steps.' },
-  { key: 'completeness', owns: 'does the plan cover EVERYTHING the task asked — every requirement, edge case, migration, test, and doc update, with no silent gaps', special: 'You catch the "plans the easy 80%, hand-waves the hard 20%" failure.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
-  { key: 'risk', owns: 'what could go wrong on execution — hidden coupling, breaking changes, data/compat hazards, rollout/ordering risk, and whether the plan names and mitigates them', special: 'Probe the failure modes the plan glosses over, not just the happy path.' },
-  { key: 'security', title: 'security-by-design', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold the council VETO: veto a plan that designs in a real, evidenced security hazard.' },
-  { key: 'simplicity', owns: 'simplicity and proportionality — is the plan the smallest coherent change that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the plan is proportionate to the task; reward the simplest approach that is still complete.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
-  { key: 'security-x', title: 'security-by-design (cross-family)', owns: 'security-by-design: does the plan build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold a council VETO — the second, cross-family security gate: veto a plan that designs in a real, evidenced security hazard.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'feasibility', owns: 'is this design brief buildable and TRUE — do the surfaces, mechanisms, and constraints it names actually exist in the snapshot (demand the proof: verify every factual claim about the codebase — a brief built on a misread codebase is infeasible however coherent), and does the chosen approach actually reach the acceptance criteria', special: 'You are the reality judge; audit the claims, not the prose. A brief at the WRONG ALTITUDE (code blocks, diffs, line numbers, function bodies) violates the deliverable contract — score it down for that, never up for the extra detail.' },
+  { key: 'completeness', owns: 'does the brief cover EVERYTHING material the task implies — the hard 20% named (not hand-waved), the real risks, and acceptance criteria that are TESTABLE and approach-neutral, with no silent gaps in what "done" means', special: 'You catch the "frames the easy 80%, hand-waves the hard 20%" failure. Completeness is decision coverage, NOT edit-level detail — never reward line-level specificity.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'risk', owns: 'what could go wrong executing this approach — hidden coupling, breaking changes, data/compat hazards, rollout/ordering risk — and whether the brief names the riskiest assumptions and mitigates them', special: 'Probe the failure modes the brief glosses over, not just the happy path.' },
+  { key: 'security', title: 'security-by-design', owns: 'security-by-design: does the chosen approach build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold the council VETO: veto a brief whose approach designs in a real, evidenced security hazard.' },
+  { key: 'simplicity', owns: 'simplicity and proportionality — is the chosen approach the smallest coherent one that solves the task, or does it over-engineer, add needless surface, or gold-plate', special: 'Judge whether the APPROACH is proportionate; reward the simplest complete approach. A longer brief is not a better brief.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
+  { key: 'security-x', title: 'security-by-design (cross-family)', owns: 'security-by-design: does the chosen approach build in least privilege, input validation, safe secret handling, and a safe execution/supply-chain posture — or does it design in a vulnerability', special: 'You hold a council VETO — the second, cross-family security gate: veto a brief whose approach designs in a real, evidenced security hazard.', judge: { kind: 'codex', displayModel: 'codex-xhigh' } },
 ]
 
 // Lens profiles the council can run under. Default = code lenses (unchanged behaviour).
@@ -1324,21 +2438,28 @@ async function askLens(lens, blindList, poolPath, phaseTitle, label, roundNum, p
   const dispatchMode = chooseJudgeDispatch(lens, LEGACY_MIX, !!codexRunner)
   if (dispatchMode === 'codex') {
     const result = await askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
-    if (result) return result
+    if (result && !result.__codexFail) return auditSeatModel(phaseTitle, label, lens, 'codex', result)
+    const fail = (result && result.__codexFail) || classifyCodexJudgeFailure('dispatch')
     log(`JE-COUNCIL-FALLBACK [${phaseTitle}] ${label} (${lens.key}): codex-xhigh seat exhausted retries — falling back to native Opus for this round so the council does not lose a seat.`)
     // A fallback IS an existing behavioural branch, so recording a RECOVERED fault here honours the
     // "observability, except where behaviour already branches" clause: the seat stays living (Opus) but
-    // its codex leg faulted — record RC 02 so the report shows the recovered fault (never silently dropped).
-    recordSeat(`${label}:codex`, phaseTitle, RC.UNAVAIL, 'codex-seat-fallback-to-opus')
+    // its codex leg faulted. Fold-in A: a dispatch-stage failure records the pre-existing RC 02; a
+    // readback-stage failure (codex RAN, its verdict arrived corrupt/unparseable) records RC 04.
+    recordSeat(`${label}:codex`, phaseTitle, fail.rc, fail.rc === RC.INVALID
+      ? `codex-seat-fallback-to-opus (verdict-readback-failed${fail.detail ? `: ${fail.detail}` : ''})`
+      : 'codex-seat-fallback-to-opus')
   } else if (!LEGACY_MIX && lens.judge && lens.judge.kind === 'codex' && !codexRunner && !codexRunnerWarned) {
     log(`JE-COUNCIL-WARNING: codexRunner not supplied — codex judge seat(s) (spec/craft/completeness/simplicity) will run as native Opus this run. Pass args.codexRunner to enable mixed-family judging.`)
     codexRunnerWarned = true
   }
-  return askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots)
+  return auditSeatModel(phaseTitle, label, lens, dispatchMode,
+    await askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots))
 }
 
-// Native Opus lens judge: opus, retry once (like judge()), reconcile. Tagged judgeModel:'opus'. This is
-// today's askLens body, unchanged except for the shared roots-warning check + the judgeModel tag.
+// Native Opus lens judge: opus, retry once (like judge()), THEN one model-ladder rung (opus try,
+// opus retry, sonnet rung, dead) — EXCEPT the security lenses, which stay opus minimum (sonnet
+// retry FORBIDDEN; their failure keeps today's dead-judge path). judgeModel is tagged with the
+// model that ACTUALLY answered (ladder.used), so a downgraded verdict is honest in the record.
 async function askLensNative(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots) {
   const prompt = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot)
   const schema = isSecurityLens(lens.key)
@@ -1346,7 +2467,9 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
     : (roundNum === 1 ? LENS_R1_SCHEMA : LENS_DELIB_SCHEMA)
   for (let i = 1; i <= 2; i++) {
     try {
-      const raw = await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label })
+      // Ladder rung ONLY on the final same-model try, NEVER for a security lens.
+      const ladder = { eligible: i === 2 && !isSecurityLens(lens.key) }
+      const raw = await agentLadder(prompt, { model: 'opus', schema, phase: phaseTitle, label }, ladder)
       if (!raw || typeof raw !== 'object') throw new Error('lens judge returned no structured result (null)')
       // Integrity guard (same choke-point as reconcile(), see EV-judge-placeholder.md): covers BOTH round 1
       // and every deliberation round, since askLens() is the single call site for all of them.
@@ -1354,7 +2477,7 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
       if (integrityIssue) throw new Error(`council lens verdict failed integrity check: ${integrityIssue}`)
       const rootsIssue = checksRunRootsIssue(raw.checks_run, allowedRoots)
       if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
-      return { lens: lens.key, judgeModel: 'opus', ...reconcileLens(raw, labels) }
+      return { lens: lens.key, judgeModel: ladder.used || 'opus', ...reconcileLens(raw, labels) }
     } catch (e) {
       log(`council ${label} (${lens.key}) attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
       if (i === 2) return null // dead lens — council recomputes majority over the living
@@ -1365,28 +2488,66 @@ async function askLensNative(lens, blindList, poolPath, phaseTitle, label, round
 // The verbatim-run brief for the codex JUDGE dispatch agent (the joust-codex agent runs it as-is; it
 // judges NOTHING itself). Mirrors RUNVERBATIM (the attempt dispatch), scoped to a single judge seat.
 function RUNVERBATIM_JUDGE(cmd, ws) {
-  return `This is an approved internal step of the joust-engine tournament: it writes a judge brief and runs the bundled codex runner script, which performs ONE codex-xhigh council judge seat (NOT a task attempt). Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not judge anything yourself, do not edit the command):\n\n${cmd}\n\nThen report only whether a file named VERDICT.json exists in ${ws} and its byte size. Do not read or relay its contents.`
+  return `Joust-engine tournament judge-dispatch step (all paths are inside this run's scratch directory): it writes a judge brief and LAUNCHES the bundled, self-supervising codex runner script, which performs ONE codex council judge seat (NOT a task attempt; the runner's own watchdogs bound its runtime and it always writes a terminal "JOUST-RC" line to its log). Follow this LAUNCH-AND-POLL protocol exactly; do not judge anything yourself and do not edit the commands.\n\nSTEP 1 — LAUNCH (one Bash call; detaches the runner and returns in seconds — expect JOUST-LAUNCHED):\n\n${cmd}\n\nSTEP 2 — POLL: run this exact command as its own FOREGROUND Bash call (never as a background task) with a generous per-call timeout; when a call times out, RUN THE SAME COMMAND AGAIN — repeat until it prints JOUST-SETTLED. NEVER end your turn while the runner is still working.\n\ncd ${q(ws)} && ${pollCmd('_codex_run.log')}\n\nSTEP 3 — report only whether a file named _review_report.md exists in ${ws} and its byte size. Do not read or relay its contents.`
 }
 
-// Codex-xhigh lens judge: dispatch the codex runner with a brief asking for VERDICT.json, read the log
-// tail + VERDICT.json body back (sentinel-joined, engine is the source of truth for bytes), then PARSE +
-// VALIDATE in code (parseCodexJudgeDump — provenance + JSON + shape + the SAME integrity guard as native).
-// Retry once; return { lens, judgeModel, ...verdict } or null after two failures (caller falls back to Opus).
+// Codex lens judge — REVIEW-PRESET pipeline (2026-07-06 judge-architecture experiment; replaces the
+// exec+VERDICT.json-authorship flow whose verdict-readback failed 9/9 seats two runs straight):
+//   1. The engine stages the seat workspace: scratch `git init` + the blind pool copied in as
+//      _pool.md (the review presets are mutually exclusive on codex-cli >=0.141, so custom
+//      instructions review the WORKING TREE — the pool copy IS the tree content under review).
+//   2. codex-run.sh in JE_CODEX_MODE=review runs the bounded `codex review` preset — the report
+//      goes to _review_report.md, the session stream feeds the stall watchdog, and the brief
+//      demands explicit machine lines (RANKING: / VOTE: / SAFETY <letter>:).
+//   3. Read-back relays log tail + report (sentinel-joined, sha-verified); parseCodexReviewDump
+//      validates provenance/exit/report-shape BEFORE any reformat spend.
+//   4. A sonnet helper MECHANICALLY reformats the report into the verdict shape (strict
+//      traceability: it reformats, it never judges — found:false on missing machine lines), then
+//      the verdict passes the SAME shape/integrity guards as every other seat.
+// Effort defaults to HIGH: the experiment's effort sweep found medium/high/xhigh all surfaced the
+// same core findings on the review preset, with high ~1.7x faster than xhigh (override:
+// args.codexJudgeEffort). Retry once; { __codexFail } after two failures (caller falls back to Opus).
 async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundNum, peerBlock, rot, labels, allowedRoots) {
   const delibExtra = roundNum > 1
-    ? ' On this deliberation round also include response_to_peers (string), changed_this_round (boolean), and changed_from_round1 (boolean) if you can honestly assess them; omit only if you cannot.'
+    ? `\n- Because this is a deliberation round, ALSO end with lines "RESPONSE TO PEERS: <one paragraph>", "CHANGED THIS ROUND: yes|no", and "CHANGED FROM ROUND 1: yes|no" if you can honestly assess them.`
     : ''
   const briefBody = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) +
-    `\n\nWrite your verdict as VALID JSON — and NOTHING else in that file, no markdown fence, no commentary — to a file named VERDICT.json in your current working directory. Required keys: lens (must be exactly "${lens.key}"), candidates (array of {label, pros: [string], cons: [string]}), ranking (array of candidate letters, best first), vote (single candidate letter), reasoning (string), checks_run (array of strings — every command you ran or file you read, with its key result, each citing a path inside your pinned evaluation scope above)${isSecurityLens(lens.key) ? ', safety (array of {label, safety: "SAFE"|"UNSAFE", severity ("high"|"critical", UNSAFE only), evidence (UNSAFE only)} — one entry per candidate)' : ''}.${delibExtra}`
+    `\n\nThe working tree you are reviewing contains _pool.md — a byte-identical copy of that pool file; it IS the artifact under review. Deliver a prioritized PLAIN-TEXT review report (you are a review preset run — do NOT write any files):\n- One section per candidate, headed exactly "Candidate <letter>:", with your lens's pros and cons, each grounded in evidence QUOTED from the pool.\n- Then finish with EXACTLY these machine-parsed lines, one per line:\nRANKING: <all candidate letters, best first, separated by " > ">\nVOTE: <the single best candidate's letter>${isSecurityLens(lens.key) ? '\nSAFETY <letter>: SAFE — or — SAFETY <letter>: UNSAFE <high|critical> <one-line concrete evidence> (one SAFETY line per candidate; UNSAFE only with evidence you can point to — a standing UNSAFE flag excludes that candidate regardless of votes)' : ''}${delibExtra}\n- Close with one reasoning paragraph explaining the ranking.`
   const seatWs = judgeWs(label)
-  const flag = CODEX_FLAG['codex-xhigh']
-  const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout)
-  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/VERDICT.json`)} 2>/dev/null | cut -d' ' -f1`
+  const judgeEffort = CODEX_JUDGE_EFFORT // security-sweep M15: single resolved effort (audit + dispatch agree)
+  const flag = CODEX_FLAG[`codex-${judgeEffort}`]
+  const prep = `git init -q . 2>/dev/null; cp ${q(poolPath)} _pool.md && `
+  const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout, prep, 'JE_CODEX_MODE=review ')
+  // Log-segment relay (run-j fix, 2026-07-07): review-mode logs carry the codex session's stderr
+  // stream (the stall-watchdog liveness feed), so on a real council pool the log grows way past
+  // 4KB and `tail -c 4000` alone no longer contains the PROVENANCE line stamped at runner startup —
+  // parse then fail-closed-rejected EVERY seat (3/3 opus fallback in run-j round 1). Prepend the
+  // provenance line explicitly (grep from the top) and keep the tail for the terminal DONE/RC (and
+  // any TIMEOUT/ERROR) markers of the LAST try. A missing log still relays nothing -> still rejects.
+  const dumpScript = `printf '%s' ${q(CODEX_JUDGE_LOG_MARK)}; grep -a '^JOUST-CODEX-PROVENANCE' ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null | head -n1; tail -c 4000 ${q(`${seatWs}/_codex_run.log`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_VERDICT_MARK)}; head -c 200000 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null; printf '%s' ${q(CODEX_JUDGE_SHA_MARK)}; shasum -a 256 ${q(`${seatWs}/_review_report.md`)} 2>/dev/null | cut -d' ' -f1`
 
+  // Two-stage try/catch per try (fold-in A): the classification is STRUCTURAL — a dispatch-stage
+  // failure (codex never produced a verdict) stays RC 02; anything past a successful dispatch
+  // (relay corruption, non-JSON, wrong shape, integrity reject) is RC 04. On exhaustion the caller
+  // receives { __codexFail } instead of null so it can record the right class.
+  let lastFail = classifyCodexJudgeFailure('dispatch')
   for (let i = 1; i <= 2; i++) {
     try {
-      await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), phase: phaseTitle, label: `${label}-codex-dispatch` })
-      const readRaw = await agent(
+      // model pinned alongside agentType: frontmatter is not reliably honoured (see dispatch()).
+      // S1: the slot serializes the LIVE codex process only (launch-and-poll wrapper returns at
+      // JOUST-SETTLED); readback + reformat run outside the slot.
+      await acquireCodexSlot()
+      try {
+        await agent(RUNVERBATIM_JUDGE(dispatchCmd, seatWs), { agentType: nsAgent('joust-codex'), model: HELPER_MODEL, phase: phaseTitle, label: `${label}-codex-dispatch` })
+      } finally { releaseCodexSlot() }
+    } catch (e) {
+      log(`council ${label} (${lens.key}) codex-xhigh dispatch attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
+      lastFail = classifyCodexJudgeFailure('dispatch')
+      if (i === 2) return { __codexFail: lastFail }
+      continue
+    }
+    try {
+      const readRaw = await agentLadder(
         `Run this exact shell command in ONE Bash call and return its ENTIRE stdout, verbatim and unaltered, in the "raw" field. Do not summarize, truncate, or interpret it. Do nothing else:\n\n${dumpScript}`,
         { model: HELPER_MODEL, schema: CODEX_JUDGE_DUMP_SCHEMA, phase: phaseTitle, label: `${label}-codex-read` }
       )
@@ -1408,20 +2569,63 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
           }
         }
       }
-      const parsedResult = parseCodexJudgeDump(rawForParse)
+      const parsedResult = parseCodexReviewDump(rawForParse)
       if (!parsedResult.ok) throw new Error(parsedResult.reason)
-      const rootsIssue = checksRunRootsIssue(parsedResult.verdict.checks_run, allowedRoots)
-      if (rootsIssue) log(`JE-COUNCIL-WARNING [${phaseTitle}] ${label} (${lens.key}, codex-xhigh): ${rootsIssue} — non-fatal (v1 telemetry); verdict still accepted.`)
-      return { lens: lens.key, judgeModel: (lens.judge && lens.judge.displayModel) || 'codex-xhigh', ...reconcileLens(parsedResult.verdict, labels) }
+      // REFORMAT (sonnet, mechanical): report text -> verdict shape. The helper reformats, it never
+      // judges — every field must trace to report content, and found:false (no invented ranking)
+      // routes to the fallback exactly like any other readback failure.
+      const fmt = await agentLadder(
+        `You are a MECHANICAL reformatter for a code-review council. Below is a judge's plain-text review report over blind candidates ${labels.join(', ')}. Convert it into the structured verdict WITHOUT adding, upgrading, downgrading, or inventing ANYTHING — every pro, con, ranking position, vote${isSecurityLens(lens.key) ? ', safety flag' : ''} and reasoning sentence must be traceable to the report. Take ranking from the report's "RANKING:" line and vote from its "VOTE:" line verbatim${isSecurityLens(lens.key) ? '; take safety entries ONLY from its "SAFETY <letter>:" lines (safety "SAFE" or "UNSAFE"; severity/evidence only as written)' : ''}. If the report lacks an explicit RANKING: or VOTE: line, or is not a real review, return found:false with empty fields rather than inventing one.\n\nREPORT (verbatim):\n${parsedResult.report}`,
+        { model: HELPER_MODEL, schema: CODEX_REVIEW_VERDICT_SCHEMA, phase: phaseTitle, label: `${label}-codex-reformat` }
+      )
+      if (!fmt || fmt.found !== true) throw new Error('codex review judge: reformatter reported no traceable RANKING/VOTE in the report')
+      // security-sweep L2 (2026-07-07): fail closed if the reformat DROPPED any UNSAFE flag present in
+      // the verbatim (sha-verified) report. The reformatter is a sonnet helper; a lost SAFETY line
+      // would silently strip a security VETO, and the downstream shape/integrity guards only inspect
+      // the flags that SURVIVED — they cannot see a missing one. Re-derive the report's UNSAFE set and
+      // require the reformatted safety array to preserve every one (throw -> retry -> opus fallback).
+      if (isSecurityLens(lens.key)) {
+        const reportUnsafe = codexReportUnsafeLabels(parsedResult.report)
+        const keptUnsafe = new Set((Array.isArray(fmt.safety) ? fmt.safety : [])
+          .filter(s => s && s.safety === 'UNSAFE')
+          .map(s => String(s.label == null ? '' : s.label).trim().charAt(0).toUpperCase()))
+        const dropped = [...reportUnsafe].filter(l => !keptUnsafe.has(l))
+        if (dropped.length) throw new Error(`codex security reformat DROPPED UNSAFE flag(s) present in the verbatim report: ${dropped.join(', ')} — failing closed (a veto must never be lost in reformat)`)
+      }
+      const verdict = {
+        lens: lens.key,
+        candidates: fmt.candidates, ranking: fmt.ranking, vote: fmt.vote, reasoning: fmt.reasoning,
+        checks_run: REVIEW_CHECKS_RUN,
+        ...(isSecurityLens(lens.key) ? { safety: Array.isArray(fmt.safety) ? fmt.safety : [] } : {}),
+        ...(fmt.response_to_peers ? { response_to_peers: fmt.response_to_peers } : {}),
+        ...(typeof fmt.changed_this_round === 'boolean' ? { changed_this_round: fmt.changed_this_round } : {}),
+        ...(typeof fmt.changed_from_round1 === 'boolean' ? { changed_from_round1: fmt.changed_from_round1 } : {}),
+      }
+      const shapeIssue = verdictShapeIssue(verdict)
+      if (shapeIssue) throw new Error(`codex review judge: reformatted verdict shape invalid — ${shapeIssue}`)
+      const integrityIssue = verdictIntegrityIssue(verdict)
+      if (integrityIssue) throw new Error(`codex review judge verdict failed integrity check: ${integrityIssue}`)
+      return { lens: lens.key, judgeModel: `codex-${judgeEffort}`, ...reconcileLens(verdict, labels) }
     } catch (e) {
-      log(`council ${label} (${lens.key}) codex-xhigh attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
-      if (i === 2) return null
+      log(`council ${label} (${lens.key}) codex-xhigh readback attempt ${i}/2 failed: ${String(e).slice(0, 160)}`)
+      lastFail = classifyCodexJudgeFailure('readback', String(e))
+      if (i === 2) return { __codexFail: lastFail }
     }
   }
 }
 
 // Each judge's candidate LISTING is rotated differently (position-bias control). The shared _pool.md
 // order is fixed (advisory caveat), but the dirs listing + the "consider in this order" hint rotate.
+// Run O (2026-07-07): prompt-lab judge-lens A/B hook. ONE whitelisted variant may be swapped in
+// via args.lensVariant; anything unrecognised silently runs production (fail-safe: a typo can never
+// change judging). 'evidence-quota' = prompt-lab 03/V2 — targets the proven recall gap (a security
+// lens without forced per-candidate evidence passed bugs the same model found under other lenses).
+// The variant text is inserted as a SINGLE paragraph; every other slot stays byte-identical, per
+// the prompt-lab protocol (one variable per arm). Record: mapping.json carries lens_variant.
+const LENS_VARIANT = String(A.lensVariant || '') === 'evidence-quota' ? 'evidence-quota' : ''
+const LENS_VARIANT_BLOCKS = {
+  'evidence-quota': `\n\nEVIDENCE QUOTA (hard): your \`checks_run\` must contain AT LEAST ONE entry PER CANDIDATE — a command you ran or a file/section you actually read for that candidate, with its key result and a path inside your pinned scope. A candidate you cannot cite evidence for is a candidate you have not judged; go back and read it before ranking. No quota entry may be a duplicate of another with only the letter changed.`,
+}
 function lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) {
   const n = blindList.length
   const rotated = blindList.map((_, i) => blindList[(i + rot) % n])
@@ -1434,7 +2638,7 @@ function lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) {
     ? `\n\nThis is DELIBERATION round ${roundNum - 1} of at most 3. Your peers' latest full verdicts (blind, letters only) are below as verbatim JSON. Read them, address the disagreements in \`response_to_peers\` (convince them or be convinced — converge on the CORRECT call, do not hold a position out of stubbornness), and you MAY run 1-2 targeted checks to settle a factual dispute. Then emit your REVISED verdict and set \`changed_this_round\` / \`changed_from_round1\` truthfully.${isSecurityLens(lens.key) ? ' A peer may rebut your veto with evidence; if it genuinely refutes the flag, WITHDRAW it (drop that UNSAFE entry). A flag you still believe stands and keeps excluding the candidate.' : ''}\n\nPEER VERDICTS (JSON, verbatim):\n${peerBlock}`
     : ''
   return `You are a blind judge on a 5-member review COUNCIL. Your lens is **${lens.title || lens.key}**: ${lens.owns}. ${lens.special}
-You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you, through YOUR lens (the other four lenses cover the rest). Apply the shared scoring method: judge the real artifact not any self-summary; score against the task's STATED runtime (treat reliance on a capability the task did not establish as a risk, and treat an unfamiliar but constraint-honouring mechanism as correct unless you can name a concrete way it fails); cite specifics (a line or behaviour, never a vibe); thoroughness is evidence, not word count — do not reward length or verbosity per se.
+You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you, through YOUR lens (the other four lenses cover the rest). Apply the shared scoring method: judge the real artifact not any self-summary; score against the task's STATED runtime (treat reliance on a capability the task did not establish as a risk, and treat an unfamiliar but constraint-honouring mechanism as correct unless you can name a concrete way it fails); cite specifics (a line or behaviour, never a vibe); thoroughness is evidence, not word count — do not reward length or verbosity per se.${LENS_VARIANT ? LENS_VARIANT_BLOCKS[LENS_VARIANT] : ''}
 
 Task that every candidate was given:
 ${task}
@@ -1465,7 +2669,16 @@ function councilTally(verdicts) {
   for (const secV of secVs) {
     if (!Array.isArray(secV.safety)) continue
     for (const s of secV.safety) {
-      if (s && s.safety === 'UNSAFE' && (s.severity === 'high' || s.severity === 'critical')) {
+      // security-sweep veto-severity (2026-07-07): an UNSAFE flag used to VETO only on an EXACT
+      // 'high'/'critical' severity, so a MISSING or misspelled severity (the schema only requires
+      // label+safety) silently dropped the veto — fail-open. Now an UNSAFE flag STANDS as a veto
+      // unless its severity is EXPLICITLY a low tier (low/medium/info/none); an absent/unknown
+      // severity on an UNSAFE flag fails CLOSED (vetoes), so a malformed model verdict can't smuggle
+      // an unsafe candidate past the gate.
+      if (s && s.safety === 'UNSAFE') {
+        const sev = String(s.severity == null ? '' : s.severity).toLowerCase().trim()
+        const lowTier = sev === 'low' || sev === 'medium' || sev === 'info' || sev === 'informational' || sev === 'none'
+        if (lowTier) continue // explicitly low-severity UNSAFE: not an exclusion (as before)
         // Highest-stakes exclusion path: don't let a vacuous-but-schema-valid evidence string stand as a
         // veto (EV-judge-placeholder.md class of failure). A rejected veto does NOT kill the security
         // lens's other votes/ranking — only this one flag is disregarded, so a real veto on another
@@ -1483,10 +2696,164 @@ function councilTally(verdicts) {
   return { living, votes, vetoedSet, vetoed: [...vetoedSet], threshold, winner }
 }
 
+// ---- begin: aspect verifiers ----
+// Binary aspect verification (BoN-MAV, arXiv:2502.20379): many cheap BINARY aspect checks beat a
+// single continuous score. PURE — extract-and-eval'able (repo convention, like the return-codes
+// block); the IMPURE fan-out (aspectVerify below) is exercised structurally/system-side. Approvals
+// NEVER override the council order: they only break EXACT ties (aspectTiebreak), slotting between
+// mean-rank and blind-letter in nonVetoedOrder.
+// The 4 aspects. Each carries the SAME binary question phrased for the artifact a phase judges:
+// `plan` for a design brief (the PLAN decision points: 'Review' / 'Final rank'), `code` otherwise.
+const ASPECTS = [
+  { key: 'correct-behaviour',
+    plan: 'Would faithfully implementing this design brief produce the behaviour the task asks for — is every mechanism it relies on sound and workable as described?',
+    code: 'Does this candidate actually produce the behaviour the task asks for — traced or run, does the core path work?' },
+  { key: 'spec-fit',
+    plan: 'Does this design brief address EVERYTHING the task explicitly asked for, honouring every stated constraint, with nothing material missing or out of scope?',
+    code: 'Does this candidate do EVERYTHING the task explicitly asked for, honouring every stated constraint, with nothing material missing or out of scope?' },
+  { key: 'simplicity',
+    plan: "Is this design brief's approach the smallest coherent one that solves the task — free of over-engineering, needless surface, or gold-plating?",
+    code: "Is this candidate's implementation the smallest coherent one that solves the task — free of over-engineering, needless surface, or gold-plating?" },
+  { key: 'robustness',
+    plan: 'Does this design brief account for the realistic failure modes and edge cases its approach will face (bad input, boundaries, partial failure), rather than only the happy path?',
+    code: 'Does this candidate handle the realistic failure modes and edge cases it will face (bad input, boundaries, partial failure) gracefully, rather than only the happy path?' },
+]
+// Phase -> phrasing selector (mirrors defaultLensesFor's phase split; no phase arg reaches the table).
+function aspectQuestionFor(aspect, phaseTitle) {
+  return (phaseTitle === 'Review' || phaseTitle === 'Final rank') ? aspect.plan : aspect.code
+}
+// votesByCandidate: { [label]: [true|false|null, ...] } — one slot per aspect; null = that aspect
+// ABSTAINED (dead agent or missing vote). Approval count = strict `true`s only; an abstention
+// never counts for or against a candidate.
+function aspectTally(votesByCandidate) {
+  const out = {}
+  for (const label of Object.keys(votesByCandidate || {})) {
+    out[label] = (votesByCandidate[label] || []).reduce((n, v) => n + (v === true ? 1 : 0), 0)
+  }
+  return out
+}
+// aspectTiebreak(order, approvals): reorders ONLY exact ties in an existing council ranking by
+// approval count. `order` is an array whose elements are either a single label (not tied — NEVER
+// moved relative to its neighbours) or an array of labels that are an EXACT tie under the
+// council's sort key. Within a tie group: approval count desc, then the group's incoming order
+// (blind-letter asc from the caller's sort) — i.e. the approval count slots BETWEEN mean-rank and
+// blind-letter. A null/empty approvals map disables reordering entirely (flatten unchanged); a
+// label missing from the map counts 0. Pure; never overrides the council order otherwise.
+function aspectTiebreak(order, approvals) {
+  if (!approvals || !Object.keys(approvals).length) {
+    return (order || []).flatMap(g => (Array.isArray(g) ? g : [g]))
+  }
+  const count = l => (Number.isFinite(approvals[l]) ? approvals[l] : 0)
+  return (order || []).flatMap(g => {
+    if (!Array.isArray(g)) return [g]
+    return g.map((l, i) => ({ l, i }))
+      .sort((a, b) => (count(b.l) - count(a.l)) || (a.i - b.i))
+      .map(x => x.l)
+  })
+}
+// ---- end: aspect verifiers ----
+
+// Strict per-aspect vote schema: one BINARY approve/reject per candidate, short reason. No scores,
+// no ranking, no winner — a verifier is not a judge.
+const ASPECT_VOTE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    votes: { type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        label: { type: 'string' },
+        approve: { type: 'boolean' },
+        reason: { type: 'string', maxLength: 240 },
+      },
+      required: ['label', 'approve', 'reason'],
+    } },
+  },
+  required: ['votes'],
+}
+
+// One cheap binary verifier for ONE aspect (HELPER_MODEL): reads the staged pool once, returns
+// approve/reject per candidate. Fail-safe by construction: any failure => null (that aspect
+// ABSTAINS) — it never throws and never shrinks the field.
+async function askAspect(aspect, blindList, poolPath, phaseTitle, label) {
+  const letters = blindList.map(c => c.blind)
+  const prompt = `You are ONE binary ASPECT VERIFIER (not a judge, not a ranker) in a blind review. Your single aspect is **${aspect.key}**. For EVERY candidate answer ONE yes/no question:
+
+${aspectQuestionFor(aspect, phaseTitle)}
+
+Task every candidate was given:
+${task}
+
+All candidate deliverables are concatenated, blind-labelled, in ONE file — read it ONCE (each candidate's section is headed "===== Candidate <letter> ====="):
+${poolPath}
+Do not read any other files. You do NOT know which model produced which candidate; do not speculate.
+
+Return one vote per candidate, for candidates ${letters.join(', ')} — each vote: label, approve (true = yes, it clearly passes this aspect; false = no, or too unclear to approve), and a SHORT reason (one clause). BINARY only: no scores, no ranking, no overall winner.`
+  try {
+    const raw = await agentLadder(prompt, { model: HELPER_MODEL, schema: ASPECT_VOTE_SCHEMA, phase: phaseTitle, label })
+    if (!raw || !Array.isArray(raw.votes)) return null
+    const set = new Set(letters)
+    const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
+    const byLabel = {}
+    for (const v of raw.votes) {
+      const l = norm(v && v.label)
+      if (set.has(l) && typeof (v && v.approve) === 'boolean' && byLabel[l] === undefined) {
+        byLabel[l] = { label: l, approve: v.approve, reason: String(v.reason || '').slice(0, 240) }
+      }
+    }
+    if (!Object.keys(byLabel).length) return null // schema-valid junk (no recognisable labels) = abstain
+    return { aspect: aspect.key, votes: letters.map(l => byLabel[l] || null) }
+  } catch (e) {
+    log(`aspect verifier '${aspect.key}' failed (${String(e).slice(0, 100)}) — this aspect ABSTAINS (never fatal).`)
+    return null
+  }
+}
+
+// Fan out ONE HELPER_MODEL verifier per aspect (4 total) against the SAME staged pool the council
+// reads. Launched CONCURRENTLY with the round-1 lens fan-out (no ordering dependency). Native
+// Anthropic seats expose no engine-known wall clock (lensTimeoutSecsFor-style null), so
+// parallelQuorum never quorum-closes an aspect seat here — but every failure path already
+// degrades to an abstention, so a dead aspect can never block or crash the council. Returns
+// { approvals: {label: n}, by_aspect: [{aspect, votes|null}] } (persisted in council.json as
+// `aspects`) or null when everything abstained/failed.
+async function aspectVerify(blindList, poolPath, phaseTitle) {
+  const letters = blindList.map(c => c.blind)
+  try {
+    const results = await parallelQuorum(ASPECTS, (aspect) =>
+      askAspect(aspect, blindList, poolPath, phaseTitle, `aspect-${aspect.key}`), phaseTitle, {
+      timeoutSecsFor: () => null, // native seats: no engine-known wall clock => never quorum-closable
+      seatLabelFor: (a) => `aspect:${a.key}`,
+    })
+    const votesByCandidate = {}
+    for (const l of letters) {
+      votesByCandidate[l] = ASPECTS.map((a, i) => {
+        const r = results[i]
+        const v = r && Array.isArray(r.votes) ? r.votes.find(x => x && x.label === l) : null
+        return v ? v.approve : null // dead aspect / missing per-candidate vote = abstain (null)
+      })
+    }
+    const approvals = aspectTally(votesByCandidate)
+    const by_aspect = ASPECTS.map((a, i) => ({
+      aspect: a.key,
+      votes: results[i] && Array.isArray(results[i].votes) ? results[i].votes.filter(Boolean) : null, // null = abstained
+    }))
+    const dead = by_aspect.filter(x => !x.votes).map(x => x.aspect)
+    if (dead.length === ASPECTS.length) { log(`aspect verifiers [${phaseTitle}]: ALL aspects abstained — proceeding without aspect data (fail-safe).`); return null }
+    if (dead.length) log(`aspect verifiers [${phaseTitle}]: ${dead.length}/${ASPECTS.length} aspect(s) abstained (${dead.join(', ')}).`)
+    log(`aspect verifiers [${phaseTitle}]: approvals ${letters.map(l => `${l}:${approvals[l]}`).join(', ')} (of ${ASPECTS.length} binary aspects; tiebreak + steelman context only).`)
+    return { approvals, by_aspect }
+  } catch (e) {
+    log(`aspect verifiers failed entirely (${String(e).slice(0, 100)}) — proceeding without (fail-safe).`)
+    return null
+  }
+}
+
 // Non-vetoed candidates in carry/seed order: most first-place votes, then best mean rank across
 // living verdicts, then blind label. Used by the fast tally (top-2 carry) and the steelman loop
-// (finalist seeding). Deterministic code — never an LLM.
-function nonVetoedOrder(verdicts, labels, vetoedSet) {
+// (finalist seeding). Deterministic code — never an LLM. `aspectApprovals` (optional; only passed
+// when args.aspectVerifiers produced data) breaks EXACT (first-votes, mean-rank) ties by binary
+// approval count — slotting between mean-rank and blind-letter via aspectTiebreak. Positions that
+// are not exact ties NEVER move.
+function nonVetoedOrder(verdicts, labels, vetoedSet, aspectApprovals = null) {
   const firstVotes = {}, rankSum = {}, rankCount = {}
   for (const l of labels) { firstVotes[l] = 0; rankSum[l] = 0; rankCount[l] = 0 }
   for (const v of verdicts) {
@@ -1494,8 +2861,19 @@ function nonVetoedOrder(verdicts, labels, vetoedSet) {
     ;(v.ranking || []).forEach((l, idx) => { if (rankCount[l] != null) { rankSum[l] += idx + 1; rankCount[l]++ } })
   }
   const avgRank = l => rankCount[l] ? rankSum[l] / rankCount[l] : labels.length + 1
-  return labels.filter(l => !vetoedSet.has(l))
+  const sorted = labels.filter(l => !vetoedSet.has(l))
     .sort((a, b) => (firstVotes[b] - firstVotes[a]) || (avgRank(a) - avgRank(b)) || a.localeCompare(b))
+  if (!aspectApprovals) return sorted
+  // Group EXACT ties under the council sort key (first-votes, mean-rank); aspectTiebreak reorders
+  // only within a group (approval count desc, then the incoming blind-letter order).
+  const key = l => `${firstVotes[l]}|${avgRank(l)}`
+  const groups = []
+  for (const l of sorted) {
+    const g = groups[groups.length - 1]
+    if (g && key(g[0]) === key(l)) g.push(l)
+    else groups.push([l])
+  }
+  return aspectTiebreak(groups, aspectApprovals)
 }
 
 // A compact, blind (letters-only) peer block handed to each judge during deliberation.
@@ -1616,7 +2994,8 @@ ${block}
 Return only the two guidance lists (each item: text, conf, why).`
   for (let i = 1; i <= 2; i++) {
     try {
-      const g = await agent(prompt, { model: 'opus', schema: GUIDANCE_SYNTH_SCHEMA, phase: phaseTitle, label })
+      // Ladder rung ONLY on the final same-model try (opus try, opus retry, THEN sonnet rung).
+      const g = await agentLadder(prompt, { model: 'opus', schema: GUIDANCE_SYNTH_SCHEMA, phase: phaseTitle, label }, { eligible: i === 2 })
       if (g && typeof g === 'object' && Array.isArray(g.positives) && Array.isArray(g.challenges)) {
         // Integrity guard (same choke-point family as reconcile()/askLens()): reject schema-valid junk
         // guidance (e.g. every item literally {text:"a", why:"b"}) before it steers a fresh round-2.
@@ -1652,12 +3031,29 @@ const STEELMAN_SCHEMA = {
   }, required: ['changes'],
 }
 
-async function steelmanChangeLists(finalists, verdicts, phaseTitle, label) {
+// Compact aspect-verifier context block for the steelman prompt (approval counts + which aspects
+// rejected each finalist, with the short reasons). Context only — never votes, never a ranking.
+function aspectSteelmanContext(aspects, finalists) {
+  if (!aspects || !aspects.approvals) return ''
+  const lines = finalists.map(f => {
+    const rejected = (aspects.by_aspect || [])
+      .map(a => ({ aspect: a.aspect, v: Array.isArray(a.votes) ? a.votes.find(x => x && x.label === f) : null }))
+      .filter(x => x.v && x.v.approve === false)
+      // security-sweep M2 (2026-07-07): x.v.reason is MODEL-AUTHORED; interpolated raw, a newline or
+      // quote breaks out of the ("...") context block and injects instructions that steer the
+      // steelman/booster. Collapse newlines and neutralise quotes before embedding.
+      .map(x => `${x.aspect} ("${String(x.v.reason == null ? '' : x.v.reason).replace(/[\r\n]+/g, ' ').replace(/["`]/g, "'").slice(0, 300)}")`)
+    return `- Candidate ${f}: ${aspects.approvals[f] ?? 0} of ${(aspects.by_aspect || []).length} aspects approved${rejected.length ? `; rejected by ${rejected.join('; ')}` : ''}`
+  })
+  return `\n\nASPECT VERIFIER RESULTS (independent cheap binary checks; CONTEXT ONLY — they are not judges, cast no votes, and never pick winners; use a rejection reason only where it corroborates a judge-cited con):\n${lines.join('\n')}`
+}
+
+async function steelmanChangeLists(finalists, verdicts, phaseTitle, label, aspects = null) {
   const block = JSON.stringify(verdicts.map(v => ({ lens: v.lens, vote: v.vote, ranking: v.ranking, reasoning: v.reasoning,
     candidates: (v.candidates || []).filter(c => finalists.includes(String(c.label || '').charAt(0))).map(c => ({ label: c.label, pros: c.pros, cons: c.cons })) })), null, 2)
   try {
-    const res = await agent(
-      `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}`,
+    const res = await agentLadder(
+      `You are the STEELMAN for a blind review — a synthesis helper, explicitly NOT a judge: you never vote, never rank, never pick a winner. Below are the review council's verdicts on the finalist candidates ${finalists.join(' and ')}. For EACH finalist, produce the MINIMAL change-list that would make IT the clear winner. HARD RULES: every item must be traceable to a judge-cited con (put the con it addresses in \`addresses\`, quoted or closely paraphrased); steel-man, do not redesign — no new features, no scope growth, no stylistic rewrites beyond the cited cons; prefer the smallest coherent edit per con. Return one entry per finalist.${isPlanPoint(phaseTitle) ? `\n\nALTITUDE (hard rule for THIS decision point): the finalists are DESIGN BRIEFS, and they must STAY design briefs. Every change item must be an edit to the brief's TEXT (approach, surfaces, risks, acceptance criteria). NEVER emit an item that instructs creating, shipping, or writing code, tests, or any runnable file — even if the task text names a code deliverable; the code is produced LATER by the implement stage from the winning brief. An item like "ship the runnable file" is a redesign of the artifact class and is forbidden (observed live: it flipped a plan steelman into an expensive secret implementation loop).` : ''}\n\nCOUNCIL VERDICTS (blind, verbatim):\n${block}${aspectSteelmanContext(aspects, finalists)}`,
       { model: 'opus', schema: STEELMAN_SCHEMA, phase: phaseTitle, label: `${label}-steelman` })
     const out = {}
     for (const c of (res && res.changes) || []) {
@@ -1673,8 +3069,8 @@ async function steelmanChangeLists(finalists, verdicts, phaseTitle, label) {
 async function boostCandidate(origDir, outDir, items, phaseTitle, label) {
   const list = items.map((it, i) => `${i + 1}. ${it.change}\n   (addresses: ${it.addresses})`).join('\n')
   try {
-    await agent(
-      `This is an approved internal step of the joust-engine tournament: apply a review-driven improvement pass to a candidate artifact. First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical. When done, reply "done".`,
+    await agentLadder(
+      `Joust-engine steelman step: apply a review-driven improvement pass to a COPY of a candidate artifact (both paths are inside this run's scratch directory; the original stays untouched). First run in ONE Bash call: mkdir -p ${q(outDir)} && cp -R ${q(origDir)}/. ${q(outDir)}/ 2>/dev/null; then EDIT the files under ${outDir} to apply EXACTLY this change-list — nothing more (no redesign, no new features, no reformatting beyond the listed items):\n\n${list}\n\nKeep every file not named by the list byte-identical.${isPlanPoint(phaseTitle) ? ` ALTITUDE (hard rule): this artifact is a DESIGN BRIEF — edit its text only. Do NOT create code, tests, or any new runnable file, even if a change item or the task seems to ask for one; skip such an item and note the skip (implementation happens in a later stage from the winning brief).` : ''}\n\nHARD STOP DISCIPLINE (this pass is edit-and-stop, not iterate-until-perfect): make ONE editing pass over the listed items, then STOP and reply "done". Do NOT run test suites, builds, or the artifact itself — a separate staging gate validates the boosted artifact after you finish, so any verification you run here is duplicated spend (observed live: a boost agent burned 88 tool calls re-running full test suites). At most, you may re-read an edited file once to confirm the edit landed. If a change-list item cannot be applied as written, skip it and note the skip in your final reply instead of iterating on it.`,
       { model: 'opus', phase: phaseTitle, label })
     return true
   } catch (e) { log(`steelman boost ${label} failed: ${String(e).slice(0, 100)} — candidate re-enters at its last gated version (ratchet)`); return false }
@@ -1683,6 +3079,30 @@ async function boostCandidate(origDir, outDir, items, phaseTitle, label) {
 async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitle, label, lenses = LENSES, style = 'final') {
   const labels = blindList.map(c => c.blind)
   const roundsLog = []
+  const reviewDir = poolPath.replace(/\/_pool\.md$/, '')
+  // Persist phase 2 (issue #33): land each round's per-seat verdicts as SMALL typed sha-verified
+  // files under <reviewDir>/_judges/ as soon as the round's verdicts are final — amortized DURING
+  // judging, off the checkpoint critical path. The engine copy is authoritative (the exact
+  // roundRecord verdict entry, serialized json(entry)); a codex seat's raw workspace VERDICT.json
+  // stays a debug artifact. Verified writes are recorded in the module seatRefs map so the
+  // checkpoint's tally skeleton can reference them; a failed write leaves that seat INLINE in the
+  // skeleton (persist logs, never throws) — worst case is today's behaviour, never a crashed run.
+  const refs = seatRefs[label] = Object.create(null)
+  const judgesDir = `${reviewDir}/_judges`
+  const relJudges = judgesDir.startsWith(`${runDir}/`) ? judgesDir.slice(runDir.length + 1) : judgesDir
+  const persistSeatFiles = async (entries) => {
+    try {
+      const okPaths = new Set(await persist(entries.map(e => ({ path: `${judgesDir}/${e.name}`, content: e.content })), phaseTitle))
+      for (const e of entries) {
+        if (okPaths.has(`${judgesDir}/${e.name}`)) refs[e.key] = { rel: `${relJudges}/${e.name}`, sha: sha256Hex(heredocBody(e.content)) }
+      }
+    } catch (e) { log(`seat-file persist (${label}): ${String(e).slice(0, 120)} — affected seats stay inline in the tally skeleton`) }
+  }
+  // One persist batch per judging round: the just-pushed roundRecord's verdict entries, keyed by
+  // lens + round (what buildTallySkeleton matches against council.rounds). Seat filenames reuse
+  // the existing seat label (`<phase-label>-<lens.key>-r<n>`), flat under _judges/.
+  const persistRoundSeats = (rec) => persistSeatFiles((rec.verdicts || []).map(v => ({
+    key: `${v.lens}|r${rec.round}`, name: `${label}-${v.lens}-r${rec.round}.json`, content: json(v) })))
   // Per-judge-seat RC (observability). A living lens seat = 00; a REQUESTED lens with no living verdict
   // after retries = a dead seat (09). `no_consensus` is NOT a fault — it still records 00 for the living
   // seats only. Recorded once, at the terminal decision, over the FINAL living verdicts.
@@ -1692,9 +3112,18 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     for (const l of lenses) if (!livingKeys.has(l.key)) recordSeat(`${label}:${l.key}`, phaseTitle, RC.UNKNOWN, 'lens-seat-dead-after-retries')
   }
 
+  // Aspect verifiers (args.aspectVerifiers, default OFF): launched CONCURRENTLY with the round-1
+  // lens fan-out — both read the same staged pool, no ordering dependency. aspectVerify never
+  // rejects (fail-safe: abstentions), so the un-awaited promise is always harmless.
+  const aspectsPromise = ASPECT_VERIFIERS ? aspectVerify(blindList, poolPath, phaseTitle) : null
+
   // Round 1 — 5 independent verdicts, no peer visibility. Each lens gets a differently-rotated listing.
-  const r1raw = await parallel(lenses.map((lens, i) => () =>
-    askLens(lens, blindList, poolPath, phaseTitle, `${label}-${lens.key}-r1`, 1, null, i)))
+  const r1raw = await parallelQuorum(lenses, (lens, i) =>
+    askLens(lens, blindList, poolPath, phaseTitle, `${label}-${lens.key}-r1`, 1, null, i), phaseTitle, {
+    timeoutSecsFor: lensTimeoutSecsFor,
+    neverClose: (lens) => isSecurityLens(lens.key), // NEVER close over a security-gate seat
+    seatLabelFor: (lens) => `${label}:${lens.key}`,
+  })
   let verdicts = r1raw.filter(Boolean)
   if (!verdicts.length) {
     log(`council ${label}: ALL 5 lenses died in round 1 — degrading to a __failed partial (caller lands a partial run).`)
@@ -1702,14 +3131,22 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     return { __failed: 'all council judges failed in round 1' }
   }
 
+  // Aspect data (flag-gated; null when off or all aspects abstained). Approvals feed ONLY the
+  // nonVetoedOrder tiebreak slot and the steelman context; `aspects` is recorded in council
+  // metadata (persisted in council.json).
+  const aspects = aspectsPromise ? await aspectsPromise : null
+  const aspectApprovals = aspects ? aspects.approvals : null
+  const attachAspects = (result) => { if (aspects && result && result.council) result.council.aspects = aspects; return result }
+
   // Security-judge death policy: repoMode = fail-closed (unresolvable veto → NO_CONSENSUS/needs-human);
   // isolated run = proceed, but LOUD warning that veto coverage was lost.
-  const securityDeadHalt = () => {
+  const securityDeadHalt = async () => {
     const tt = councilTally(verdicts)
     roundsLog.push(roundRecord(roundsLog.length + 1, verdicts, tt, lenses))
+    await persistRoundSeats(roundsLog[roundsLog.length - 1]) // persist phase 2: this fail path still checkpoints its seats
     recordCouncilSeats(verdicts)
-    return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
-      humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' })
+    return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true,
+      humanReason: 'security judge unavailable in repo mode — veto coverage lost (fail-closed)' }))
   }
   if (!verdicts.some(v => v.lens === 'security')) {
     if (repoMode) {
@@ -1721,6 +3158,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
 
   let t = councilTally(verdicts)
   roundsLog.push(roundRecord(1, verdicts, t, lenses))
+  await persistRoundSeats(roundsLog[roundsLog.length - 1]) // persist phase 2: round-1 seats land now (~2-20KB each, one helper batch)
   const allVetoed = () => labels.length > 0 && labels.every(l => t.vetoedSet.has(l))
   recordCouncilSeats(verdicts)
 
@@ -1730,7 +3168,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   // the panel preferred. Majority => carry 1 (byte-identical outcome to before); split => carry
   // the TOP TWO non-vetoed; all-vetoed => carry NONE and proceed on guidance alone (NOT a halt).
   if (style === 'intermediate') {
-    const order = nonVetoedOrder(verdicts, labels, t.vetoedSet)
+    const order = nonVetoedOrder(verdicts, labels, t.vetoedSet, aspectApprovals)
     const carried = t.winner != null ? [t.winner] : order.slice(0, 2)
     if (t.winner == null) log(`council ${label}: FAST TALLY — no majority; carrying top ${carried.length} non-vetoed candidate(s) [${carried.join(', ')}] into the final pool (no deliberation at intermediate reviews).`)
     if (!carried.length) log(`council ${label}: FAST TALLY — every candidate vetoed; carrying none, round 2 proceeds on guidance alone.`)
@@ -1745,7 +3183,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
         ? `Carried champion(s): ${carried.join(', ')} (vote split ${Object.keys(t.votes).sort().map(k => `${k}:${t.votes[k]}`).join(', ') || 'none'}) — these set the bar the final pool must beat.`
         : 'No candidate was carried (all vetoed); the final pool is round 2 alone.'
     }
-    return result
+    return attachAspects(result)
   }
 
   // ---- FINAL decision point: STEELMAN SHOOTOUT (judging-v3 spec 2). The seed vote NEVER crowns —
@@ -1755,25 +3193,32 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   if (allVetoed()) {
     const reason = 'all candidates were vetoed UNSAFE by the security lens(es)'
     log(`council ${label}: NO_CONSENSUS — ${reason}.`)
-    return buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: reason })
+    return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: reason }))
   }
-  const seedOrder = nonVetoedOrder(verdicts, labels, t.vetoedSet)
+  const seedOrder = nonVetoedOrder(verdicts, labels, t.vetoedSet, aspectApprovals)
   const seeds = seedOrder.slice(0, 2)
-  const reviewDir = poolPath.replace(/\/_pool\.md$/, '')
   const seedVotesStr = Object.keys(t.votes).sort().map(k => `${k}:${t.votes[k]}`).join(', ') || 'none'
   log(`council ${label}: STEELMAN SHOOTOUT — seed vote ${seedVotesStr}${t.winner ? ` (majority: ${t.winner})` : ' (no majority)'}; finalists [${seeds.join(', ')}].`)
   const steelmanMeta = { seeds, seed_votes: { ...t.votes }, seed_majority: t.winner || null, rounds: [], decided_by: null }
+  // Run N: fire-and-forget the speculative-implement seed hook the moment the finalists are known.
+  // Registered only for the plan final rank; cleared on fire so no other council point can trigger it.
+  if (onSteelmanSeeds) { const h = onSteelmanSeeds; onSteelmanSeeds = null; try { h(seeds.slice()) } catch (e) { log(`speculative seed hook failed (non-fatal): ${String(e).slice(0, 120)}`) } }
   const currentWs = {}                          // ratchet state: letter -> last GATED artifact dir
   for (const s of seeds) currentWs[s] = `${reviewDir}/${s}`
   const loneFinalist = seeds.length === 1
   let finalWinner = null                        // ORIGINAL pool letter
   let lastRunoffVerdicts = null                 // mapped to original letters (for orchestrator pick)
   let steelmanVerdicts = verdicts               // what the steelman reads (orig-letter space)
-  const maxIters = loneFinalist ? 1 : 5
+  // Steelman iteration budget (2026-07-07, Rob): variable per run — 'fast' = 1 (the one
+  // mandatory shootout round, ties route straight to the orchestrator pick), 'deep' = up to 5,
+  // default 3. Clamped 1..5; loneFinalist stays a single boosted-vs-original round regardless.
+  const iterBudget = Number.isInteger(A.steelmanMaxIters) && A.steelmanMaxIters >= 1 && A.steelmanMaxIters <= 5
+    ? A.steelmanMaxIters : 3
+  const maxIters = loneFinalist ? 1 : iterBudget
 
   for (let iter = 1; iter <= maxIters && finalWinner == null; iter++) {
     // (a) steelman: cons -> minimal change-lists (never votes). Only the steelman sees history.
-    const changeLists = await steelmanChangeLists(seeds, steelmanVerdicts, phaseTitle, `${label}-i${iter}`)
+    const changeLists = await steelmanChangeLists(seeds, steelmanVerdicts, phaseTitle, `${label}-i${iter}`, aspects)
     // (b) boost each finalist on a COPY; a failed/empty boost re-enters at the last gated version.
     const boostDirs = {}
     await parallel(seeds.map(s => async () => {
@@ -1799,12 +3244,48 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       stagedR = (await stageAndValidate(blindLabel(repaired, iter), runoffDir, phaseTitle)).filter(c => c.valid)
     }
     if (!stagedR.length) { log(`steelman ${label} i${iter}: runoff staging produced no valid candidates — ending loop on seed result.`); break }
+    // run-j2 fix (2026-07-07): the runoff previously carried the COPIED source stamps (a stale
+    // "MECHANICAL: patch applies cleanly") into the cold re-judge and never re-gated the BOOSTED
+    // patches — a boost that regenerates a broken patch was judged (and could WIN) under a clean
+    // stamp; observed live: run-j2 i1's winning boost does not apply at the pinned baseline. The
+    // runoff now re-derives stamps + pool via the same mechanical gate as every implement round; a
+    // gate-invalidated boost ratchets back to the last gated version (one repair pass), mirroring
+    // the staging-gate ratchet above. Lone mode needs no repair: the failed variant simply drops.
+    {
+      const preN = stagedR.length
+      let gatedR = (await mechanicalPatchGate(stagedR, runoffDir, phaseTitle)).filter(inContention)
+      if (gatedR.length < preN && !loneFinalist) {
+        const still = new Set(gatedR.map(c => c.orig))
+        const repaired = runoffEntries.map(e => still.has(e.orig) ? e : { ...e, ws: currentWs[e.orig], variant: 'ratchet' })
+        log(`steelman ${label} i${iter}: ${preN - gatedR.length} boost(s) failed the MECHANICAL gate — reverted to last gated version (ratchet).`)
+        runoffDir = `${runoffDir}-mechrepair`
+        const restaged = (await stageAndValidate(blindLabel(repaired, iter), runoffDir, phaseTitle)).filter(c => c.valid)
+        gatedR = (await mechanicalPatchGate(restaged, runoffDir, phaseTitle)).filter(inContention)
+      }
+      stagedR = gatedR
+    }
+    if (!stagedR.length) { log(`steelman ${label} i${iter}: no candidate survived the runoff mechanical gate — ending loop on seed result.`); break }
     if (repoMode) await enrichBlindPool(stagedR, runoffDir, phaseTitle)
     const runoffPool = `${runoffDir}/_pool.md`
-    const rRaw = await parallel(lenses.map((lens, i) => () =>
-      askLens(lens, stagedR, runoffPool, phaseTitle, `${label}-runoff${iter}-${lens.key}-r1`, 1, null, i)))
+    const rRaw = await parallelQuorum(lenses, (lens, i) =>
+      askLens(lens, stagedR, runoffPool, phaseTitle, `${label}-runoff${iter}-${lens.key}-r1`, 1, null, i), phaseTitle, {
+      timeoutSecsFor: lensTimeoutSecsFor,
+      neverClose: (lens) => isSecurityLens(lens.key), // NEVER close over a security-gate seat
+      seatLabelFor: (lens) => `${label}:runoff${iter}:${lens.key}`,
+    })
     const rVerdicts = rRaw.filter(Boolean)
     if (!rVerdicts.length) { log(`steelman ${label} i${iter}: all runoff judges died — ending loop on seed result.`); break }
+    // security-sweep H12 (2026-07-07): the runoff must apply the SAME security-dead fail-closed policy
+    // as round 1 (line ~3081). If the primary security lens produced no runoff verdict, veto coverage
+    // is lost for the boosted finalists; in repoMode that is unresolvable → NO_CONSENSUS (needs-human),
+    // never a crown without a security gate. (Non-repo isolated runs warn and proceed, as round 1 does.)
+    if (!rVerdicts.some(v => v.lens === 'security')) {
+      if (repoMode) {
+        log(`council ${label}: SECURITY lens dead in the steelman runoff (repoMode) — veto coverage unresolvable; failing closed to NO_CONSENSUS.`)
+        return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: 'security judge unavailable in the steelman runoff (repo mode) — veto coverage lost (fail-closed)' }))
+      }
+      log(`JE-COUNCIL-WARNING [${phaseTitle}]: security lens dead in the steelman runoff — veto coverage LOST for this isolated run; proceeding WITHOUT a runoff security veto.`)
+    }
     const rt = councilTally(rVerdicts)
     const origOf = (blind) => { const e = stagedR.find(c => c.blind === blind); return e ? e.orig : null }
     const mapVerdict = v => ({ ...v, vote: origOf(v.vote) || v.vote })
@@ -1813,6 +3294,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       candidates: (v.candidates || []).map(c => ({ ...c, label: origOf(String(c.label || '').charAt(0)) || c.label })),
       vote: origOf(v.vote) || v.vote,
       ranking: (v.ranking || []).map(l => origOf(l) || l) }))
+    // Persist phase 2: durable per-seat runoff verdicts (ORIG-LETTER mapped — what steelmanVerdicts
+    // consumes) under the base reviewDir's _judges/. Runoff verdicts never appear in council.rounds,
+    // so these files are a natural partial checkpoint (inspection v1; resume v2), recorded under
+    // distinct runoff keys the tally skeleton never matches.
+    await persistSeatFiles(steelmanVerdicts.map(v => ({
+      key: `runoff${iter}|${v.lens}`, name: `${label}-runoff${iter}-${v.lens}-r1.json`, content: json(v) })))
     steelmanMeta.rounds.push({
       iteration: iter,
       change_lists: Object.fromEntries(seeds.map(s => [s, (changeLists[s] || []).map(it => it.change)])),
@@ -1824,7 +3311,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     const bothVetoed = stagedR.length > 0 && stagedR.every(c => rt.vetoedSet.has(c.blind))
     if (bothVetoed) {
       log(`council ${label}: STEELMAN runoff i${iter} — every finalist vetoed UNSAFE; NO_CONSENSUS (needs-human).`)
-      return buildCouncilResult({ winner: null, verdicts: steelmanVerdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: 'both steelman finalists vetoed UNSAFE in the runoff' })
+      return attachAspects(buildCouncilResult({ winner: null, verdicts: steelmanVerdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: 'both steelman finalists vetoed UNSAFE in the runoff' }))
     }
     if (rt.winner != null) {
       const winEntry = stagedR.find(c => c.blind === rt.winner)
@@ -1833,13 +3320,33 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       // ship the version that WON: copy the winning gated artifact over the winner's staged dir so
       // every downstream consumer (plan bundling, adoption, reports) gets the polished artifact.
       if (winEntry.ws !== `${reviewDir}/${finalWinner}`) {
-        await agent(`This is an approved internal step of the joust-engine tournament: adopt the improved winner artifact. Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; find "$DEST" -mindepth 1 -delete 2>/dev/null; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
-          { model: HELPER_MODEL, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`))
+        // Rename-preserving adopt (2026-07-07): NO deletion — the pre-boost original is moved
+        // aside as an audit sibling (<letter>.pre-steelman-iN) and the boosted copy takes the
+        // staged slot. The old find-delete+overwrite form was blocked by the harness safety
+        // classifier in auto mode (twice, live), which left the staged winner UN-boosted; a
+        // rename keeps every byte recoverable and gives the runDir a free audit trail.
+        // security-sweep H13 (2026-07-07): the adopt copy is delegated to a helper. The old code
+        // swallowed the .catch and never CONFIRMED the copy landed, so a skipped/partial copy shipped
+        // the STALE pre-boost artifact while the result reported the boosted one won. The command now
+        // emits a content fingerprint of SRC and DEST after the copy; the engine compares them and, on
+        // mismatch/failure, records adopt_verified:false in steelmanMeta (auditable) — the WINNER
+        // determination is unaffected (correct either way; the staged copy is what may be stale).
+        const adoptRaw = await agentLadder(`Joust-engine staging step: the council's steelman pass produced an improved copy of the winning candidate; adopt it into the staged slot by RENAMING the current copy aside as an audit backup and copying the improved version in (nothing is deleted; both paths are engine-managed scratch dirs inside this run's staging area). Run in ONE Bash call and return its stdout VERBATIM in the "raw" field: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; BAK="$DEST.pre-steelman-i${iter}"; [ -e "$BAK" ] && BAK="$BAK.$$"; mv "$DEST" "$BAK" && mkdir -p "$DEST" && cp -R "$SRC"/. "$DEST"/; h(){ cd "$1" 2>/dev/null && find . -type f ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | sort | shasum -a 256 2>/dev/null | cut -d' ' -f1; }; echo "JADOPT src=$(h "$SRC") dest=$(h "$DEST")"`,
+          { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => { log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`); return null })
+        const am = ((adoptRaw && adoptRaw.raw) || '').match(/JADOPT src=([0-9a-f]{64}) dest=([0-9a-f]{64})/)
+        const adoptVerified = !!(am && am[1] === am[2])
+        steelmanMeta.adopt_verified = adoptVerified
+        if (!adoptVerified) log(`JE-STEELMAN-ADOPT-UNVERIFIED [${label}]: the boosted winner's staged copy did NOT verify against its source (${am ? 'hash mismatch' : 'no fingerprint returned'}); downstream may read the pre-boost artifact — the winner determination is unaffected. Boosted content is intact at ${winEntry.ws}.`)
       }
-    } else if (iter < maxIters) {
-      // tie -> iterate: next boosts are gated versions of THIS round (ratchet forward on gate pass)
+    } else {
+      // tie -> ratchet forward: currentWs advances to THIS round's gated boosted versions. variant
+      // 'boosted' means it PASSED the mechanical gate above; 'ratchet'/'mechrepair' reverts keep their
+      // prior gated ws. security-sweep M13 (2026-07-07): ratchet on EVERY tied iteration INCLUDING the
+      // last — the old `iter < maxIters` guard skipped the final ratchet, so a tie that exhausted the
+      // loop handed the orchestrator needs_orchestrator_pick.gated_ws pointing at the SECOND-TO-LAST
+      // round's artifacts, silently one improvement pass stale (never ungated, just not the latest).
       for (const c of stagedR) if (c.variant === 'boosted') currentWs[c.orig] = c.ws
-      log(`council ${label}: STEELMAN runoff i${iter} tied (${Object.keys(rt.votes).sort().map(k => `${k}:${rt.votes[k]}`).join(', ') || 'no votes'}); iterating.`)
+      if (iter < maxIters) log(`council ${label}: STEELMAN runoff i${iter} tied (${Object.keys(rt.votes).sort().map(k => `${k}:${rt.votes[k]}`).join(', ') || 'no votes'}); iterating.`)
     }
   }
 
@@ -1849,7 +3356,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     result.reasoning = `Steelman shootout: seed vote ${seedVotesStr}${t.winner ? ` (seed majority ${t.winner})` : ''}; finalists [${seeds.join(', ')}] each received a judge-guided improvement pass; Candidate ${finalWinner} won the cold runoff after ${steelmanMeta.rounds.length} steelman round(s). Decided by ${steelmanMeta.decided_by}.`
     result.council.steelman = steelmanMeta
     if (guidanceWanted) result.guidance = await synthesizeGuidance(steelmanVerdicts, phaseTitle, `${label}-guidance`)
-    return result
+    return attachAspects(result)
   }
   // 5 rounds, still tied -> the ORCHESTRATOR casts the deciding vote (never the engine, never an
   // LLM aggregation). NOT no_consensus: both finalists are gated, security-cleared, 5x improved —
@@ -1865,7 +3372,7 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
   }
   result.reasoning = `Steelman shootout: ${maxIters} improvement rounds could not break the tie between [${seeds.join(', ')}] — the orchestrator must cast the deciding vote (both finalists are gated and security-cleared; a vetoed candidate can never be picked).`
   if (guidanceWanted) result.guidance = await synthesizeGuidance(steelmanVerdicts, phaseTitle, `${label}-guidance`)
-  return result
+  return attachAspects(result)
 }
 
 // ---- begin: report renderers (PURE — sliced by bin/je-render.mjs + tests; deps: GUIDANCE_CAP only) ----
@@ -1939,19 +3446,25 @@ function councilTallyMd(council) {
 // genericise a failReason for the BLIND summary so a provider-specific failure can't re-identify a model
 const blindFail = r => r ? 'excluded (did not pass validation)' : r
 
+// security-sweep M3 (2026-07-07): reasoning/pros/cons are MODEL-AUTHORED and rendered into verdict.md
+// as markdown. A candidate-influenced judge could embed `## Winner` / `**VETO**` / a table to SPOOF
+// the engine-written sections a human reads. Defang model text before rendering: collapse newlines
+// (no new block), strip leading markdown structural chars (#>|`*-+ so it can't open a heading/quote/
+// table/fence/list), and cap length. The engine's own labels/headers are written directly, unescaped.
+const mdSafe = (s) => String(s == null ? '' : s).replace(/[\r\n]+/g, ' ').replace(/^[\s#>|`*+-]+/, '').replace(/[`]/g, "'").slice(0, 4000)
 // verdict object (blind, letters only): { candidates:[{label,pros,cons}], ranking, winner, reasoning, guidance? }
 function verdictToMd(v, title) {
   // Council NO_CONSENSUS carries winner:null — render it as a HALT banner, never a fake "Candidate ".
   const winnerLine = (v.no_consensus || !v.winner) ? '**Winner:** NO CONSENSUS (routed to human review)' : `**Winner:** Candidate ${v.winner}`
   const L = [`# ${title}`, '', winnerLine, '',
     `**Ranking (best first):** ${(v.ranking || []).map(r => `Candidate ${r}`).join(' > ')}`, '',
-    '## Reasoning', '', v.reasoning || '_(none given)_', '', '## Per-candidate', '']
+    '## Reasoning', '', v.reasoning ? mdSafe(v.reasoning) : '_(none given)_', '', '## Per-candidate', '']
   for (const c of (v.candidates || [])) {
     L.push(`### Candidate ${c.label}`, '', '**Pros**')
-    for (const p of (c.pros || [])) L.push(`- ${p}`)
+    for (const p of (c.pros || [])) L.push(`- ${mdSafe(p)}`)
     if (!(c.pros || []).length) L.push('- _(none)_')
     L.push('', '**Cons**')
-    for (const x of (c.cons || [])) L.push(`- ${x}`)
+    for (const x of (c.cons || [])) L.push(`- ${mdSafe(x)}`)
     if (!(c.cons || []).length) L.push('- _(none)_')
     L.push('')
   }
@@ -1994,9 +3507,15 @@ function rcSummaryMd(rcSummary) {
   return L
 }
 
-function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound, rcSummary }) {
+function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound, rcSummary, resume }) {
   const L = [`# Joust Engine — run summary${unblind ? '' : ' (BLIND)'}`, '',
     `**Mode:** ${mode === 'two' ? 'two-pass' : 'single-pass'}  •  **N (attempts/round):** ${n}`, '',
+    ...(resume ? [`**RESUMED** — reused ${resume.reused} seat(s) from a prior interrupted run, re-ran ${resume.rerun} seat(s).`,
+      ...(resume.reusedSeats && resume.reusedSeats.length ? [`- Reused seats: ${resume.reusedSeats.join(', ')}`] : []), // item 4
+      ...(resume.rerunSeats && resume.rerunSeats.length ? [`- Re-ran seats: ${resume.rerunSeats.join(', ')}`] : []), // item 4
+      ...(resume.mixedGuidance ? ['- Mixed guidance: reused round-2/implement seats reflect the PRIOR review guidance while re-run seats reflect the NEW guidance — this resumed pool blends both.'] : []), // item 9
+      ...(resume.forfeited ? [`- ${resume.forfeited}.`] : []), // item 3
+      ''] : []),
     '## Task', '', '> ' + String(task).replace(/\n/g, '\n> '), '',
     '## Round-1 candidates', '',
     unblind ? '| Candidate | Model | Valid | Note |' : '| Candidate | Valid | Note |',
@@ -2114,8 +3633,37 @@ function heredocBody(content) {
 }
 // ---- end: structural persist helpers ------------------------------------------------------------
 
+// ---- begin: tally skeleton builder (PURE — persist phase 2, issue #33; sliced by tests) ----------
+// Deep-copy the council result and replace each council.rounds[*].verdicts[*] body with its
+// on-disk seat ref {"$seat": "<runDir-relative path>", "sha256": "<hex>"} — matched by lens key +
+// round. Skeleton + splice, never recompute: bin/je-assemble.mjs reverses this by splicing the
+// sha-verified seat files back, byte-identical to json(result). A verdict with no verified on-disk
+// ref stays INLINE (the skeleton grows but assembly still succeeds — never a crashed persist). The
+// deep copy guarantees refs can NEVER leak into json(review) itself (byte-parity invariant).
+function buildTallySkeleton(result, refs) {
+  const skel = JSON.parse(JSON.stringify(result))
+  const rounds = skel && skel.council && Array.isArray(skel.council.rounds) ? skel.council.rounds : []
+  for (const r of rounds) {
+    if (!r || !Array.isArray(r.verdicts)) continue
+    r.verdicts = r.verdicts.map(v => {
+      const ref = v && v.lens && refs ? refs[`${v.lens}|r${r.round}`] : null
+      return ref ? { $seat: ref.rel, sha256: ref.sha } : v
+    })
+  }
+  return skel
+}
+// ---- end: tally skeleton builder -----------------------------------------------------------------
+
 // ---- durable persistence (sandbox has NO node:fs/import/process — write via a sonnet helper+Bash) ----
 const json = obj => JSON.stringify(obj, null, 2) + '\n'
+
+// Persist phase 2 (issue #33): per-seat verdict refs, module-level, keyed phase label ->
+// { '<lensKey>|r<round>': { rel, sha } } for round-log seats (splice-able into the tally skeleton)
+// plus 'runoff<i>|<lensKey>' keys for steelman runoff seats (durable/inspection only — runoff
+// verdicts never appear in council.rounds). NEVER attached to the council result itself: refs
+// inside json(review) would break assemble byte-parity. Written by councilJudge as each round's
+// seat files verify; read by the checkpoint call sites via verdictEntries().
+const seatRefs = Object.create(null)
 
 // Plugin bin dir (for on-disk derivation via bin/je-render.mjs), derived from any supplied runner path.
 const PLUGIN_BIN = (() => {
@@ -2125,7 +3673,7 @@ const PLUGIN_BIN = (() => {
   return null
 })()
 
-// Write one persistence point — STRUCTURAL PERSIST (issue #33). Two entry kinds:
+// Write one persistence point — STRUCTURAL PERSIST (issue #33). Three entry kinds:
 //   { path, content }            — typed once through the helper as a single quoted HEREDOC (no
 //                                  printf re-quoting, no chunking), then VERIFIED: the helper reports
 //                                  `wc -c` + `shasum -a 256` per file and the engine compares against
@@ -2136,21 +3684,41 @@ const PLUGIN_BIN = (() => {
 //                                  rendered ON DISK by deterministic code and NEVER transit the model
 //                                  (the dominant cost: run C typed ~290KB at ~9KB/min ≈ 35min/checkpoint).
 //                                  `content` is the fallback (typed+verified) when PLUGIN_BIN is unknown.
-// Any verified miss is RETRIED ONCE (a failed derive retries as typed content); a still-bad target is
-// logged as a REAL, path-named failure. An unverified LLM write is NEVER treated as success (#D-0002).
-// Still fire-and-forget overall: a persist failure logs but must never crash a fully-paid run.
+//   { path, content, assemble }  — ASSEMBLED artifact (persist phase 2): the helper runs
+//                                  `node bin/je-assemble.mjs <assemble.tally> <path>` so deterministic
+//                                  code splices the sha-pinned per-seat files back into the tally
+//                                  skeleton ON DISK. Unlike derive, the result is FULLY verified: the
+//                                  FLP sha must equal the engine-computed sha256Hex over `content`
+//                                  (= json(review)) — assembled bytes ≠ the engine's result object is
+//                                  a verified miss, so corruption structurally cannot land silently.
+// Any verified miss is RETRIED ONCE (a failed derive/assemble retries as typed content); a still-bad
+// target is logged as a REAL, path-named failure. An unverified LLM write is NEVER treated as success
+// (#D-0002). Still fire-and-forget overall: a persist failure logs but must never crash a fully-paid
+// run. Returns the list of VERIFIED paths (empty on total failure) so callers — the per-seat writes
+// feeding the tally skeleton — can record refs only for files that actually landed.
 async function persist(pairs, phaseTitle) {
   const files = (pairs || []).filter(p => p && p.path && (p.content != null || p.derive))
-  if (!files.length) return
+  if (!files.length) return []
   const expected = {} // path -> sha256 hex for typed writes (derived writes verify bytes>0 + exit only)
   const stepFor = (f, allowDerive) => {
     const dir = f.path.slice(0, f.path.lastIndexOf('/'))
     const tmp = `${f.path}.partial`
     const report = `printf 'FLP %s %s %s\\n' ${q(f.path)} "$(wc -c < ${q(f.path)} 2>/dev/null || echo 0)" "$(shasum -a 256 ${q(f.path)} 2>/dev/null | cut -d' ' -f1)"`
+    if (f.assemble && f.content != null && allowDerive && PLUGIN_BIN) {
+      // Assembled write: deterministic splice on disk, but expected[] STAYS SET (over the exact
+      // json(review) bytes) — full-file verification, stronger than derive's bytes>0 check. A
+      // je-assemble crash/miss/mismatch surfaces as a verified miss and retries as typed content.
+      expected[f.path] = sha256Hex(heredocBody(f.content))
+      return `mkdir -p ${q(dir)} && node ${q(`${PLUGIN_BIN}/je-assemble.mjs`)} ${q(f.assemble.tally)} ${q(f.path)}; ${report}`
+    }
     if (f.derive && allowDerive && PLUGIN_BIN) {
       delete expected[f.path]
       const extra = f.derive.title ? ` ${q(f.derive.title)}` : ''
-      return `mkdir -p ${q(dir)} && node ${q(`${PLUGIN_BIN}/je-render.mjs`)} ${q(f.derive.mode)} ${q(f.derive.from)} ${q(f.path)}${extra}; ${report}`
+      // security-sweep M17 (2026-07-07): a derived write is only bytes>0-verified (no sha). The old
+      // `; ${report}` ran the report REGARDLESS of render success, so a FAILED render that left a
+      // STALE non-empty target from a prior write was accepted as fresh. Remove any existing target
+      // first, so a failed render reports bytes=0 → a verified miss → retry as typed content.
+      return `mkdir -p ${q(dir)} && rm -f ${q(f.path)} 2>/dev/null; node ${q(`${PLUGIN_BIN}/je-render.mjs`)} ${q(f.derive.mode)} ${q(f.derive.from)} ${q(f.path)}${extra}; ${report}`
     }
     if (f.content == null) return `printf 'FLP %s 0 none\\n' ${q(f.path)}` // derive-only entry with no bin dir: report the miss honestly
     const body = heredocBody(f.content)
@@ -2162,8 +3730,8 @@ async function persist(pairs, phaseTitle) {
   // Run the given file list through the write-agent; return a map path -> {bytes, sha}.
   const writeAndMeasure = async (list, allowDerive) => {
     const script = list.map(f => stepFor(f, allowDerive)).join('\n')
-    const res = await agent(
-      `This is an approved internal step of the joust-engine tournament: persist result artifacts. ` +
+    const res = await agentLadder(
+      `Joust-engine persist step (writes only inside this run's output directory): persist result artifacts. ` +
       `Run this exact shell script in ONE Bash call, reproducing it VERBATIM — every heredoc body byte-for-byte, ` +
       `no reformatting, no abbreviation (the engine verifies checksums; any drift is detected and retried). ` +
       `It prints one line per file of the form "FLP <path> <byte-count> <sha256>". Then return the structured ` +
@@ -2182,7 +3750,14 @@ async function persist(pairs, phaseTitle) {
   const bad = (f, seen) => {
     const got = seen[f.path]
     if (!got || !(got.bytes > 0)) return 'missing/empty'
-    if (expected[f.path] && got.sha && got.sha !== expected[f.path]) return `sha mismatch (relay corruption): expected ${expected[f.path].slice(0, 12)}…, got ${got.sha.slice(0, 12)}…`
+    // security-sweep H9 (2026-07-07): a typed write (expected[path] set) MUST carry a matching sha.
+    // The old `got.sha && got.sha !== expected` short-circuited when the relay returned an EMPTY sha,
+    // so an UNVERIFIED write passed on bytes>0 alone — a fail-open hole in the #33 sha-verified
+    // dataplane invariant. Now a missing/empty sha on a sha-required write is itself a failure.
+    if (expected[f.path]) {
+      if (!got.sha) return 'sha missing on a sha-verified write (relay dropped it; treated as unverified → retry)'
+      if (got.sha !== expected[f.path]) return `sha mismatch (relay corruption): expected ${expected[f.path].slice(0, 12)}…, got ${got.sha.slice(0, 12)}…`
+    }
     return null
   }
   try {
@@ -2195,7 +3770,28 @@ async function persist(pairs, phaseTitle) {
       missing = files.filter(f => bad(f, seen))
     }
     if (missing.length) log(`persist FAILED (${phaseTitle}): ${missing.map(f => `${f.path} [${bad(f, seen)}]`).join(', ')} after retry`)
-  } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`) }
+    const badSet = new Set(missing.map(f => f.path))
+    return files.map(f => f.path).filter(p => !badSet.has(p))
+  } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`); return [] }
+}
+
+// Persist phase 2 (issue #33): the verdict.json entries for one review checkpoint. With a council
+// AND at least one verified per-seat file, the bulk never transits the model: a SMALL typed tally
+// skeleton (the result with $seat refs) lands first, then bin/je-assemble.mjs splices the
+// sha-pinned seat files back into verdict.json ON DISK — verified against the engine-computed
+// sha256Hex(json(review)) via the assemble entry's `content`. Any failure retries through the
+// existing ladder as today's single typed write (worst case = current behaviour). No council
+// (judges:1 legacy) or no verified refs → today's plain typed write, unchanged.
+function verdictEntries(dir, review, phaseLabel) {
+  const path = `${dir}/verdict.json`
+  const content = json(review)
+  const refs = seatRefs[phaseLabel]
+  if (!review || !review.council || !refs || !Object.keys(refs).length) return [{ path, content }]
+  const tallyPath = `${dir}/_judges/tally.json`
+  return [ // tally.json ordered BEFORE the assemble step — persist runs its steps sequentially in one script
+    { path: tallyPath, content: json(buildTallySkeleton(review, refs)) },
+    { path, content, assemble: { tally: tallyPath } },
+  ]
 }
 
 // ---- auto-filed engine issues (privacy-scrubbed, fail-closed, fire-and-forget) ----
@@ -2229,8 +3825,8 @@ async function maybeFileEngineIssues(phaseTitle) {
       const cmd = `mkdir -p ${q(`${runDir}/_rc-issues`)}; { printf '%s\\n' ${q(evLines.join('\n'))}; ${logGreps || 'true'}; } > ${q(ev)}; ` +
         `GH_REPO=${q(engineRepo)} JE_ISSUE_AUTOFILE=1 bash ${q(A.issueRunner)} new --sev ${sev} --area ${area} ` +
         `--title ${q(title)} --evidence-file ${q(ev)} --run-id ${q(safeRunId)} 2>&1; echo "JEI ${rc} rc=$?"`
-      const res = await agent(
-        `This is an approved internal step: file ONE dogfood issue for engine-fault class ${rc}. Run this exact shell command in ONE Bash call and report its stdout verbatim. Do nothing else:\n\n${cmd}`,
+      const res = await agentLadder(
+        `Joust-engine auto-issue step (opt-in via args.issueRunner; the command below is the bundled, privacy-filtered issue helper): file ONE dogfood issue for engine-fault class ${rc}. Run this exact shell command in ONE Bash call and report its stdout verbatim. Do nothing else:\n\n${cmd}`,
         { model: HELPER_MODEL, phase: phaseTitle, label: `rc-issue-${rc}` }).catch(() => null)
       const filed = /JEI .* rc=0\b/.test(String(res))
       recordSeat(`issue:${rc}`, phaseTitle, filed ? RC.OK : RC.UNKNOWN, `auto-issue-${filed ? 'filed-or-drafted' : 'FAILED'}`)
@@ -2351,7 +3947,7 @@ async function bundlePlan(planWs, seedPath) {
   const dir = seedPath.slice(0, seedPath.lastIndexOf('/'))
   const cmd = `mkdir -p ${q(dir)} && { echo "===== APPROVED PLAN (implement this verbatim) ====="; find ${q(planWs)} -type f 2>/dev/null | sort | while IFS= read -r f; do printf '\\n----- %s -----\\n' "$f"; cat "$f" 2>/dev/null; done; } > ${q(seedPath)} && wc -c ${q(seedPath)}`
   log(`Bundling winning plan → ${seedPath}`)
-  await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
+  await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
     { model: HELPER_MODEL, phase: 'Implement Round 3', label: 'seed-plan' }).catch(() => null)
 }
 
@@ -2368,20 +3964,66 @@ function implGatePassed(r) {
   return { pass: true, reason: 'code-council majority on a valid, non-vetoed candidate', winner: rv.winner }
 }
 
+// Read the SAME-TASK convergence aggregate from the run ledger (bin/je-ledger.mjs) via the opt-in
+// ledger runner. Fail-open end to end: no runner / no bucket / dead agent / garbled output => null,
+// which trimSeatsForConvergence treats as "leave the seat count unchanged". The runner is expected
+// to print ONE line for the bucket: `JE-LEDGER-CONVERGENCE samples=<int> ratio=<float>`; the engine
+// (parseConvergenceEvidence), not the LLM, is the source of truth for the numbers.
+async function readConvergenceEvidence(taskBucket) {
+  if (!DYNAMIC_M_ON || !ledgerRunner || !taskBucket) return null
+  // Fail-open (issue #36): the opt-in dynamic-M path must NEVER throw. Guard the optional
+  // CODEX_JUDGE_DUMP_SCHEMA — if it is absent, degrade to an inline {raw} schema rather than a
+  // ReferenceError — and wrap the whole read so any failure returns null (seats stay unchanged).
+  try {
+    const dumpSchema = (typeof CODEX_JUDGE_DUMP_SCHEMA !== 'undefined' && CODEX_JUDGE_DUMP_SCHEMA)
+      || { type: 'object', additionalProperties: false, properties: { raw: { type: 'string' } }, required: ['raw'] }
+    const cmd = `node ${q(ledgerRunner)} convergence ${q(taskBucket)} 2>/dev/null`
+    const res = await agent(
+      `Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do not summarize or interpret it. Do nothing else:\n\n${cmd}`,
+      { model: HELPER_MODEL, schema: dumpSchema, phase: 'Implement Round 3', label: 'ledger-convergence' }
+    ).catch(() => null)
+    const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    return parseConvergenceEvidence(raw)
+  } catch {
+    return null
+  }
+}
+
 // Run ONE implement round: dispatch the implement pool seeded with the plan, stage, enrich, and
 // judge with the CODE lenses. `wantGuidance` distils round-3 → round-4 priors (round 3 only).
 async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance, reviewDir, wantGuidance) {
-  const list = implementAttempts.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
+  const list = implementSeats.map(a => ({ ...a, roundName, ws: repoMode ? worktreePath(roundName, a.label) : scratchPath(roundName, a.label) }))
   await buildWorktrees(roundName, list)
-  const doneRaw = (await parallel(list.map(a => () => dispatch(a, a.ws, guidance, phaseTitle, 'implement', seedPlanPath)))).filter(Boolean)
+  // Per-attempt seed (A/B briefs): a seat carrying its own seedPlanPath uses it; else the shared one.
+  await computeReuse(roundName, list)
+  markInflight(list)
+  await heartbeat(phaseTitle)
+  const doneRaw = (await parallelQuorum(list, (a) => dispatchOrReuse(a, roundName, () => dispatch(a, a.ws, guidance, phaseTitle, 'implement', a.seedPlanPath || seedPlanPath)), phaseTitle, {
+    timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
+  })).filter(Boolean)
   const done = doneRaw.map(c => ({ ...c, roundName }))
   { const w = dispatchDropSummary(phaseTitle, dispatchDrops, list.length, done.length); if (w) log(w) }
   await snapshotWorktrees(roundName, done)
   if (!done.length) return { blind: [], mapping: [], review: { __failed: 'no implement attempts survived dispatch' } }
-  const staged = await stageAndValidate(blindLabel(done, rot), reviewDir, phaseTitle)
-  const blind = staged.filter(c => c.valid)
-  const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
-  if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables' } }
+  let staged = await stageAndValidate(blindLabel(done, rot), reviewDir, phaseTitle)
+  markStaged(staged)
+  // Run F: mechanical pre-council gate — classify/stamp every valid candidate, invalidate corrupt
+  // patches, BEFORE the code council (or legacy judge) sees the pool. Implement rounds only.
+  staged = await mechanicalPatchGate(staged, reviewDir, phaseTitle)
+  // item 11: a REUSED deliverable that fails the mechanical/staging gate is re-run once (see helper).
+  staged = await reRunInvalidReused(roundName, list, staged, reviewDir, phaseTitle,
+    (a) => dispatch(a, a.ws, guidance, phaseTitle, 'implement', a.seedPlanPath || seedPlanPath), true)
+  markStaged(staged)
+  // issue #36: inContention drops NON-representative byte-identical duplicates from judging while
+  // leaving them valid:true (they never enter blindList, exactly as an invalid candidate doesn't).
+  const blind = staged.filter(inContention)
+  const mapping = staged.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
+    ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
+    ...(c.contract ? { contract: c.contract.class } : {}), // run G: layout-conformance class (audit only; never gates)
+    ...(c.collapse ? { collapse: c.collapse } : {}), // issue #36: dedup group (rep + all letters) — unblinding bookkeeping, never judge-visible
+    ...(c.seedBrief ? { seedBrief: c.seedBrief } : {}), // A/B lineage — bookkeeping only, judges never see it
+    ...(c.valid ? {} : { failReason: c.failReason }) }))
+  if (!blind.length) return { blind, mapping, review: { __failed: 'no valid implement deliverables (post-mechanical-gate)' } }
   if (repoMode) await enrichBlindPool(blind, reviewDir, phaseTitle)
   const review = await judge('code reviewer', blind, wantGuidance, `${reviewDir}/_pool.md`,
     wantGuidance ? REVIEW_SCHEMA : RANK_SCHEMA, phaseTitle, `${roundName}-review`, LENSES, 'final')
@@ -2389,13 +4031,14 @@ async function implementRound(roundName, phaseTitle, rot, seedPlanPath, guidance
 }
 
 // The implement phase driver. Round 3 always; Round 4 ONLY on a failed R3 gate (guided by R3 review).
-async function implementPhase(seedPlanPath) {
+async function implementPhase(seedPlanPath, preR3 = null) {
   phase('Implement Round 3')
   log(`Implement Round 3: ${implementAttempts.length} implementer(s) seeded with the winning plan (${implementAttempts.map(a => a.displayModel).join(', ')})`)
-  const r3 = await implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
+  // Run N: a speculative round started at steelman-seed time substitutes for the fresh dispatch.
+  const r3 = preR3 ? await preR3 : await implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
   await persist([
     ...(r3.review && !r3.review.__failed ? [
-      { path: `${runDir}/review-impl-3/verdict.json`, content: json(r3.review) },
+      ...verdictEntries(`${runDir}/review-impl-3`, r3.review, 'impl-3-review'),
       { path: `${runDir}/review-impl-3/verdict.md`, content: verdictToMd(r3.review, 'Implement Round 3 verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-impl-3/verdict.json`, title: 'Implement Round 3 verdict' } },
     ] : []),
     ...(r3.review && r3.review.council ? [{ path: `${runDir}/review-impl-3/council.json`, content: json(r3.review.council), derive: { mode: 'council-json', from: `${runDir}/review-impl-3/verdict.json` } }] : []),
@@ -2415,11 +4058,13 @@ async function implementPhase(seedPlanPath) {
   // surfaced before any implement spend.
   log(`Implement Round 3 gate NOT passed (${g3.reason}); escalating to Implement Round 4 (guided retry).`)
   phase('Implement Round 4')
-  const guidance = (r3.review && r3.review.guidance) || null
+  let guidance = (r3.review && r3.review.guidance) || null
+  { const stub = guidanceStub(guidance)
+    if (stub) { log(`JE-GUIDANCE-STUB [Implement Round 4]: ${stub} — falling back to task-only guided retry (no placeholder guidance seeds a brief).`); guidance = null } }
   const r4 = await implementRound('impl-4', 'Implement Round 4', 4, seedPlanPath, guidance, `${runDir}/review-impl-4`, false)
   await persist([
     ...(r4.review && !r4.review.__failed ? [
-      { path: `${runDir}/review-impl-4/verdict.json`, content: json(r4.review) },
+      ...verdictEntries(`${runDir}/review-impl-4`, r4.review, 'impl-4-review'),
       { path: `${runDir}/review-impl-4/verdict.md`, content: verdictToMd(r4.review, 'Implement Round 4 verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-impl-4/verdict.json`, title: 'Implement Round 4 verdict' } },
     ] : []),
     ...(r4.review && r4.review.council ? [{ path: `${runDir}/review-impl-4/council.json`, content: json(r4.review.council), derive: { mode: 'council-json', from: `${runDir}/review-impl-4/verdict.json` } }] : []),
@@ -2438,14 +4083,562 @@ async function implementPhase(seedPlanPath) {
   }
 }
 
+// ================= REJUDGE MODE (args.rejudgeCandidates) ======================================
+// Salvage/re-judge entry: judge an EXISTING pool of staged implement candidates without running
+// any plan or implement round. Motivated by run-i (2026-07-06): a mechanical-gate bug false-killed
+// 11/12 staged candidates AFTER the expensive dispatch had already succeeded — the artifacts were
+// intact on disk, only the judgment was wrong. Rejudge re-runs the (fixed) mechanical gate over
+// the staged dirs under FRESH blind letters (cold re-judge: no letter aligns with the source run),
+// rebuilds the pool, and runs the full CODE council (majority + dual security veto + steelman).
+// args.rejudgeCandidates = [{ dir: <abs staged-candidate dir>, model: <displayModel>, source: <tag> }]
+// args.rejudgeRot (optional int) rotates the fresh letter assignment. `attempts` still needs one
+// well-formed (never-dispatched) seat to satisfy the top-of-file guard.
+if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
+  phase('Rejudge')
+  log(`▶ REJUDGE: ${A.rejudgeCandidates.length} staged candidate(s) — fixed mechanical gate + code council, no generation rounds`)
+  await buildContext() // pins gateBaseShaFile (HEAD) for the gate's real-apply snapshot baseline
+  // args.rejudgeBaseSha (2026-07-07, run-j2 post-mortem): staged candidates were authored against
+  // the SOURCE run's tree, not today's HEAD — engine commits landed between run and re-judge drift
+  // the pinned baseline and false-kill candidates whose patch context moved (observed live: one
+  // more kill per commit batch). A rejudge MUST judge against the tree the candidates targeted, and
+  // an A/B pair (same pool, two prompt arms) MUST share one baseline. Strict 7-40 hex or ignored.
+  if (/^[0-9a-f]{7,40}$/.test(String(A.rejudgeBaseSha || ''))) {
+    // security-sweep M19 (2026-07-07): the old pin wrote an EMPTY file via `|| printf ''` on a
+    // rev-parse failure, swallowed the relay error, and logged "pinned" regardless — so a
+    // hex-but-unresolvable rejudgeBaseSha silently fell back to today's HEAD while claiming it
+    // pinned the authoring tree, gating candidates against the WRONG baseline. Now the pin emits
+    // `JRPIN <bytes>`; a given-but-unresolvable sha (0 bytes) FAILS the rejudge (fail closed).
+    const pinCmd = `mkdir -p ${q(`${runDir}/_context`)} && { git rev-parse --verify ${q(`${String(A.rejudgeBaseSha)}^{commit}`)} 2>/dev/null || printf ''; } > ${q(gateBaseShaFile)}; echo "JRPIN $(wc -c < ${q(gateBaseShaFile)} 2>/dev/null | tr -d ' ')"`
+    const pinRes = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${pinCmd}`,
+      { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: 'Rejudge', label: 'rejudge-base-pin' }).catch(() => null)
+    const pinBytes = Number(((pinRes && pinRes.raw) || '').match(/JRPIN\s+(\d+)/)?.[1] || 0)
+    if (!pinBytes) {
+      return { mode: 'rejudge', n: A.rejudgeCandidates.length, __failed: `rejudgeBaseSha ${A.rejudgeBaseSha} did not resolve to a commit in this repo — refusing to gate against the wrong baseline (fail-closed)`, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+    }
+    log(`REJUDGE baseline pinned to ${A.rejudgeBaseSha} (the tree the candidates were authored against)`)
+  }
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  const rjN = A.rejudgeCandidates.length
+  // security-sweep M20 (2026-07-07): blind letters come from a 26-char alphabet, so >26 candidates
+  // or a negative rot made `letters[(i+rot)%N]` undefined → candidates collided at `.../undefined`,
+  // silently overwriting each other and corrupting the rejudge pool. Bound N<=26 and normalise rot
+  // to a non-negative index (fail loud on overflow rather than mangle the pool).
+  if (rjN > letters.length) {
+    return { mode: 'rejudge', n: rjN, __failed: `rejudge supports at most ${letters.length} candidates (got ${rjN}); split into batches`, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+  }
+  const rjRot = Number.isInteger(A.rejudgeRot) ? ((A.rejudgeRot % rjN) + rjN) % rjN : 3 % rjN // non-negative, in-range
+  const reviewDir = `${runDir}/review-rejudge`
+  const rjAssign = A.rejudgeCandidates.map((r, i) => ({ ...r, blind: letters[(i + rjRot) % rjN] }))
+  // Stage: copy each source dir into its fresh blind slot; STRIP the source run's engine stamps
+  // (mechanical/contract/convergence/enrichment) so the fixed gate re-derives them — a stale
+  // corrupt-patch stamp from the buggy gate must never leak into the rebuilt pool.
+  const copyScript = [`mkdir -p ${q(reviewDir)}`].concat(rjAssign.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    // security-sweep H17 (2026-07-07): c.dir is caller-supplied (args.rejudgeCandidates). The old
+    // `cp -R ${dir}/.` copied WHATEVER it named — a `$HOME` or a symlinked candidate dir — straight
+    // into the blind judged pool, leaking arbitrary local files/secrets to the judges. Copy ONLY
+    // when the source is a real directory AND not a symlink; otherwise stage nothing (0 files → the
+    // candidate fails the mechanical gate's empty check, never silently pulling in outside files).
+    return `rm -rf ${q(dest)}; mkdir -p ${q(dest)}; ` +
+           `if [ -d ${q(c.dir)} ] && [ ! -L ${q(c.dir)} ]; then cp -R ${q(c.dir)}/. ${q(dest)}/ 2>/dev/null; else echo "JRJ-REFUSE ${c.blind} not-a-plain-dir" >&2; fi; ` +
+           `rm -f ${q(dest)}/mechanical.txt ${q(dest)}/contract.txt ${q(dest)}/convergence.txt ${q(dest)}/enrichment.txt; ` +
+           `echo "JRJ ${c.blind} $(find ${q(dest)} -type f 2>/dev/null | grep -c .)"`
+  })).join('\n')
+  await agentLadder(
+    `Run this exact shell script in ONE Bash call. It stages candidate directories for re-judging and prints one "JRJ <letter> <filecount>" line per candidate. Report the printed lines; do nothing else:\n\n${copyScript}`,
+    { model: HELPER_MODEL, phase: 'Rejudge', label: 'rejudge-stage' }
+  ).catch(() => null)
+  let rjStaged = rjAssign.map((c, i) => ({
+    label: c.source || `rejudge-${i + 1}`, dispatch: 'anthropic', displayModel: c.model || 'unknown',
+    blind: c.blind, ws: `${reviewDir}/${c.blind}`, valid: true, failReason: '', roundName: 'rejudge',
+  }))
+  rjStaged = await mechanicalPatchGate(rjStaged, reviewDir, 'Rejudge')
+  const rjBlind = rjStaged.filter(inContention)
+  const rjMapping = rjStaged.map(c => ({ candidate: c.blind, model: c.displayModel, source: c.label, valid: c.valid,
+    ...(c.mechanical ? { mechanical: c.mechanical.class } : {}),
+    ...(c.contract ? { contract: c.contract.class } : {}),
+    ...(c.collapse ? { collapse: c.collapse } : {}),
+    ...(c.valid ? {} : { failReason: c.failReason }) }))
+  if (!rjBlind.length) {
+    await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: null }) }], 'Rejudge')
+    return { mode: 'rejudge', n: rjN, mapping: rjMapping, winner: null, __failed: 'no valid candidates survived the mechanical gate', rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+  }
+  const rjReview = await judge('code reviewer', rjBlind, false, `${reviewDir}/_pool.md`, RANK_SCHEMA, 'Rejudge', 'rejudge-review', LENSES, 'final')
+  await persist([
+    ...(rjReview && !rjReview.__failed ? [
+      ...verdictEntries(reviewDir, rjReview, 'rejudge-review'),
+      { path: `${reviewDir}/verdict.md`, content: verdictToMd(rjReview, 'Rejudge verdict'), derive: { mode: 'verdict-md', from: `${reviewDir}/verdict.json`, title: 'Rejudge verdict' } },
+    ] : []),
+    ...(rjReview && rjReview.council ? [{ path: `${reviewDir}/council.json`, content: json(rjReview.council), derive: { mode: 'council-json', from: `${reviewDir}/verdict.json` } }] : []),
+  ], 'Rejudge')
+  const rjGate = implGatePassed({ review: rjReview, blind: rjBlind })
+  const rjWinnerEntry = rjGate.pass ? rjMapping.find(m => m.candidate === rjGate.winner) : null
+  const rjPick = !rjGate.pass && rjReview && rjReview.needs_orchestrator_pick ? rjReview.needs_orchestrator_pick : null
+  await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}), no_consensus: !!(rjReview && rjReview.no_consensus) }) }], 'Rejudge')
+  await maybeFileEngineIssues('Rejudge')
+  return {
+    mode: 'rejudge', n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), mapping: rjMapping,
+    winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}),
+    no_consensus: !!(rjReview && rjReview.no_consensus),
+    ...(rjPick ? { needs_orchestrator_pick: rjPick } : {}),
+    ranking: (rjReview && rjReview.ranking) || null,
+    reasoning: (rjReview && typeof rjReview.reasoning === 'string') ? rjReview.reasoning.slice(0, 2000) : null,
+    rc_summary: rcSummaryLive(),
+    model_downgrades: modelDowngrades,
+  }
+}
+
+// ================= RUN-STATE HEARTBEAT + ABORT STAMPING + RESUME (engine top-10 #10) =============
+// A crash/interrupt mid-tournament used to be unrecoverable: the engine wrote rich artifacts but no
+// authoritative machine-readable RUN STATE, so nothing could tell "seat completed" from "seat in
+// flight". This adds `runDir/run-state.json` — an UNBLINDING bookkeeping sidecar (like mapping.json,
+// never judge-visible) written through the existing atomic sha-verified persist() shim. It is an
+// INDEX/HINT, never authority: resume ALWAYS re-derives a seat's completion from the SAME on-disk
+// probe every other gate trusts (deliverable present + the runner PROVENANCE/DONE contract), so a
+// hand-edited run-state.json can never inject a fake completed seat. Fail-open end to end: any read/
+// probe/heartbeat failure degrades to today's clean-run behaviour and never crashes or stalls a live
+// run. The vote tally, veto, and judging semantics are otherwise unchanged.
+
+// ---- begin: run-state heartbeat/resume pure helpers (PURE — engine #10; sliced by tests) --------
+// No closures over module state, no I/O — extract-and-eval-testable exactly like the persist block.
+const RUN_STATE_VERSION = 1
+const VALID_SEAT_STATUS = new Set(['completed', 'aborted', 'in_flight', 'never_started'])
+
+// Stable seat IDENTITY (what a resume must match to trust a reuse): label + how it dispatches + the
+// exact model/agent it runs. Any change here is genuine config drift -> reuse is refused (fail-safe).
+function attemptIdentity(a) {
+  return {
+    label: a && a.label != null ? a.label : null,
+    dispatch: (a && a.dispatch) || 'anthropic',
+    model: (a && a.model) || null,
+    displayModel: (a && a.displayModel) || null,
+    agentType: (a && a.agentType) || null,
+  }
+}
+function attemptIdentityKey(a) {
+  const id = attemptIdentity(a)
+  return [id.label, id.dispatch, id.model || '', id.displayModel || '', id.agentType || ''].join('\u0001')
+}
+
+// Canonical config string the fingerprint is hashed over (hashing itself is done by the caller with
+// sha256Hex, so this block stays dependency-free). Order-stable by construction.
+function canonicalConfig(cfg) {
+  const ids = arr => (Array.isArray(arr) ? arr : []).map(a => {
+    const id = attemptIdentity(a); return [id.label, id.dispatch, id.model, id.displayModel, id.agentType]
+  })
+  return JSON.stringify({
+    mode: (cfg && cfg.mode) || null,
+    implement: !!(cfg && cfg.implement),
+    // security-sweep H10 (2026-07-07): task_sha MUST be in the fingerprint. It was set on
+    // RUN_STATE_CONFIG (steelman F5) but never serialized here, so a resume against the SAME runDir
+    // with a CHANGED task silently reused the prior task's deliverables — the F5 task-binding was
+    // inert. Including it makes any task change refuse reuse (fingerprint mismatch → clean re-run).
+    task_sha: (cfg && cfg.task_sha) || null,
+    rots: (cfg && cfg.rots) || {},
+    attempts: ids(cfg && cfg.attempts),
+    implementAttempts: ids(cfg && cfg.implementAttempts),
+  })
+}
+
+// Schema/shape validator for run-state.json — pins the on-disk contract so it can't drift silently.
+function validateRunState(o) {
+  if (!o || typeof o !== 'object') return false
+  if (o.version !== RUN_STATE_VERSION) return false
+  if (typeof o.phase !== 'string') return false
+  if (!Number.isInteger(o.phase_index)) return false
+  if (typeof o.config_fingerprint !== 'string' || !o.config_fingerprint) return false
+  if (!o.config || typeof o.config !== 'object' || !Array.isArray(o.config.attempts)) return false
+  if (!o.seats || typeof o.seats !== 'object') return false
+  for (const k of Object.keys(o.seats)) {
+    const s = o.seats[k]
+    if (!s || typeof s !== 'object' || !VALID_SEAT_STATUS.has(s.status)) return false
+  }
+  return true
+}
+
+// THE single source of truth for a seat's status: classify from an on-disk PROBE (already gathered by
+// the shell), never from a cached claim. `probe` = { started, present, provenance, provStarted, rc }.
+//   never_started : no workspace began (no _brief.txt).
+//   completed     : a deliverable is present AND the provenance/DONE contract holds (reuse-eligible).
+//   in_flight     : a runner wrote its PROVENANCE marker but never a clean DONE and left no deliverable
+//                   (a hard kill mid-run) — must RE-RUN, never reused.
+//   aborted       : began but left no reusable deliverable (empty dir + no clean provenance) — re-run.
+// Provider-agnostic BY PRINCIPLE: it reads the probe facts, not which dispatch produced the seat.
+function deriveSeatStatus(probe) {
+  if (!probe || !probe.started) return 'never_started'
+  if (probe.present && probe.provenance) return 'completed'
+  if (probe.provStarted && !probe.provenance && !probe.present) return 'in_flight'
+  return 'aborted'
+}
+
+// Rebuild the resume seat list in ORIGINAL order with reused seats substituted IN PLACE, or return
+// null (REFUSE reuse -> clean full re-run) on ANY drift: fingerprint change, blind-rotation change,
+// attempts length/order/identity change. Returning null is the fail-safe that guarantees a reused
+// deliverable can never be mispaired with a shifted blind letter.
+function rebuildResumeList({ prevAttempts, currentAttempts, completedSet, prevRot, currentRot, prevFingerprint, currentFingerprint } = {}) {
+  const cur = Array.isArray(currentAttempts) ? currentAttempts : []
+  if (prevFingerprint != null && currentFingerprint != null && prevFingerprint !== currentFingerprint) return null
+  if (prevRot != null && currentRot != null && prevRot !== currentRot) return null
+  if (!Array.isArray(prevAttempts) || prevAttempts.length !== cur.length) return null
+  for (let i = 0; i < cur.length; i++) {
+    if (attemptIdentityKey(prevAttempts[i]) !== attemptIdentityKey(cur[i])) return null
+  }
+  const done = completedSet instanceof Set ? completedSet : new Set(Array.isArray(completedSet) ? completedSet : [])
+  return cur.map(a => ({ attempt: a, reuse: done.has(a && a.label) }))
+}
+// ---- end: run-state heartbeat/resume pure helpers -----------------------------------------------
+
+// ---- run-state runtime (IMPURE — thin call-site hooks; fail-open) -------------------------------
+const RESUME = A.resume === true
+const REUSE_DELIVERED = A.reuseDelivered !== false // default true
+// Per-round blind ROTATIONS captured into the config echo so a code change to any rot is drift.
+const ROTS = { 'round-1': 1, 'round-2': 2, 'impl-3': 3, 'impl-4': 4 }
+const RUN_STATE_PATH = `${runDir}/run-state.json`
+const LOCK_PATH = `${runDir}/resume.lock`
+const LOCK_STALE_MIN = Number(A.resumeLockStaleMins) > 0 ? Math.floor(Number(A.resumeLockStaleMins)) : 30
+const RUN_STATE_CONFIG = { mode, implement, task_sha: sha256Hex(String(task || '')), rots: ROTS, attempts: attempts.map(attemptIdentity), implementAttempts: implementAttempts.map(attemptIdentity) } // steelman F5: task rides the fingerprint (hashed) so a changed task refuses reuse
+const CONFIG_FP = sha256Hex(canonicalConfig(RUN_STATE_CONFIG))
+const RUN_STATE_DUMP_SCHEMA = { type: 'object', additionalProperties: false, properties: { raw: { type: 'string' } }, required: ['raw'] }
+const PROBE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { results: { type: 'array', items: {
+    type: 'object', additionalProperties: false,
+    properties: { label: { type: 'string' }, started: { type: 'boolean' }, present: { type: 'boolean' }, provenance: { type: 'boolean' }, provStarted: { type: 'boolean' }, rc: { type: 'string' } },
+    required: ['label', 'started', 'present', 'provenance'],
+  } } },
+  required: ['results'],
+}
+let phaseIndex = 0
+let lockHeld = false // steelman F2: only a resume acquires the lock; only the holder releases/touches it
+let resumed = false
+let prevConfig = null
+let resumeReuseCount = 0
+let resumeRerunCount = 0
+let resumeForfeited = null                // item 3: set when a degraded probe/relay forces a fail-open clean re-run
+let resumeMixedGuidance = false           // item 9: set when a guided round reuses SOME seats and re-runs others
+const resumeReusedLabels = []             // item 4: the specific seat labels reused in place
+const resumeRerunLabels = []              // item 4: the specific seat labels re-run
+const resumeReuse = Object.create(null)   // roundName -> Set(label) to reuse
+const runStateSeats = Object.create(null) // label -> { status, rc, reused? }
+
+// item 4: report WHICH seats were reused vs re-run (not just counts). items 3/9: also surface a
+// degraded-probe reuse forfeit and the mixed-guidance condition so the SUMMARY disclosure is complete.
+function resumeSummary() {
+  return resumed ? {
+    reused: resumeReuseCount, rerun: resumeRerunCount,
+    reusedSeats: resumeReusedLabels.slice(), rerunSeats: resumeRerunLabels.slice(),
+    ...(resumeForfeited ? { forfeited: resumeForfeited } : {}),
+    ...(resumeMixedGuidance ? { mixedGuidance: true } : {}),
+  } : null
+}
+
+function markInflight(list) {
+  for (const a of (list || [])) {
+    const cur = runStateSeats[a.label]
+    if (cur && cur.status === 'completed') continue // a reused seat is already done
+    runStateSeats[a.label] = { status: 'in_flight', rc: null }
+  }
+}
+function markStaged(staged) {
+  for (const c of (staged || [])) {
+    const label = c.label || c.blind
+    if (label == null) continue
+    runStateSeats[label] = { status: c.valid ? 'completed' : 'aborted', rc: c.rc || (c.valid ? '00' : null), ...(c.reused ? { reused: true } : {}) }
+  }
+}
+
+// One batched heartbeat per phase boundary — routed through persist() (atomic temp+rename+sha-verify),
+// fail-open: an exception logs and is swallowed so a degraded persist never stalls a live run.
+async function heartbeat(phaseLabel, opts = {}) {
+  try {
+    phaseIndex += 1
+    const state = {
+      version: RUN_STATE_VERSION,
+      phase: phaseLabel,
+      phase_index: phaseIndex,
+      resumed,
+      ...(opts.phaseComplete ? { phase_complete: opts.phaseComplete } : {}),
+      resume_reused: resumeReuseCount,
+      resume_rerun: resumeRerunCount,
+      config_fingerprint: CONFIG_FP,
+      config: RUN_STATE_CONFIG,
+      seats: runStateSeats,
+    }
+    await persist([{ path: RUN_STATE_PATH, content: json(state) }], phaseLabel)
+    // item 8: refresh the lock's mtime on each heartbeat so `find -mmin` staleness ages from the LAST
+    // heartbeat, not from launch — a crashed run's lock then goes stale LOCK_STALE_MIN after its last
+    // activity, unblocking re-resume automatically. The terminal heartbeat releases the lock instead.
+    if (opts.phaseComplete === 'final') { if (lockHeld) { await releaseLock(); lockHeld = false } }
+    else if (lockHeld) await touchLock()
+  } catch (e) { log(`heartbeat (${phaseLabel}) failed (non-fatal): ${String(e).slice(0, 120)}`) }
+}
+
+async function readRunState() {
+  try {
+    // security-sweep M21 (2026-07-07): refuse to cat run-state.json through a SYMLINK — resume reads
+    // and trusts this file to decide reuse; a pre-planted symlink could feed it arbitrary content
+    // (the config-fingerprint gate still refuses reuse on drift, but don't read through the link).
+    const cmd = `[ -L ${q(RUN_STATE_PATH)} ] || cat ${q(RUN_STATE_PATH)} 2>/dev/null || true`
+    const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
+      { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'read-run-state' }).catch(() => null)
+    const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    if (!raw.trim()) return null
+    return JSON.parse(raw)
+  } catch { return null }
+}
+
+// Advisory concurrency guard: atomic (noclobber) create. A live lock younger than LOCK_STALE_MIN =>
+// a second launch is resuming the same runDir -> REFUSE (double-launching corrupts in-flight work). A
+// stale lock (older, owner gone) is STOLEN so a post-crash resume is never blocked. mtime uses the OS
+// clock (`find -mmin`), which is available even though the sandbox's Date.now() throws.
+// item 6: the noclobber create is the atomic test-and-acquire — success means NO lock was present, so
+// we hold it (fail open on a genuinely absent lock). A create FAILURE means a lock exists (or the
+// probe erred): we classify stale (steal) vs held-fresh (refuse). Any UNRECOGNIZED output / relay
+// throw can NOT confirm the lock is absent, so it returns 'unreadable' (a refusal), NOT 'acquired' —
+// a transient probe error no longer green-lights a concurrent double-launch.
+async function acquireLock() {
+  try {
+    const cmd = `[ -L ${q(runDir)} ] && { echo JLOCK symlink; exit 0; }; [ -L ${q(LOCK_PATH)} ] && { echo JLOCK symlink; exit 0; }; mkdir -p ${q(runDir)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK acquired; ` +
+      // run-j3 security-x veto finding: the stale-steal branch used to WRITE THROUGH the lock path
+      // (`: > lock`), so a symlink planted at resume.lock truncated an arbitrary writable target.
+      // Steal = rm the stale lock, then RE-TAKE it with the same atomic noclobber create (a racing
+      // launch that recreates it first wins and we refuse); symlinked locks are refused above.
+      `elif [ -n "$(find ${q(LOCK_PATH)} -mmin +${LOCK_STALE_MIN} 2>/dev/null)" ]; then rm -f ${q(LOCK_PATH)}; if ( set -o noclobber; : > ${q(LOCK_PATH)} ) 2>/dev/null; then echo JLOCK stale-stolen; else echo JLOCK held-fresh; fi; ` +
+      `else echo JLOCK held-fresh; fi`
+    const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
+      { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'resume-lock' }).catch(() => null)
+    const raw = res && typeof res.raw === 'string' ? res.raw : ''
+    if (/JLOCK symlink/.test(raw)) return 'symlink'        // steelman F4: refuse a symlinked runDir
+    if (/JLOCK acquired/.test(raw)) return 'acquired'      // create SUCCEEDED: no lock was present
+    if (/JLOCK stale-stolen/.test(raw)) return 'stale-stolen'
+    if (/JLOCK held-fresh/.test(raw)) return 'held-fresh'
+    return 'unreadable'                                     // probe could not confirm the lock is absent
+  } catch { return 'unreadable' } // fail-safe: an existing-but-unreadable lock must NOT permit a double-launch
+}
+// item 8: refresh the lock file's mtime (best-effort) so staleness ages from the last heartbeat.
+async function touchLock() {
+  try {
+    await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\ntouch ${q(LOCK_PATH)} 2>/dev/null; echo JLOCK touched`,
+      { model: HELPER_MODEL, phase: 'Round 1', label: 'resume-lock-touch' }).catch(() => null)
+  } catch { /* best-effort */ }
+}
+// item 7: the lock now covers the ORIGINAL clean run too (acquired at launch, released on the final
+// heartbeat), so a resume launched against a still-alive original detects the held lock. Released for
+// ANY launch that reaches its terminal heartbeat, not only resumes.
+async function releaseLock() {
+  try {
+    await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\nrm -f ${q(LOCK_PATH)}; echo JLOCK released`,
+      { model: HELPER_MODEL, phase: 'Final rank', label: 'resume-unlock' }).catch(() => null)
+  } catch { /* best-effort */ }
+}
+
+// Probe each seat's WORKSPACE on disk (read-only; never stages) so deriveSeatStatus can classify it.
+// Reuses the exact provenance contract (provCheckShell) + engine-file exclusion the staging path uses.
+async function probeSeats(roundName, list) {
+  const excl = engineFiles.map(f => `! -name ${q(f)}`).join(' ')
+  const script = (list || []).map(c => {
+    // item 12: use the shared dispatchRunner table (the single provider->log/token mapping) instead of
+    // an inline ternary chain, so adding a provider can't leave this probe out of sync with dispatch.
+    const { logf, tok } = dispatchRunner(c.dispatch)
+    const lp = logf ? q(`${c.ws}/${logf}`) : ''
+    const provChk = provCheckShell(logf, tok, lp, false) // sets P (DONE exit=0 contract), P=1 for native
+    const psChk = logf ? `if grep -q '^JOUST-${tok}-PROVENANCE endpoint=' ${lp} 2>/dev/null; then PS=1; else PS=0; fi` : `PS=1`
+    const rcEcho = logf ? `rc=$(grep -a '^JOUST-RC ' ${lp} 2>/dev/null | tail -n1 | sed -n 's/^JOUST-RC \\([0-9][0-9]\\).*/\\1/p'); [ -z "$rc" ] && rc=NONE` : `rc=NONE`
+    return `if [ -f ${q(`${c.ws}/_brief.txt`)} ]; then S=1; else S=0; fi; ` +
+      `D=$(find ${q(c.ws)} -type f ${excl} 2>/dev/null | grep -c .); ${provChk}; ${psChk}; ${rcEcho}; ` +
+      `printf 'JPRB %s S=%s D=%s P=%s PS=%s RC=%s\\n' ${q(c.label)} "$S" "$([ "$D" -gt 0 ] && echo 1 || echo 0)" "$P" "$PS" "$rc"` // run-j3 fix: label goes through q(), never bare interpolation
+  }).join('\n')
+  const res = await agentLadder(
+    `This is an approved internal step of the joust-engine tournament: probe on-disk seat state for a RESUME (read-only). Run this exact shell script in ONE Bash call. It prints one line per seat of the form "JPRB <label> S=<0|1> D=<0|1> P=<0|1> PS=<0|1> RC=<code|NONE>". Then return the structured results: for EACH printed JPRB line an entry {label: the label, started: (S==1), present: (D==1), provenance: (P==1), provStarted: (PS==1), rc: the RC token}. Report exactly what the script printed — do not infer or change values. Do nothing else:\n\n${script}`,
+    { model: HELPER_MODEL, schema: PROBE_SCHEMA, phase: roundName === 'round-2' ? 'Round 2' : roundName === 'round-1' ? 'Round 1' : 'Implement Round 3', label: `resume-probe-${roundName}` }
+  ).catch(() => null)
+  // item 3: a null/shapeless relay result is a DEGRADED PROBE, not "nothing on disk" — signal it to
+  // the caller (return null) so the forfeited reuse can be DISCLOSED, rather than silently re-running.
+  if (!res || !Array.isArray(res.results)) return null
+  const out = {}
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
+    if (r && r.label != null) out[String(r.label)] = {
+      started: !!r.started, present: !!r.present, provenance: !!r.provenance, provStarted: !!r.provStarted,
+      rc: typeof r.rc === 'string' ? r.rc : null,
+    }
+  }
+  return out
+}
+
+// Decide, for one round, which seats to REUSE (completed on disk) vs re-run. Fail-open + drift-safe:
+// no resume / reuse disabled / any config drift => empty reuse set (a clean full re-run).
+// item 10: the SAME disk-probe + provenance-gated reuse now applies in repoMode too (no early return),
+// extending the recovery win to the grand-loop / implement-into-repo path under identical gating.
+async function computeReuse(roundName, list) {
+  resumeReuse[roundName] = new Set()
+  if (!resumed || !REUSE_DELIVERED) return
+  let probeMap = null
+  try { probeMap = await probeSeats(roundName, list) } catch { probeMap = null }
+  // item 3: a degraded probe/relay forfeits reuse (fail-open clean re-run) — DISCLOSE it in the
+  // SUMMARY so the lost recoverability is visible to the operator, not buried in a log line.
+  if (probeMap == null) {
+    resumeForfeited = `reuse forfeited: probe relay degraded — re-ran all seats clean (round ${roundName})`
+    log(`JE-RESUME-PROBE-DEGRADED [${roundName}]: ${resumeForfeited}`)
+    probeMap = {}
+  }
+  const completedSet = new Set()
+  for (const a of (list || [])) {
+    const st = deriveSeatStatus(probeMap[a.label])
+    if (st === 'completed') completedSet.add(a.label)
+    else {
+      // item 2: a killed run's seat probes as in_flight/empty; persist the honest TERMINAL 'aborted'
+      // (one heartbeat, BEFORE re-dispatch) so the durable run-state.json literally reads 'aborted'.
+      const persistedStatus = (st === 'in_flight' || st === 'aborted') ? 'aborted' : st
+      runStateSeats[a.label] = { status: persistedStatus, rc: (probeMap[a.label] && probeMap[a.label].rc && probeMap[a.label].rc !== 'NONE') ? probeMap[a.label].rc : null }
+    }
+  }
+  // item 2: durably stamp the 'aborted' reclassification BEFORE any seat is re-dispatched.
+  if ((list || []).some(a => runStateSeats[a.label] && runStateSeats[a.label].status === 'aborted')) await heartbeat(`resume-abort:${roundName}`)
+  const isImpl = roundName === 'impl-3' || roundName === 'impl-4'
+  const plan = rebuildResumeList({
+    prevAttempts: prevConfig ? (isImpl ? prevConfig.implementAttempts : prevConfig.attempts) : null,
+    currentAttempts: (list || []).map(attemptIdentity),
+    completedSet,
+    prevRot: prevConfig && prevConfig.rots ? prevConfig.rots[roundName] : undefined,
+    currentRot: ROTS[roundName],
+    prevFingerprint: prevConfig ? prevConfig.fingerprint : undefined,
+    currentFingerprint: CONFIG_FP,
+  })
+  if (!plan) {
+    log(`JE-RESUME-DRIFT-REFUSED [${roundName}]: run-state config drift — re-running ALL seats this round (no reuse, no shifted blind letters).`)
+    return
+  }
+  resumeReuse[roundName] = new Set(plan.filter(p => p.reuse).map(p => p.attempt.label))
+  const reused = resumeReuse[roundName].size
+  if (reused) log(`JE-RESUME [${roundName}]: reusing ${reused}/${list.length} completed on-disk seat(s); re-running ${list.length - reused}.`)
+  // item 9: a GUIDED round (round-2 / implement rounds) that reuses SOME seats while re-running others
+  // blends prior-guidance and new-guidance deliverables — flag it so the SUMMARY discloses the
+  // guidance-incoherence of the resumed pool.
+  if ((roundName === 'round-2' || roundName === 'impl-3' || roundName === 'impl-4') && reused > 0 && reused < (list || []).length) resumeMixedGuidance = true
+}
+
+// Dispatch a seat, OR — on a resume where the seat's on-disk deliverable is trusted complete — reuse
+// it in place (same ws, same dispatch-order index, so blindLabel() yields the same letter). Never
+// trusts a bare status claim: reuse only happens for labels computeReuse() derived from the disk probe.
+async function dispatchOrReuse(a, roundName, thunk) {
+  const set = resumeReuse[roundName]
+  if (set && set.has(a.label)) {
+    resumeReuseCount += 1
+    resumeReusedLabels.push(a.label) // item 4: record WHICH seat was reused
+    runStateSeats[a.label] = { status: 'completed', rc: '00', reused: true }
+    log(`JE-RESUME-REUSE [${roundName}]: seat ${a.label} (${a.displayModel}) — reusing on-disk deliverable (not re-dispatched).`)
+    // steelman F1 (run-j2): NO per-seat heartbeat — one batched heartbeat per phase boundary keeps
+    // the <=~5-persist budget; resume authority is the DISK PROBE, so per-seat run-state durability
+    // was observability-only at ~2 helper calls per seat.
+    return { label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws: a.ws, res: null, reused: true }
+  }
+  if (resumed) { resumeRerunCount += 1; resumeRerunLabels.push(a.label) } // item 4: record WHICH seat re-ran
+  const out = await thunk()
+  // steelman F1: seat status still lands in runStateSeats (markStaged) and persists at the NEXT
+  // phase-boundary heartbeat — no per-seat persist round-trip.
+  return out
+}
+
+// Launch entry hook: acquire the advisory lock (item 7: for the ORIGINAL clean run too, not only a
+// resume — released on the final heartbeat), read + validate the prior run-state, gate on the config
+// fingerprint. On a held-fresh OR unreadable lock, REFUSE (return an error the flow surfaces). On
+// no/invalid/drifted prior state, fall through to a clean run (resumed stays false -> nothing reused).
+async function resumeInit() {
+  // steelman F2 (run-j2): the lock guards the RESUME path only. A fresh launch acquires nothing and
+  // can never be refused by a leftover lock (the item-7 lock-every-launch design made a crashed
+  // run's <staleness-old lock block an ordinary relaunch of the same runDir — a new failure mode
+  // for normal tournaments). The cost, accepted by the runoff: resume-vs-live-ORIGINAL races are no
+  // longer detected — the guard now covers resume-vs-resume.
+  if (!RESUME) return null
+  // steelman F4 (run-j2): harden runDir BEFORE probing any artifact through it — resume reads and
+  // trusts files under this path. Reject non-absolute / traversal here; the lock probe below also
+  // refuses a symlinked runDir (shell-side [ -L ] check).
+  if (!/^\//.test(String(runDir)) || String(runDir).includes('..')) {
+    log(`JE-RESUME: runDir ${runDir} failed the resume path guard (non-absolute or traversal) — starting a CLEAN run (nothing reused).`)
+    return null
+  }
+  const lock = await acquireLock()
+  lockHeld = (lock === 'acquired' || lock === 'stale-stolen')
+  if (lock === 'held-fresh' || lock === 'unreadable' || lock === 'symlink') {
+    // item 6: 'unreadable' = the probe could not confirm the lock is absent (transient read error); we
+    // refuse rather than risk a concurrent double-launch of the same resume target.
+    const why = lock === 'unreadable'
+      ? `the lock probe could not confirm ${LOCK_PATH} is absent (transient read error)`
+      : lock === 'symlink' ? `${runDir} is a symlink (resume refuses to follow redirected run directories)`
+      : `${LOCK_PATH} is held by a live launch (younger than ${LOCK_STALE_MIN}min)`
+    log(`JE-RESUME-LOCK-HELD: ${why} — refusing to double-launch this runDir.`)
+    return { error: `RESUME-LOCK-HELD: ${why}; refusing to double-launch (would corrupt in-flight work). Remove the lock if the owner is gone, or raise args.resumeLockStaleMins.` }
+  }
+  const prev = await readRunState()
+  if (!prev || !validateRunState(prev)) {
+    log('JE-RESUME: no valid prior run-state.json found — starting a CLEAN run (nothing to reuse).')
+    return null
+  }
+  if (prev.config_fingerprint !== CONFIG_FP) {
+    log(`JE-RESUME-DRIFT-REFUSED: config fingerprint changed since the prior run — running CLEAN, no seat reuse.`)
+    return null
+  }
+  resumed = true
+  prevConfig = {
+    attempts: prev.config && prev.config.attempts,
+    implementAttempts: prev.config && prev.config.implementAttempts,
+    rots: prev.config && prev.config.rots,
+    fingerprint: prev.config_fingerprint,
+  }
+  log(`JE-RESUME: valid prior run-state.json (phase '${prev.phase}', index ${prev.phase_index}) — reusing completed seats, re-running the missing/aborted ones.`)
+  return null
+}
+
+// item 11: a provenance-DONE deliverable can still be SEMANTICALLY invalid (e.g. a corrupt patch that
+// fails the mechanical/staging gate). On a resume, such a REUSED seat would otherwise be left
+// permanently failed. Detect reused seats that ended invalid post-gate, reclassify them 'aborted', and
+// RE-RUN each ONCE (fresh dispatch) re-staged under its ORIGINAL blind letter (blind order preserved),
+// then splice the fresh result back in. Fail-open: if the re-run/re-stage throws, keep today's pool.
+// `applyMechGate` re-applies the implement-round mechanical gate to the fresh single-seat result.
+async function reRunInvalidReused(roundName, list, staged, reviewDir, phaseTitle, dispatchFor, applyMechGate) {
+  if (!resumed) return staged
+  const bad = (staged || []).filter(c => c && c.reused && !c.valid)
+  if (!bad.length) return staged
+  const out = staged.slice()
+  for (const c of bad) {
+    const a = (list || []).find(x => (x.label != null ? x.label : null) === (c.label != null ? c.label : c.blind))
+    if (!a) continue
+    log(`JE-RESUME-REUSE-INVALID [${roundName}]: reused seat ${c.label != null ? c.label : c.blind} failed the mechanical/staging gate — reclassifying 'aborted' and re-running once.`)
+    runStateSeats[c.label != null ? c.label : c.blind] = { status: 'aborted', rc: null }
+    if (resumeReuse[roundName]) resumeReuse[roundName].delete(a.label)
+    resumeReuseCount = Math.max(0, resumeReuseCount - 1)
+    resumeRerunCount += 1
+    { const i = resumeReusedLabels.indexOf(a.label); if (i >= 0) resumeReusedLabels.splice(i, 1) }
+    resumeRerunLabels.push(a.label)
+    try {
+      const fresh = await dispatchFor(a)
+      if (!fresh) continue
+      await snapshotWorktrees(roundName, [{ ...fresh, roundName }])
+      let [restaged] = await stageAndValidate([{ ...fresh, roundName, blind: c.blind }], reviewDir, phaseTitle)
+      if (restaged && applyMechGate && restaged.valid) { const g = await mechanicalPatchGate([restaged], reviewDir, phaseTitle); restaged = g[0] || restaged }
+      if (restaged) { const i = out.findIndex(x => x.blind === c.blind); if (i >= 0) out[i] = restaged }
+    } catch (e) { log(`JE-RESUME-REUSE-INVALID re-run failed (non-fatal): ${String(e).slice(0, 120)}`) }
+  }
+  await heartbeat(`resume-rerun:${roundName}`)
+  return out
+}
+// ---- end run-state runtime ----------------------------------------------------------------------
+
 // ---- Round 1 ----
 phase('Round 1')
 log(`▶ ${deriveSummary()}`) // issue #38: run-purpose summary as the first narrator line (above the progress tree)
+const __resumeErr = await resumeInit()
+if (__resumeErr) return __resumeErr
 await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
 const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label) }))
 await buildWorktrees('round-1', r1Worktrees) // repoMode-only no-op otherwise
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
-const r1 = (await parallel(r1Worktrees.map(a => () => dispatch(a, a.ws, null, 'Round 1')))).filter(Boolean)
+await computeReuse('round-1', r1Worktrees)
+markInflight(r1Worktrees)
+await heartbeat('Round 1')
+const r1 = (await parallelQuorum(r1Worktrees, (a) => dispatchOrReuse(a, 'round-1', () => dispatch(a, a.ws, null, 'Round 1', investigate ? 'investigate' : 'plan')), 'Round 1', {
+  timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
+})).filter(Boolean)
 { const w = dispatchDropSummary('Round 1', dispatchDrops, r1Worktrees.length, r1.length); if (w) log(w) } // #45
 if (!r1.length) {
   const unreg = [...new Set(dispatchDrops.filter(d => d.phase === 'Round 1').map(d => d.agentType))]
@@ -2458,6 +4651,8 @@ await snapshotWorktrees('round-1', r1) // repoMode-only no-op otherwise
 phase('Review')
 const staged1 = await stageAndValidate(blindLabel(r1, 1), `${runDir}/review-1`, 'Review')
 const blind1 = staged1.filter(c => c.valid)
+markStaged(staged1)
+await heartbeat('Review')
 const r1mapping = staged1.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
 const N = attempts.length
 if (!blind1.length) {
@@ -2468,10 +4663,37 @@ if (!blind1.length) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // failure-heavy abort: file engine-fault classes before returning
-  return { mode, n: N, rc_summary: rcSummaryLive(), error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
 }
 
 if (repoMode) await enrichBlindPool(blind1, `${runDir}/review-1`, 'Review')
+
+// G2 evidence-verification pass (investigate runs only — a hard no-op otherwise): AFTER staging
+// (and the repoMode enrichment rebuild), BEFORE the composeOnly pool return, so every pooled
+// finding carries its `EVIDENCE: n cited, m verified` stamp when the composer reads the pool.
+const stagedEv = await evidenceVerificationPass(staged1, `${runDir}/review-1`, 'Review')
+
+// composeOnly (@@FE): the pool is the product. Persist the key + summaries and return the
+// staged blind pool for the orchestrating model to review/compose from. No council spend.
+if (composeOnly) {
+  // Evidence-aware mapping rows (investigate only; identical to r1mapping otherwise, since
+  // mergeEvidence attaches nothing when the pass did not run).
+  const evMapping = stagedEv.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid,
+    ...(c.evidence ? { evidence: { cited: c.evidence.cited, verified: c.evidence.verified } } : {}),
+    ...(c.valid ? {} : { failReason: c.failReason }) }))
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(), round1: evMapping, winner1: null }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping: evMapping, resume: resumeSummary() }) },
+  ], 'Review')
+  await maybeFileEngineIssues('Review')
+  return {
+    mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades,
+    poolPath: `${runDir}/review-1/_pool.md`,
+    round1: { mapping: evMapping },
+    candidates: stagedEv.filter(c => c.valid).map(c => ({ blind: c.blind, stagedDir: `${runDir}/review-1/${c.blind}`,
+      ...(c.evidence ? { evidence: { cited: c.evidence.cited, verified: c.evidence.verified } } : {}) })),
+  }
+}
 
 // Plan Round 1 review — judged by the PLAN-lens council (feasibility/completeness/risk/
 // security-by-design/simplicity), selected by phaseTitle inside judge(). Plans never touch the repo.
@@ -2485,7 +4707,7 @@ if (review.__failed) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // failure-heavy abort: file engine-fault classes before returning
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
 }
 
 if (review.no_consensus) {
@@ -2496,20 +4718,20 @@ if (review.no_consensus) {
   log(`Review: council NO_CONSENSUS — ${review.reasoning}`)
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: null, no_consensus: true, ...(mode === 'two' ? { winner: null } : {}) }) },
-    { path: `${runDir}/review-1/verdict.json`, content: json(review) },
+    ...verdictEntries(`${runDir}/review-1`, review, 'review'),
     { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict (NO CONSENSUS)'), derive: { mode: 'verdict-md', from: `${runDir}/review-1/verdict.json`, title: 'Round-1 review verdict (NO CONSENSUS)' } },
     { path: `${runDir}/review-1/council.json`, content: json(review.council), derive: { mode: 'council-json', from: `${runDir}/review-1/verdict.json` } },
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, resume: resumeSummary() }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, resume: resumeSummary() }) },
   ], 'Review')
   await maybeFileEngineIssues('Review') // abort path: RC observability must survive a NO_CONSENSUS stop
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, no_consensus: true, council: review.council, error: `NO_CONSENSUS at review: ${review.reasoning}` }
 }
 
 // P2: round-1 review is valid — incremental write BEFORE any round-2 dispatch (crash-survival linchpin)
 await persist([
   { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner }) },
-  { path: `${runDir}/review-1/verdict.json`, content: json(review) },
+  ...verdictEntries(`${runDir}/review-1`, review, 'review'),
   { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-1/verdict.json`, title: 'Round-1 review verdict' } },
   ...(review.council ? [{ path: `${runDir}/review-1/council.json`, content: json(review.council), derive: { mode: 'council-json', from: `${runDir}/review-1/verdict.json` } }] : []),
   ...(review.guidance ? [{ path: `${runDir}/review-1/guidance.md`, content: guidanceToMd(review.guidance), derive: { mode: 'guidance-md', from: `${runDir}/review-1/verdict.json` } }] : []),
@@ -2519,12 +4741,55 @@ if (mode === 'single') {
   // P3: single-pass — mapping/verdict already written at P2; add the summaries
   const contributions = computeContributions({ mapping: r1mapping, review }, null, null, mode)
   await persist([
-    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
-    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, resume: resumeSummary() }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, resume: resumeSummary() }) },
     { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, contributions }) },
   ], 'Review')
+  // Run depth (2026-07-07 fix): fast/default IMPLEMENT runs land HERE — c5722eb routes them to
+  // mode 'single' so the R1 review (a FINAL decision point: steelman included, winner gated and
+  // boosted) replaces the Round-2 rewrite. The implement phase must therefore hang off THIS path
+  // too, seeded with the R1 winner's brief; without it an implement+default run silently ended at
+  // the plan review (caught pre-dispatch on the first live default-depth implement invocation).
+  if (implement) {
+    const planWinner1 = blind1.find(c => c.blind === review.winner)
+    if (!planWinner1) {
+      await maybeFileEngineIssues('Review')
+      await heartbeat('done', { phaseComplete: 'final' })
+      return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions, no_consensus: false, error: 'implement requested but the review winner is not a valid staged candidate' }
+    }
+    const seedPlanPath = `${runDir}/_winning-plan/plan.md`
+    await bundlePlan(planWinner1.ws, seedPlanPath)
+    if (DYNAMIC_M_ON) {
+      const ev = await readConvergenceEvidence(dynamicMBucket)
+      const trimmed = trimSeatsForConvergence(implementSeats, ev)
+      if (trimmed.length < implementSeats.length) { log(`JE-DYNAMIC-M: trimming implementers ${implementSeats.length} -> ${trimmed.length}.`); implementSeats = trimmed }
+    }
+    // A/B briefs: runner-up = the R1 steelman's second seeded finalist (same source as two-pass).
+    let abInfo = null
+    if (AB_BRIEFS) {
+      const sm = review.council && review.council.steelman
+      const fin = (sm && Array.isArray(sm.seeds) && sm.seeds.length) ? sm.seeds : []
+      const ruLetter = fin.find(l => l !== review.winner) || null
+      const ru = ruLetter ? blind1.find(c => c.blind === ruLetter) : null
+      if (ru) {
+        const brief2Path = `${runDir}/_winning-plan/brief-2.md`
+        await bundlePlan(ru.ws, brief2Path)
+        implementSeats = assignAbSeeds(implementSeats, [seedPlanPath, brief2Path])
+        abInfo = { 'brief-1': review.winner, 'brief-2': ruLetter }
+      }
+    }
+    const impl = await implementPhase(seedPlanPath)
+    await persist([
+      { path: `${runDir}/implement.json`, content: json({ winningPlan: review.winner, ...(abInfo ? { ab: abInfo } : {}), ...impl }) },
+      { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, planWinner: review.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human }) },
+    ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+    await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+    await heartbeat('done', { phaseComplete: 'final' })
+    return { mode, n: N, implement: true, plan: { round1: { mapping: r1mapping, review }, winner: review.winner }, implementPhase: impl, contributions, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+  }
   await maybeFileEngineIssues('Review')
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping, review }, contributions }
+  await heartbeat('done', { phaseComplete: 'final' })
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions }
 }
 
 // ---- Two pass ----
@@ -2539,7 +4804,17 @@ phase('Round 2')
 log(`Round 2: ${attempts.length} guided attempts; carrying over ${champs.length} round-1 champion(s)${champs.length ? ` (${champs.map(c => c.displayModel).join(', ')})` : ' — none (all vetoed)'}`)
 const r2Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-2', a.label) : scratchPath('round-2', a.label) }))
 await buildWorktrees('round-2', r2Worktrees) // repoMode-only no-op otherwise
-const r2 = (await parallel(r2Worktrees.map(a => () => dispatch(a, a.ws, review.guidance, 'Round 2')))).filter(Boolean)
+// Run F fold-in: never seed round-2 briefs with stub/placeholder guidance — fall back to task-only
+// (null guidance is the round-1 dispatch shape, a first-class path).
+let r2Guidance = review.guidance
+{ const stub = guidanceStub(r2Guidance)
+  if (stub) { log(`JE-GUIDANCE-STUB [Round 2]: ${stub} — falling back to TASK-ONLY round 2 (no priors block seeds a brief).`); r2Guidance = null } }
+await computeReuse('round-2', r2Worktrees)
+markInflight(r2Worktrees)
+await heartbeat('Round 2')
+const r2 = (await parallelQuorum(r2Worktrees, (a) => dispatchOrReuse(a, 'round-2', () => dispatch(a, a.ws, r2Guidance, 'Round 2')), 'Round 2', {
+  timeoutSecsFor: attemptTimeoutSecsFor, seatLabelFor: (a) => a.label,
+})).filter(Boolean)
 { const w = dispatchDropSummary('Round 2', dispatchDrops, r2Worktrees.length, r2.length); if (w) log(w) } // #45
 await snapshotWorktrees('round-2', r2) // repoMode-only no-op otherwise
 
@@ -2557,6 +4832,8 @@ const finalPool = [
 phase('Final rank')
 const stagedF = await stageAndValidate(blindLabel(finalPool, 2), `${runDir}/review-final`, 'Final rank')
 const blindF = stagedF.filter(c => c.valid)
+markStaged(stagedF)
+await heartbeat('Final rank')
 const finalMapping = stagedF.map(c => ({ candidate: c.blind, model: c.displayModel, round: c.round, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
 const carriedEntries = finalMapping.filter(e => e.round === 1)
 const carriedOverWinner = carriedEntries.length ? carriedEntries[0].candidate : null // legacy field (first champion)
@@ -2568,13 +4845,39 @@ if (!blindF.length) {
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
 }
 
 if (repoMode) await enrichBlindPool(blindF, `${runDir}/review-final`, 'Final rank')
 
 // Plan Final rank — the winning PLAN, judged by the same PLAN-lens council (by phaseTitle).
+// Run N: register the speculative-implement seed hook (implement runs only; flag-gated). The
+// callback captures blindF so seed letters resolve to candidate workspaces at fire time.
+if (implement && SPECULATIVE_IMPLEMENT) {
+  onSteelmanSeeds = (seeds) => {
+    const leader = seeds && seeds[0]
+    const lead = leader ? blindF.find(c => c.blind === leader) : null
+    if (!lead) return
+    const ruLetter = seeds[1] || null
+    const ru = ruLetter ? blindF.find(c => c.blind === ruLetter) : null
+    log(`JE-SPECULATIVE [Implement Round 3]: seeding implementers with tally-leader ${leader}'s PRE-STEELMAN brief while the shootout runs (a flip discards + re-runs clean).`)
+    const spec = { leader }
+    spec.promise = (async () => {
+      const seedPlanPath = `${runDir}/_winning-plan/plan.md`
+      await bundlePlan(lead.ws, seedPlanPath)
+      if (AB_BRIEFS && ru) {
+        const brief2Path = `${runDir}/_winning-plan/brief-2.md`
+        await bundlePlan(ru.ws, brief2Path)
+        implementSeats = assignAbSeeds(implementSeats, [seedPlanPath, brief2Path])
+        spec.ab = { 'brief-1': leader, 'brief-2': ruLetter }
+      }
+      return implementRound('impl-3', 'Implement Round 3', 3, seedPlanPath, null, `${runDir}/review-impl-3`, true)
+    })()
+    speculativeImpl = spec
+  }
+}
 const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-final/_pool.md`, RANK_SCHEMA, 'Final rank', 'final-rank')
+onSteelmanSeeds = null // Run N: never leaks past the plan final rank (fired or not)
 if (finalRank.__failed) {
   // P5: final-rank judge failed — same payload as P4 (no finalRank to render)
   await persist([
@@ -2583,7 +4886,7 @@ if (finalRank.__failed) {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
   ], 'Final rank')
   await maybeFileEngineIssues('Final rank') // failure-heavy abort: file engine-fault classes before returning
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
 }
 
 if (finalRank.no_consensus) {
@@ -2593,14 +4896,14 @@ if (finalRank.no_consensus) {
   log(`Final rank: council NO_CONSENSUS — ${finalRank.reasoning}`)
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, carriedOver: carriedOverAll, no_consensus: true }) },
-    { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+    ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
     { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict (NO CONSENSUS)'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict (NO CONSENSUS)' } },
     { path: `${runDir}/review-final/council.json`, content: json(finalRank.council), derive: { mode: 'council-json', from: `${runDir}/review-final/verdict.json` } },
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
   ], 'Final rank')
   await maybeFileEngineIssues('Final rank') // abort path: RC observability must survive a NO_CONSENSUS stop
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, no_consensus: true, council: finalRank.council, error: `NO_CONSENSUS at final rank: ${finalRank.reasoning}` }
 }
 
 if (finalRank.needs_orchestrator_pick) {
@@ -2610,14 +4913,14 @@ if (finalRank.needs_orchestrator_pick) {
   log(`Final rank: steelman loop tied after 5 rounds — needs_orchestrator_pick [${finalRank.needs_orchestrator_pick.finalists.join(', ')}]`)
   await persist([
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner, carriedOver: carriedOverAll, needs_orchestrator_pick: finalRank.needs_orchestrator_pick.finalists }) },
-    { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+    ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
     { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict (ORCHESTRATOR PICK NEEDED)'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict (ORCHESTRATOR PICK NEEDED)' } },
     { path: `${runDir}/review-final/council.json`, content: json(finalRank.council) },
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank }) },
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank }) },
   ], 'Final rank')
   await maybeFileEngineIssues('Final rank')
-  return { mode, n: N, rc_summary: rcSummaryLive(), round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, needs_orchestrator_pick: finalRank.needs_orchestrator_pick }
+  return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, rank: finalRank }, needs_orchestrator_pick: finalRank.needs_orchestrator_pick }
 }
 
 // #7: resolve winnerRound against the VALID finalist set; omit the field if unresolved (no literal "undefined")
@@ -2631,16 +4934,17 @@ const contributions = computeContributions(
 )
 await persist([
   { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), round1: r1mapping, winner1: review.winner, final: finalMapping, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, carriedOverWinner, carriedOver: carriedOverAll }) },
-  { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+  ...verdictEntries(`${runDir}/review-final`, finalRank, 'final-rank'),
   { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict'), derive: { mode: 'verdict-md', from: `${runDir}/review-final/verdict.json`, title: 'Final rank verdict' } },
   ...(finalRank.council ? [{ path: `${runDir}/review-final/council.json`, content: json(finalRank.council), derive: { mode: 'council-json', from: `${runDir}/review-final/verdict.json` } }] : []),
-  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
-  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
+  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null, resume: resumeSummary() }) },
+  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null, resume: resumeSummary() }) },
   { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, contributions }) },
 ], 'Final rank')
 
 // Auto-file engine-fault issues AFTER durable persistence, so a filing hang can never lose artifacts.
 await maybeFileEngineIssues('Final rank')
+if (!implement) await heartbeat('done', { phaseComplete: 'final' })
 
 // ===== IMPLEMENT PHASE hook — only with args.implement. =====================================
 // Reached only on a RESOLVED winning plan: a plan-phase NO_CONSENSUS / __failed / no-valid-pool
@@ -2649,13 +4953,69 @@ await maybeFileEngineIssues('Final rank')
 if (implement) {
   const planWinner = blindF.find(c => c.blind === finalRank.winner) || champ || blindF[0]
   const seedPlanPath = `${runDir}/_winning-plan/plan.md`
-  await bundlePlan(planWinner.ws, seedPlanPath)
-  const impl = await implementPhase(seedPlanPath)
+  // Run N: resolve the speculative round's fate against the crowned winner.
+  const specHit = !!(SPECULATIVE_IMPLEMENT && speculativeImpl && speculativeImpl.leader === finalRank.winner)
+  if (SPECULATIVE_IMPLEMENT && speculativeImpl && !specHit) {
+    log(`JE-SPECULATIVE-FLIP: shootout crowned ${finalRank.winner} but the speculative round was seeded with ${speculativeImpl.leader} — discarding it (awaited to completion) and re-running Implement Round 3 clean.`)
+    await speculativeImpl.promise.catch(() => null)
+    await agentLadder(
+      `Joust-engine speculative-flip cleanup (BOTH paths are engine-managed scratch dirs inside this run): run in ONE Bash call: rm -rf ${q(`${runDir}/review-impl-3`)} ${q(`${workspaceRoot}/impl-3`)}; echo done`,
+      { model: HELPER_MODEL, phase: 'Implement Round 3', label: 'speculative-wipe' }).catch(() => null)
+    speculativeImpl = null
+  }
+  if (!specHit) await bundlePlan(planWinner.ws, seedPlanPath)
+  // Dynamic M (issue #36): OPT-IN spend optimization — decided BEFORE the A/B-brief assignment so the
+  // reduce-only prefix trim shrinks the BASE pool and the A/B split re-alternates the TRIMMED pool
+  // below (a prefix slice of an already-alternated pool would unbalance brief-1/brief-2).
+  // Reduce-only + fail-open: on high same-task convergence in the ledger, seat one fewer implementer
+  // (never below the floor). Any missing input / read failure / thin evidence leaves the count as-is.
+  // Safe by construction: dedup already dissolves the duplicate-deadlock before judging, so a wrong
+  // or stale read can only ever spend slightly less — it can never recreate the deadlock #36 targets.
+  if (DYNAMIC_M_ON && !specHit) { // Run N: the seed-time path skips the trim (spend guard stays normal-path-only)
+    const ev = await readConvergenceEvidence(dynamicMBucket)
+    const trimmed = trimSeatsForConvergence(implementSeats, ev)
+    if (trimmed.length < implementSeats.length) {
+      log(`JE-DYNAMIC-M: same-task convergence high (samples=${ev.samples}, ratio=${ev.convergenceRatio}) — trimming implementers ${implementSeats.length} → ${trimmed.length} (reduce-only; floor ${DYNAMIC_M.M_FLOOR}).`)
+      implementSeats = trimmed
+    } else {
+      log(`JE-DYNAMIC-M: no trim (dynamicM on; evidence ${ev ? `samples=${ev.samples} ratio=${ev.convergenceRatio}` : 'unavailable'} — seats unchanged at ${implementSeats.length}).`)
+    }
+  }
+  // A/B briefs: seed the implementer pool alternately with the winner's AND the runner-up finalist's
+  // briefs. The runner-up comes from the steelman's seeded finalists (top-2 NON-VETOED by
+  // construction — a vetoed candidate can never be a finalist), so a vetoed brief can never seed an
+  // implementer. Judges stay blind to lineage; the readout is derived from mapping afterwards.
+  let abInfo = specHit ? (speculativeImpl.ab || null) : null
+  if (AB_BRIEFS && !specHit) {
+    // The steelman metadata's field for the top-2 non-vetoed finalists is `seeds` (observed live:
+    // the run-h calibration resolved A vs G with steelman.seeds=['A','G'], while `finalists` exists
+    // ONLY inside a needs_orchestrator_pick payload — reading it here silently disabled A/B on
+    // every majority-resolved run). Keep `finalists` as a fallback for the pick-payload shape.
+    const sm = finalRank.council && finalRank.council.steelman
+    const fin = (sm && Array.isArray(sm.seeds) && sm.seeds.length) ? sm.seeds
+      : (sm && Array.isArray(sm.finalists)) ? sm.finalists : []
+    const ruLetter = fin.find(l => l !== finalRank.winner) || null
+    const ru = ruLetter ? blindF.find(c => c.blind === ruLetter) : null
+    if (ru) {
+      const brief2Path = `${runDir}/_winning-plan/brief-2.md`
+      await bundlePlan(ru.ws, brief2Path)
+      // Re-alternate the (possibly trimmed) pool so the A/B split stays balanced — never slice a
+      // prefix of an already-alternated pool (issue #36: trim precedes this assignment).
+      implementSeats = assignAbSeeds(implementSeats, [seedPlanPath, brief2Path])
+      abInfo = { 'brief-1': finalRank.winner, 'brief-2': ruLetter }
+      log(`A/B BRIEFS: implementers split alternately across brief-1 (final-rank ${finalRank.winner}) and brief-2 (final-rank ${ruLetter}). Judges are blind to lineage — the A/B readout is derived from mapping, never from votes.`)
+    } else {
+      log('A/B BRIEFS requested but the final rank has no second non-vetoed finalist — all implementers seed from the single winning brief.')
+    }
+  }
+  if (specHit) log(`JE-SPECULATIVE: tally leader ${speculativeImpl.leader} held through the shootout — adopting the speculative Implement Round 3 (seeded PRE-STEELMAN; disclosed in mapping).`)
+  const impl = await implementPhase(seedPlanPath, specHit ? speculativeImpl.promise : null)
   await persist([
-    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...impl }) },
-    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
+    { path: `${runDir}/implement.json`, content: json({ winningPlan: finalRank.winner, ...(abInfo ? { ab: abInfo } : {}), ...(SPECULATIVE_IMPLEMENT ? { speculative: { enabled: true, ...(speculativeImpl ? { leader: speculativeImpl.leader, hit: specHit, seed: 'pre-steelman' } : { fired: false }) } } : {}), ...impl }) },
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+  await heartbeat('done', { phaseComplete: 'final' })
   return {
     mode, n: N, implement: true,
     plan: {
@@ -2667,6 +5027,7 @@ if (implement) {
     implementPhase: impl,
     contributions,
     rc_summary: rcSummaryLive(),
+    model_downgrades: modelDowngrades,
   }
 }
 
@@ -2677,4 +5038,5 @@ return {
   final: { mapping: finalMapping, rank: finalRank, ...(winnerEntry ? { winnerRound: winnerEntry.round } : {}) },
   contributions,
   rc_summary: rcSummaryLive(),
+  model_downgrades: modelDowngrades,
 }

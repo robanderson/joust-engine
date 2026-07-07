@@ -6,14 +6,28 @@
 // explicit-N-vs-prose conflict rule, and (NEW, Feature 1) the grand-loop Z
 // parameter.
 //
+// @@FE (Fable Engine, the fast composer variant) is ALSO parsed here:
+//   @@FE[:N]  — N optional (>= 2); case-insensitive; optional spaces around ':'.
+//   Output gains fe:true + composeOnly:true. M/Z segments are INVALID for @@FE
+//   (loud error, like positional skips) — @@FE is single-pass compose-only.
+//   The marker-adjacent size word (short/medium/long) and the prose model spec
+//   work identically to @@JE (spec sum supplies/overrides N). Bare @@FE with no
+//   N and no spec expands to the skill's documented default pool
+//   (2 opus, 2 sonnet, 2 glm-5.2, 2 codex-high, 2 minimax-m3 => N=10) and sets
+//   feDefaultPool:true, needsGate:false (no interactive gate).
+//   @@FE and @@JE in ONE message is an error (never guess which engine).
+//
 // Pure & deterministic: no Date, no random, no I/O except the tiny CLI guard at
 // the bottom. NEVER throws on user input — every failure becomes an errors[]
 // entry and n/assignment are nulled so a careless caller can't run the wrong
 // tournament.
 //
-// CLI:   node je-parse.mjs "<raw user message>"
+// CLI:   node je-parse.mjs "<raw user message>"   (or --help / --size <label>)
 // Prints { task, n, mode, z, assignment, preset?, conflict?, errors?, needsGate?,
 //          repoMode, baseRef }
+//   plus, for an @@FE invocation only: { fe: true, composeOnly: true,
+//          feDefaultPool } (feDefaultPool true iff the bare-@@FE default N=10
+//          pool was applied). @@JE / prose parses carry NONE of the fe fields.
 //   repoMode : boolean — true => repo-anchored (worktree-per-attempt) grand loop;
 //               false (default) => today's self-contained tournament, byte-for-byte.
 //   baseRef  : string|null — pinned base sha for repo-anchored mode. The PARSER only
@@ -131,6 +145,15 @@ const PLAN_DEFAULT_POOL = [
 // opus >= 2 AND sonnet >= 2), trading one codex-high seat to keep M lean.
 const IMPLEMENT_DEFAULT_POOL = ['opus', 'opus', 'sonnet', 'sonnet', 'codex-xhigh', 'glm-5.2'];
 
+// @@FE (Fable Engine) default draft pool — the skill's documented default N=10
+// pool for a bare @@FE (no N, no spec). Codex at HIGH (not xhigh: near-equal
+// draft quality, materially faster); glm-5.2 viable because a compose round has
+// no council to gridlock. See skills/fable-engine/SKILL.md "Phase 0: Parse".
+const FE_DEFAULT_POOL = [
+  'opus', 'opus', 'sonnet', 'sonnet', 'glm-5.2', 'glm-5.2',
+  'codex-high', 'codex-high', 'minimax-m3', 'minimax-m3',
+];
+
 // Recognised model token alternatives for the SPEC scan. These match the
 // HEAD of an item (after the count); the normaliser then validates exactly.
 // Order matters: longer / more-specific patterns first so we capture the full
@@ -212,6 +235,17 @@ const NO_REPO_BEFORE_RX = /(?:--no-repo|self[\s-]?contained)\b[\s:,-]*$/i;
 //   BEFORE : immediately precedes the marker
 const SIZE_AFTER_RX  = /^[\s:,-]*\b(short|medium|long)\b(?=\s*(?:[,;]|$))/i;
 const SIZE_BEFORE_RX = /\b(short|medium|long)\b[\s:,-]*$/i;
+
+// Marker-adjacent RUN-DEPTH override (2026-07-07, Rob): how many steelman
+// boost-and-cold-re-judge rounds a FINAL decision point may run before the tie routes to
+// needs_orchestrator_pick. 'fast' = 1 (one mandatory shootout round, no iteration),
+// 'deep' = up to 5. Unspecified = the engine default (3). Same adjacency + strip
+// discipline as the size words, so an ordinary 'fast'/'deep' in the task body ('a fast
+// sorter', 'deep copy the tree') is never misread or eaten. The AFTER form requires a
+// clause boundary, so `@@JE fast, <task>` matches and `@@JE fast sorter` does not.
+const DEPTH_AFTER_RX  = /^[\s:,-]*\b(fast|deep)\b(?=\s*(?:[,;]|$))/i;
+const DEPTH_BEFORE_RX = /\b(fast|deep)\b[\s:,-]*$/i;
+const DEPTH_ITERS = { fast: 1, deep: 5 };
 
 // Marker-adjacent 'implement' keyword (plan/implement round split). It enables the
 // implement rounds (3–4) without a phase-scoped Implement: spec. Like the pass /
@@ -356,6 +390,11 @@ function intSeg(raw) {
 // '@@JE:5:2' and '@@JE:5:2:3' all match.
 const SIGIL_RX = /@@je(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
 const PROSE_RX = /joust\s*:\s*(\d*)(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
+// @@FE (Fable Engine) sigil. Same segment shape as SIGIL_RX so an M/Z segment
+// is CAPTURED (and then rejected loudly) rather than silently left in the task.
+// NB: '@@FE' is deliberately brand-invariant — the rebrand map (rebrand.config.json)
+// rewrites @@JE tokens only, so this sigil survives identically in the dev channel.
+const FE_SIGIL_RX = /@@fe(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?/i;
 
 // ---------------------------------------------------------------------------
 // Prose model-spec scan (two-stage).
@@ -376,13 +415,18 @@ function locateSpec(msg) {
   // commas / 'and' / whitespace, optionally introduced by a connector.
   // We iterate item-by-item (NOT one giant variable-length capture) to reliably
   // capture middle items.
+  // 2026-07-07 fix: bare WHITESPACE also joins adjacent items ('2 opus 2 codex' is one
+  // chain — it used to parse as two disjoint 1-item chains, and the longest-raw pick below
+  // silently DROPPED the other item, changing N; the skill contract forbids silent drops).
   const chainRx = new RegExp(
     '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +                       // first item
-    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX + ')*', // more
+    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX +
+    '|\\s+' + COUNT_NC + MODEL_TOKEN_RX + ')*',                    // more (joiner OR whitespace)
     'ig'
   );
 
   let best = null;
+  const all = [];
   let m;
   while ((m = chainRx.exec(msg)) !== null) {
     if (m[0].length === 0) { chainRx.lastIndex++; continue; }
@@ -392,10 +436,15 @@ function locateSpec(msg) {
     // are drawn from MODEL_TOKEN_RX (real model families only), a lone
     // '3 glm' is fine; '3 bugs' never matches because 'bugs' isn't a model
     // token. So any match here is already spec-grade.
+    all.push({ start: m.index, end: m.index + m[0].length, raw: m[0] });
     if (!best || m[0].length > best.raw.length) {
       best = { found: true, start: m.index, end: m.index + m[0].length, raw: m[0] };
     }
   }
+  // Multiple DISJOINT spec-grade chains (e.g. '2 opus then 2 codex') can no longer be
+  // resolved by picking one — that silently drops the rest. Surface every fragment so the
+  // caller errors loudly and the user re-states the spec with commas/'and'.
+  if (best && all.length > 1) best.multiple = all.map(c => c.raw.trim());
   return best || { found: false };
 }
 
@@ -504,6 +553,7 @@ function extractPhaseSpecs(msg) {
     // An Implement: label with no model spell-out is still a signal to enable the
     // implement rounds (defaults fill the pool); record an empty expansion for it.
     const exp = loc.found ? expandSpec(loc.raw) : { assignment: [], count: 0, unknowns: [], overflows: [], any: false };
+    if (loc.found && loc.multiple) exp.multiple = loc.multiple; // surfaced by the caller as a loud error
     for (const u of unk) if (!exp.unknowns.includes(u)) exp.unknowns.push(u);
     out[marks[i].name] = exp;
   }
@@ -537,6 +587,7 @@ function parse(rawInput) {
     repoMode: false, // P0 (plan §4): false => today's self-contained tournament unchanged
     baseRef: null,   // P0: resolved to a pinned sha by the SKILL; the parser records null
     size: null,      // manual task-size override (short|medium|long); null => SKILL estimates
+    depth: null,     // run-depth override (fast|deep); null => engine default steelman budget (3)
     // Plan/Implement round split (2026-07-03). `implement` gates rounds 3–4;
     // planAssignment is the plan-phase pool (== assignment, kept for clarity);
     // implementAssignment is the implement-phase pool (rounds 3–4), null when
@@ -563,7 +614,15 @@ function parse(rawInput) {
 
   // --- 1. Find the marker (sigil preferred, else prose). ---
   const sigil = SIGIL_RX.exec(msg);
+  const feSigil = FE_SIGIL_RX.exec(msg);
   const prose = PROSE_RX.exec(msg);
+
+  // @@FE and @@JE in ONE message is ambiguous (which engine?) — NEVER guess.
+  if (sigil && feSigil) {
+    errors.push('Both @@FE and @@JE markers found in one message. Use exactly one engine sigil.');
+    result.errors = errors;
+    return result;
+  }
 
   let marker = null;       // { kind, index, length, nSeg, mSeg, zSeg }
   if (sigil) {
@@ -577,6 +636,21 @@ function parse(rawInput) {
       // raw text after '@@JE' (for positional-skip detection)
       rawTail: sigil[0],
     };
+  } else if (feSigil) {
+    // @@FE (Fable Engine, composeOnly). fe-only output fields are added HERE so
+    // every @@JE / prose parse stays byte-identical to before.
+    marker = {
+      kind: 'fe',
+      index: feSigil.index,
+      length: feSigil[0].length,
+      nSeg: intSeg(feSigil[1]),
+      mSeg: intSeg(feSigil[2]),
+      zSeg: intSeg(feSigil[3]),
+      rawTail: feSigil[0],
+    };
+    result.fe = true;
+    result.composeOnly = true;
+    result.feDefaultPool = false; // true only when the bare-@@FE default pool applies
   } else if (prose) {
     marker = {
       kind: 'prose',
@@ -597,6 +671,21 @@ function parse(rawInput) {
     return result;
   }
 
+  // security-sweep M23 (2026-07-07): the sigil regex captures at most 3 colon segments and has no
+  // end-assertion, so a MALFORMED marker with a 4th+ segment (`@@JE:4:2:5:99`) matched the `:4:2:5`
+  // prefix and left `:99` in the task — silently running a valid-looking prefix instead of erroring.
+  // For repo-mutating Z configs a fat-fingered extra segment could run a DIFFERENT tournament than
+  // typed. Reject a 4th colon-number segment immediately after the marker (fail loud, don't guess).
+  if (marker.kind === 'sigil' || marker.kind === 'fe') {
+    const afterMarker = msg.slice(marker.index + marker.length);
+    const extra = afterMarker.match(/^\s*:\s*\d+/);
+    if (extra) {
+      errors.push(`Malformed marker: "${(marker.rawTail + extra[0]).trim()}" has more than 3 colon segments (@@JE takes :N:M:Z only). Remove the extra segment and re-run.`);
+      result.errors = errors;
+      return result;
+    }
+  }
+
   // --- 2. Detect positional skips (empty middle segment). ---
   // A skip looks like '@@JE:5::3' — N present, M EMPTY, Z present. Because we
   // captured \d* per segment, an empty-but-colon-supplied M shows as
@@ -606,16 +695,28 @@ function parse(rawInput) {
   const colonSegs = countColonSegments(marker.rawTail);
   // colonSegs: how many ':' separators were written. If a later segment has a
   // value but an earlier one is empty -> positional skip.
-  if (marker.zSeg.present && !marker.mSeg.present && marker.zSeg.value !== null) {
-    errors.push(
-      'Positional skip not allowed: "' + marker.rawTail.trim() +
-      '". To set Z with default M, write @@JE:N:1:Z (e.g. @@JE:5:1:3).'
-    );
-  }
-  if (marker.mSeg.present && !marker.nSeg.present && marker.nSeg.value === null &&
-      marker.kind === 'sigil' && colonSegs >= 2 && isEmptyFirstColonSeg(marker.rawTail)) {
-    // '@@JE::2' — empty N is allowed ONLY if a prose spec will supply N; we
-    // record nothing here and let the conflict/needsGate logic decide later.
+  if (marker.kind === 'fe') {
+    // @@FE takes ONLY an optional N. Any second colon segment (M or Z, even an
+    // empty one) is rejected loudly — like a positional skip — never guessed at.
+    if (colonSegs >= 2) {
+      errors.push(
+        'M/Z segments are not valid for @@FE: "' + marker.rawTail.trim() +
+        '". @@FE is single-pass compose-only and takes only an optional N (e.g. @@FE:6). ' +
+        'Use @@JE:N:M:Z for passes / grand loops.'
+      );
+    }
+  } else {
+    if (marker.zSeg.present && !marker.mSeg.present && marker.zSeg.value !== null) {
+      errors.push(
+        'Positional skip not allowed: "' + marker.rawTail.trim() +
+        '". To set Z with default M, write @@JE:N:1:Z (e.g. @@JE:5:1:3).'
+      );
+    }
+    if (marker.mSeg.present && !marker.nSeg.present && marker.nSeg.value === null &&
+        marker.kind === 'sigil' && colonSegs >= 2 && isEmptyFirstColonSeg(marker.rawTail)) {
+      // '@@JE::2' — empty N is allowed ONLY if a prose spec will supply N; we
+      // record nothing here and let the conflict/needsGate logic decide later.
+    }
   }
 
   // --- 3. Extract task = text on BOTH sides of the marker (D-0007). ---
@@ -630,7 +731,7 @@ function parse(rawInput) {
   // --- 4. M / mode (sigil :M, then a MARKER-ADJACENT prose pass directive). ---
   let mode = 1;
   let mSigil = null;                 // a VALID sigil M (1 or 2), else null
-  if (marker.mSeg.present) {
+  if (marker.kind !== 'fe' && marker.mSeg.present) {
     if (marker.mSeg.value === 1) { mode = 1; mSigil = 1; }
     else if (marker.mSeg.value === 2) { mode = 2; mSigil = 2; }
     else {
@@ -652,7 +753,15 @@ function parse(rawInput) {
     const mp = /two/i.test(pmMatch[1]) ? 2 : 1;   // 'two'->2, 'single'/'one'->1
     if (pmAfter) postMarker = postMarker.replace(PASS_AFTER_RX, ' ');
     else preMarker = preMarker.replace(PASS_BEFORE_RX, ' ');
-    if (mSigil != null) {
+    if (marker.kind === 'fe') {
+      // @@FE is single-pass compose-only: a prose 'two pass' is the M=2 spelling
+      // and is just as invalid as a sigil :2. 'single'/'one pass' is redundant
+      // but harmless (mode is already 1) — stripped, no error.
+      if (mp === 2) {
+        errors.push('"two pass" is not valid with @@FE — @@FE is single-pass compose-only. ' +
+          'Use @@JE:N:2 for a two-pass tournament.');
+      }
+    } else if (mSigil != null) {
       if (mSigil !== mp) {
         errors.push('Pass-count conflict: sigil M=' + mSigil + ' but prose says "' +
           pmMatch[1].toLowerCase() + ' pass" (M=' + mp + '). State the pass count once.');
@@ -698,6 +807,18 @@ function parse(rawInput) {
     else preMarker = preMarker.replace(SIZE_BEFORE_RX, ' ');
   }
 
+  // --- 4c2. Run-depth override (fast|deep; steelman shootout iteration budget). ---
+  // Marker-adjacent + stripped, exactly like the size word. When absent, depth stays
+  // null and the engine runs its default budget (3 iterations).
+  const dpAfter = DEPTH_AFTER_RX.exec(postMarker);
+  const dpMatch = dpAfter || DEPTH_BEFORE_RX.exec(preMarker);
+  if (dpMatch) {
+    result.depth = canon(dpMatch[1]);                       // fast | deep
+    result.steelmanMaxIters = DEPTH_ITERS[result.depth];    // 1 | 5 (pass straight to the engine)
+    if (dpAfter) postMarker = postMarker.replace(DEPTH_AFTER_RX, ' ');
+    else preMarker = preMarker.replace(DEPTH_BEFORE_RX, ' ');
+  }
+
   // --- 4d. Implement keyword (marker-adjacent; plan/implement round split). ---
   // Enables the implement rounds (3–4). Stripped at its source side (same D-0006
   // discipline as the pass / repo / size keywords) so an ordinary 'implement …' in the
@@ -717,7 +838,7 @@ function parse(rawInput) {
   // SKILL's grand-loop authorization + driver (NO "not yet implemented" stop).
   // Z>Z_MAX is a LOUD error that echoes the offending Z and nulls n/assignment.
   let z = 1;
-  if (marker.zSeg.present) {
+  if (marker.kind !== 'fe' && marker.zSeg.present) {
     if (marker.zSeg.value === null || marker.zSeg.value < 1) {
       errors.push('Invalid Z=' + (marker.zSeg.value === null ? '(empty)' : marker.zSeg.value) +
         '. Z must be an integer >= 1.');
@@ -743,7 +864,12 @@ function parse(rawInput) {
   // the same Z_MAX ceiling and >=1 floor apply. (GRAND_LOOP_RX is evaluated against
   //  msg, which exists here; section 7 re-strips it from the spec-scan copy.)
   const __grand = GRAND_LOOP_RX.exec(msg);
-  if (__grand) {
+  if (__grand && marker.kind === 'fe') {
+    // The prose grand-loop phrase is the Z spelling — invalid for @@FE like the
+    // sigil :Z. (The phrase is still stripped from the spec scan / task below.)
+    errors.push('grand loops (Z) are not valid with @@FE — @@FE is a single compose round. ' +
+      'Use @@JE:N:M:Z for grand loops.');
+  } else if (__grand) {
     const zp = intSeg(__grand[1]).value;
     if (zp === null || zp < 1) {
       errors.push('Invalid grand-loop count "' + __grand[0].trim() +
@@ -824,6 +950,18 @@ function parse(rawInput) {
 
   // Locate a recognised-item spec (not Top Mixed).
   const spec = locateSpec(scanMsg);
+  // 2026-07-07: multiple DISJOINT spec fragments = LOUD error (the old longest-wins pick
+  // silently dropped the other fragment's models, changing N — the invariant this parser
+  // exists to protect). Whitespace-adjacent items now merge into one chain above, so this
+  // fires only for genuinely separated fragments ('2 opus … 2 codex' with words between).
+  // Phase-labelled messages are exempt HERE: 'Plan: <chain> … Implement: <chain>' is two
+  // chains by design, and each phase SEGMENT surfaces its own `multiple` below.
+  const hasPhaseLabels = PLAN_LABEL_RX.test(scanMsg) || IMPLEMENT_LABEL_RX.test(scanMsg);
+  if (spec.found && spec.multiple && !hasPhaseLabels) {
+    errors.push('Found ' + spec.multiple.length + ' separate model-spec fragments: ' +
+      spec.multiple.map(f => '"' + f + '"').join(' and ') +
+      '. Join them into ONE list with commas/"and" (e.g. "2 opus, 2 codex") and re-run.');
+  }
 
   // Connector-licensed unknown tokens (loud rejection of typos).
   const unknownHits = locateUnknownNearConnector(scanMsg);
@@ -842,6 +980,10 @@ function parse(rawInput) {
   const implExp = phaseSpecs && phaseSpecs.implement;
   if (implExp && (implExp.any || implExp.unknowns.length || implExp.overflows.length)) {
     if (implExp.overflows.length) { for (const o of implExp.overflows) pushNMaxError(o.total); }
+    else if (implExp.multiple) {
+      errors.push('Implement: spec contains ' + implExp.multiple.length + ' separate model-spec fragments: ' +
+        implExp.multiple.map(f => '"' + f + '"').join(' and ') + '. Join them with commas/"and".');
+    }
     else if (implExp.unknowns.length) {
       errors.push('Unrecognised model token(s) in Implement: spec: ' +
         implExp.unknowns.map(u => '"' + u + '"').join(', ') + '. Re-state the spec.');
@@ -861,6 +1003,10 @@ function parse(rawInput) {
     if (planExp && (planExp.any || planExp.unknowns.length || planExp.overflows.length)) {
       if (planExp.overflows.length) {
         for (const o of planExp.overflows) pushNMaxError(o.total);
+        assignment = null; nSpec = null;
+      } else if (planExp.multiple) {
+        errors.push('Plan: spec contains ' + planExp.multiple.length + ' separate model-spec fragments: ' +
+          planExp.multiple.map(f => '"' + f + '"').join(' and ') + '. Join them with commas/"and".');
         assignment = null; nSpec = null;
       } else if (planExp.unknowns.length) {
         errors.push('Unrecognised model token(s) in Plan: spec: ' +
@@ -968,6 +1114,18 @@ function parse(rawInput) {
   // --- 9. Resolve N + assignment + gate. ---
   let n = nSpec != null ? nSpec : nMarker;
 
+  // @@FE default pool: a bare @@FE (no N, no spec, no top-mixed-needs-N, no
+  // errors so far) runs the skill's documented wide default pool (N=10) — the
+  // interactive gate is NOT used for @@FE. feDefaultPool:true tells the SKILL
+  // the default applied. An explicit @@FE:N with no spec keeps assignment:null
+  // (the SKILL resolves the pool), exactly like @@JE:N.
+  if (marker.kind === 'fe' && n == null && assignment == null &&
+      !result.needsGate && !errors.length) {
+    assignment = FE_DEFAULT_POOL.slice();
+    n = FE_DEFAULT_POOL.length;
+    result.feDefaultPool = true;
+  }
+
   if (n == null && !result.needsGate) {
     // Bare @@JE with no spec, no marker N, no top-mixed-needs-N -> interactive gate.
     result.needsGate = true;
@@ -1046,7 +1204,8 @@ function stripAll(preMarkerTask, spec, fullMsg, marker) {
   const chainRx = new RegExp(
     '(?:\\bwith\\b|\\busing\\b)?\\s*' +
     '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +
-    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX + ')*',
+    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX +
+    '|\\s+' + COUNT_NC + MODEL_TOKEN_RX + ')*',   // lockstep with locateSpec (whitespace joiner)
     'ig'
   );
   t = t.replace(chainRx, ' ');
@@ -1083,6 +1242,7 @@ export {
   TOP_MIXED_POOL,
   PLAN_DEFAULT_POOL,
   IMPLEMENT_DEFAULT_POOL,
+  FE_DEFAULT_POOL,
   SIZE_PROFILES,
   Z_MAX,
   N_MAX,
@@ -1099,6 +1259,29 @@ const isMain = (() => {
 })();
 
 if (isMain) {
+  // Subcommand: `--help` prints the grammar/usage (exit 0).
+  if (process.argv[2] === '--help' || process.argv[2] === '-h') {
+    process.stdout.write([
+      'usage: node je-parse.mjs "<raw user message>"',
+      '       node je-parse.mjs --size <short|medium|long>',
+      '       node je-parse.mjs --help',
+      '',
+      'Markers (exactly one per message):',
+      '  @@JE[:N][:M[:Z]]   tournament — N attempts (>=2), M passes (1|2), Z grand loops (<=' + Z_MAX + ')',
+      '  joust:N[:M[:Z]]    prose spelling of the @@JE marker',
+      '  @@FE[:N]           Fable Engine (composeOnly) — N drafts (>=2); M/Z are INVALID.',
+      '                     Bare @@FE (no N, no spec) = default pool ' +
+        FE_DEFAULT_POOL.join(',') + ' (N=' + FE_DEFAULT_POOL.length + '), feDefaultPool:true.',
+      '',
+      'Shared grammar (both sigils, marker-adjacent unless noted):',
+      '  prose model spec   "2 opus, 2 glm 5.2, 1 codex high" — sum supplies/overrides N (anywhere)',
+      '  size word          short | medium | long (marker-adjacent, stripped from the task)',
+      '  N ceiling          N_MAX=' + N_MAX + '; all failures land in errors[] with n/assignment nulled',
+      '',
+      'Output: JSON on stdout (see the header comment of this file for the field contract).',
+    ].join('\n') + '\n');
+    process.exit(0);
+  }
   // Subcommand: `je-parse.mjs --size <short|medium|long>` prints just that size's
   // limit profile as JSON, so the SKILL can resolve the dynamic limits deterministically
   // (one source of truth) instead of hard-coding the numbers in the procedure text.

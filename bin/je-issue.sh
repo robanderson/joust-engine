@@ -87,8 +87,13 @@ check_evidence() {
   # Obvious secrets/tokens. Every alternative is anchored on a distinctive fixed
   # prefix followed by a bounded char class — no catastrophic backtracking. POSIX
   # ERE (grep -E). -i case-folds, harmless for these distinctive prefixes.
+  # security-sweep H21 (2026-07-07): the old `sk-[A-Za-z0-9]{16,}` did NOT match modern OpenAI
+  # project/service keys (`sk-proj-…`, `sk-svcacct-…`, `sk-admin-…`) — the hyphen after `sk-` stops
+  # the char class at ~4 chars, under the {16,} floor, so those keys reached the PUBLIC issue body.
+  # `sk-(proj|svcacct|admin|None)-…` is matched explicitly AND the generic `sk-` class now allows
+  # `-`/`_` so future hyphenated variants are covered too.
   if printf '%s' "$ev" | grep -Eiq \
-      'sk-[A-Za-z0-9]{16,}|gh[ps]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|(api[_-]?key|secret|bearer|access[_-]?token)[[:space:]"'"'"':=]+[A-Za-z0-9._\-]{16,}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[sr]k_live_[0-9A-Za-z]{16,}'; then
+      'sk-(proj|svcacct|admin|none)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{16,}|gh[ps]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|(api[_-]?key|secret|bearer|access[_-]?token)[[:space:]"'"'"':=]+[A-Za-z0-9._\-]{16,}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[sr]k_live_[0-9A-Za-z]{16,}'; then
     echo "REFUSE: possible secret/token in evidence." >&2
     return 5
   fi
@@ -233,27 +238,42 @@ cmd_new() {
     return 6
   fi
   EVIDENCE_FILE="$scrubbed"                     # everything downstream now uses ONLY scrubbed text
-  local rc; check_evidence "$EVIDENCE_FILE"; rc=$?
-  if [ "$rc" -ne 0 ]; then                      # post-scrub guard STILL refused
-    if [ "${JE_ISSUE_AUTOFILE:-0}" = "1" ]; then
-      local body; body="$(render_body)"         # render from the SCRUBBED evidence
-      fallback_inbox "$TITLE" "$body"           # degrade to committed inbox DRAFT (scrubbed) — never dropped
-      echo "REFUSE-DEGRADED: guard rc=$rc after scrub; wrote scrubbed inbox draft instead of posting." >&2
-      rm -f "$scrubbed"
-      return 0                                  # finding preserved on disk; caller records a non-00 filing outcome
-    fi
-    rm -f "$scrubbed"
-    return "$rc"                                # human caller: surface the guard code (now over scrubbed text)
+  # security-sweep H15 (2026-07-07): the Problem/Repro/Suspected-fix sections AND the title reach the
+  # PUBLIC issue body via render_body/_section, but the OLD pipeline scrubbed + guarded ONLY the
+  # evidence. Scrub every published section file the same way, and run check_evidence over the
+  # CONCATENATION of all published text (title + all sections) so a secret/unblinding in ANY field is
+  # caught. A scrub failure on any section fails closed (return 6), same as the evidence scrub.
+  local _sec_tmps=""
+  for var in PROBLEM_FILE REPRO_FILE FIX_FILE; do
+    eval "local src=\"\$$var\""
+    [ -n "$src" ] && [ -f "$src" ] || continue
+    local sc; sc="$(mktemp)"; _sec_tmps="$_sec_tmps $sc"
+    if ! scrub_evidence "$src" "$sc"; then rm -f "$scrubbed" $_sec_tmps; echo "REFUSE: scrub of $var failed — refusing to file." >&2; return 6; fi
+    eval "$var=\"\$sc\""
+  done
+  # Combined guard over EVERYTHING that will be published (title + all scrubbed sections + evidence).
+  local combined; combined="$(mktemp)"
+  { printf '%s\n' "$TITLE"; _section "$PROBLEM_FILE"; cat "$EVIDENCE_FILE"; _section "$REPRO_FILE"; _section "$FIX_FILE"; } > "$combined"
+  local rc; check_evidence "$combined"; rc=$?
+  rm -f "$combined"
+  if [ "$rc" -ne 0 ]; then                      # post-scrub guard STILL refused SOMEWHERE in the body
+    # security-sweep H16 (2026-07-07): NEVER write guard-refused content (rc=4 unblinding / rc=5 secret)
+    # to the COMMITTED inbox (docs/dogfood/inbox is committed to a PUBLIC repo). The old autofile path
+    # degraded rc4/5 into a committed draft — preserving exactly what the guard refused. Refuse instead:
+    # the finding stays only in the caller's own run scratch, never in a committed/public artifact.
+    rm -f "$scrubbed" $_sec_tmps
+    echo "REFUSE: guard rc=$rc after scrub (secret/unblinding in a published field) — NOT filing and NOT drafting to the committed inbox." >&2
+    return "$rc"
   fi
   local body; body="$(render_body)"
-  if ! gh_ok; then fallback_inbox "$TITLE" "$body"; rm -f "$scrubbed"; return 0; fi
+  if ! gh_ok; then fallback_inbox "$TITLE" "$body"; rm -f "$scrubbed" $_sec_tmps; return 0; fi
   resolve_repo
   local dup; dup="$(find_dup "$TITLE")"
-  if [ -n "$dup" ]; then info "duplicate of #$dup — not filing (comment there if new info)."; echo "$dup"; rm -f "$scrubbed"; return 0; fi
+  if [ -n "$dup" ]; then info "duplicate of #$dup — not filing (comment there if new info)."; echo "$dup"; rm -f "$scrubbed" $_sec_tmps; return 0; fi
   ghi issue create --title "${TITLE_PREFIX}${TITLE}" \
     --label "$MARKER" --label "$SEV" --label "area:$AREA" --body "$body"
   local crc=$?
-  rm -f "$scrubbed"
+  rm -f "$scrubbed" $_sec_tmps
   return $crc
 }
 

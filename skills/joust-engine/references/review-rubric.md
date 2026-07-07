@@ -30,15 +30,15 @@ Five blind Opus judges, **one lens each**. Each lens owns a slice of the judgeme
 
 The tournament runs in two phases and the council uses a **different lens table for each** (same engine — same deterministic tally, veto, judging-v3 fast-tally/shootout resolution, and NO_CONSENSUS rules; only the five lenses change). The engine selects the table by judging point: the **Plan phase** (Plan Round 1 review + Plan Final rank) uses the **plan lenses**; the **Implement phase** (Implement Round 3/4) uses the **code lenses** above.
 
-**Plan council** — judges a PLAN artifact (a concrete, file-level change proposal that never touches the repo):
+**Plan council** — judges a **DESIGN BRIEF** (a decision-level PLAN artifact that never touches the repo): at most 10 bullets covering **approach** (+ why, and the rejected alternative when one is competitive), **surfaces** touched (what *kind* of change each takes, never line-level edits), **risks** (riskiest assumptions + mitigation), and **testable, approach-neutral acceptance criteria**. **Altitude rule (hard):** no code blocks, no diffs, no line numbers, no function bodies. A brief that reads like an implementation is judged **DOWN** for altitude violation — never rewarded for the extra detail; a brief that hand-waves the hard 20% is judged down for incompleteness. Decisions and criteria are the deliverable — implementation details belong to the implementers.
 
 | Lens | You own | Special |
 |---|---|---|
-| **feasibility** | can this plan be built as written — are the named files, APIs, and mechanisms real and reachable, and does each step follow from the last | the reality judge; an unbuildable plan is worthless however elegant |
-| **completeness** | does the plan cover *everything* asked — every requirement, edge case, migration, test, doc — with no silent gaps | you catch "plans the easy 80%, hand-waves the hard 20%" |
-| **risk** | execution hazards — hidden coupling, breaking changes, data/compat, rollout/ordering — and whether the plan names and mitigates them | probe the failure modes the plan glosses over |
-| **security-by-design** | least privilege, input validation, safe secret handling, safe execution/supply-chain posture — or a designed-in vulnerability | you hold the **veto** (evidence-backed, as for code) |
-| **simplicity** | simplicity and proportionality — is this the smallest coherent change that still fully solves the task, or is it over-engineered | reward the simplest complete approach; penalise gold-plating |
+| **feasibility** | is the brief buildable and TRUE — do the surfaces, mechanisms, and constraints it names actually exist in the snapshot (demand the proof: verify every factual claim — a brief built on a misread codebase is infeasible however coherent), and does the chosen approach actually reach the acceptance criteria | the reality judge; audit the claims, not the prose — and score a wrong-altitude brief down, never up |
+| **completeness** | does the brief cover *everything* material the task implies — the hard 20% named (not hand-waved), the real risks, and acceptance criteria that are TESTABLE and approach-neutral, with no silent gaps in what "done" means | you catch "frames the easy 80%, hand-waves the hard 20%"; completeness is decision coverage, NOT edit-level detail — never reward line-level specificity |
+| **risk** | what could go wrong executing this approach — hidden coupling, breaking changes, data/compat hazards, rollout/ordering — and whether the brief names the riskiest assumptions and mitigates them | probe the failure modes the brief glosses over |
+| **security-by-design** | does the chosen approach build in least privilege, input validation, safe secret handling, a safe execution/supply-chain posture — or design in a vulnerability | you hold the **veto** (evidence-backed, as for code) |
+| **simplicity** | simplicity and proportionality — is the chosen approach the smallest coherent one that solves the task, or does it over-engineer, add needless surface, or gold-plate | judge whether the APPROACH is proportionate; a longer brief is not a better brief |
 
 **Dual security gates (union veto).** Every council carries TWO security seats: the primary
 Opus security lens and a cross-family `security-x` seat on codex-xhigh with the same
@@ -49,7 +49,9 @@ even-panel split is cheap now — it simply seeds or iterates the steelman shoot
 The fail-closed security-DEAD policy keys to the primary Opus seat; the codex gate falls
 back to Opus on failure like any codex seat.
 
-The **security-by-design** lens holds the same evidence-backed veto as the code security lens: a standing `UNSAFE` (high|critical + real "file + why") flag excludes that plan from winning. Everything else in this document — the shared scoring method, `checks_run`, the deterministic >50% tally, the judging-v3 fast-tally/shootout resolution, and the NO_CONSENSUS halt — applies identically to both councils. **A plan-phase NO_CONSENSUS surfaces to the orchestrator BEFORE any implement spend** (a genuinely contested design is a human decision, not something to silently implement).
+The **security-by-design** lens holds the same evidence-backed veto as the code security lens: a standing `UNSAFE` (high|critical + real "file + why") flag excludes that brief from winning. Everything else in this document — the shared scoring method, `checks_run`, the deterministic >50% tally, the judging-v3 fast-tally/shootout resolution, and the NO_CONSENSUS halt — applies identically to both councils. **A plan-phase NO_CONSENSUS surfaces to the orchestrator BEFORE any implement spend** (a genuinely contested design is a human decision, not something to silently implement).
+
+**A/B briefs (`abBriefs: true`).** When the final rank leaves a second non-vetoed steelman finalist, the implementer pool seeds **alternately** from the top-2 finalists' briefs. This changes nothing for judges: they stay **blind to brief lineage** and judge the resulting code against the **ORIGINAL task + the code-lens fundamentals only** — never against a brief. Briefs compete through their children; children are judged as orphans. The A/B readout is derived from mapping bookkeeping afterwards, never from votes.
 
 ### Mixed-family seats (codex-xhigh)
 
@@ -102,6 +104,10 @@ Peer-deliberation rounds are retired (observed live: hours of judges re-arguing 
 - **Majority** = strictly **>50%** of the *living* judges' first-place votes (recomputed against the living count if a judge dies).
 - **Veto filter (absolute):** a candidate with a standing `UNSAFE` (high|critical + evidence) flag from EITHER security gate cannot win, be carried, or be picked by the orchestrator, whatever its vote count. Both steelman finalists vetoed in a runoff (or every candidate vetoed at a final-rank seed vote) → **NO_CONSENSUS** / needs-human — the only remaining NO_CONSENSUS path.
 - The consolidated ranking downstream consumers read is derived in code (winner first, then remaining candidates by first-place votes, then average rank, then blind label) — it is bookkeeping, not a consensus override.
+
+### Aspect verifiers (optional)
+
+With `aspectVerifiers: true` (default **off**), each council decision point also fans out **4 cheap binary aspect verifiers** (one helper-model agent per aspect: *correct-behaviour, spec-fit, simplicity, robustness*), run **concurrently** with the round-1 lens fan-out against the same blind pool (research BoN-MAV, arXiv:2502.20379 — many cheap **binary** aspect checks beat a single continuous score; spend marginal budget on verification, not candidates). Each verifier answers one yes/no question per candidate (phrased for a design brief at the plan decision points, for code otherwise); a dead verifier simply **abstains** — it can never crash or shrink a run. Approval counts **never** touch the majority tally, the veto, or the `judges: 1` legacy path: they only break **exact** ties in the deterministic carry/seed order (slotting between mean-rank and blind-letter) and are surfaced to the steelman as context alongside the judge-cited cons. Per-candidate approval counts and per-aspect votes are recorded in `council.json` as `aspects`.
 
 ## Single blind judge (`judges: 1`, legacy)
 

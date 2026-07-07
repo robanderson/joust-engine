@@ -41,6 +41,10 @@ expect_rc 4 "candidate->model"  '{"candidate":"F","model":"acme-ultra-7b"}'
 # --- rc 5: secrets ------------------------------------------------------------
 expect_rc 5 "gh token"         'the log leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 oops'
 expect_rc 5 "api key kv"       'config had api_key = sk-abcdef0123456789abcdef0123 in it'
+# security-sweep H21: modern OpenAI project/service keys have a hyphen after `sk-` and slipped the
+# old `sk-[A-Za-z0-9]{16,}` pattern → reached the PUBLIC issue body. Now caught.
+expect_rc 5 "openai proj key"  'leaked sk-proj-ABCdef0123456789ABCdef0123456789 into the log'
+expect_rc 5 "openai svcacct"   'the runner used sk-svcacct-ZZZ0123456789ABCdefGHIjkl to auth'
 # new formats — all values are obviously FAKE but match the real format shape
 expect_rc 5 "google api key"   'env had GOOGLE_KEY=AIzaFAKE_NOT_A_REAL_GOOGLE_KEY_00000000 set'
 expect_rc 5 "slack token"      'the bot used xoxb-FAKE-NOT-A-REAL-TOKEN-000000 to post'

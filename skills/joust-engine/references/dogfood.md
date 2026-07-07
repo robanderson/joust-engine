@@ -152,3 +152,22 @@ them with
 `gh issue list --label dogfood --state all --json number --jq '.[].number' | xargs -I{} gh issue delete {} --yes`
 if a full reversal is wanted. No information is lost either direction — the reverted commit restores
 the verbatim evidence files, and (until deleted) the closed issues hold the same evidence.
+
+## Cross-run leaderboard ledger (`bin/je-ledger.mjs`)
+
+Run outcomes die with the gitignored run dirs; the ledger makes them durable (issue #41).
+After a run completes, `node bin/je-ledger.mjs record <runDir>` appends ONE JSON line to an
+append-only ledger (`$JE_LEDGER_PATH`, default `~/.joust-engine/ledger.jsonl`) summarizing
+the run's unblinded outcomes: mode/n, every seat (model, valid, failReason, round), winners
+(round-1 / final / implement), `rc_summary.by_code`, and — when `timeline.jsonl` exists —
+the per-phase **barrier** (slowest attempt) and mean attempt durations. The record's `ts` is
+mapping.json's mtime (run completion), never the recording time; re-recording a run is a
+skip, not a duplicate; missing optional inputs degrade gracefully.
+
+`node bin/je-ledger.mjs report` aggregates the ledger to markdown: a per-model leaderboard
+(seats, valid-rate, R1/final/implement wins, vetoes, mean attempt duration where a phase ran
+a single model) plus the assumptions we track — two-pass value (fresh round-2 vs carried
+round-1 finals), diversity (win distribution), and per-seat cost-vs-contribution. Every row
+carries its sample size (`n=`); below n>=5 nothing is recommended, and at n>=5 findings are
+phrased as hypotheses only. This is how diversity pools and default seats get tuned on
+evidence.

@@ -96,7 +96,9 @@ test('(structural) final pool takes up to two carried champions', () => {
 // ----- structural: steelman shootout -----
 test('(structural) steelman loop: always >=1 round, max 5, orchestrator pick after', () => {
   const cj = slice('async function councilJudge(', '\n// Render the council')
-  assert.match(cj, /const maxIters = loneFinalist \? 1 : 5/)
+  assert.match(cj, /const maxIters = loneFinalist \? 1 : iterBudget/)
+  // 2026-07-07: variable budget — fast=1, deep=5, DEFAULT 3, clamped 1..5 (args.steelmanMaxIters).
+  assert.match(cj, /A\.steelmanMaxIters >= 1 && A\.steelmanMaxIters <= 5\s*\n\s*\? A\.steelmanMaxIters : 3/)
   assert.match(cj, /needs_orchestrator_pick/)
   assert.match(cj, /decided_by/)
 })
@@ -109,6 +111,16 @@ test('(structural) boost failure ratchets to the last gated version, never worse
   const cj = slice('async function councilJudge(', '\n// Render the council')
   assert.match(cj, /ratchet/)
   assert.match(cj, /currentWs\[/)
+})
+test('(structural) M13: the tie ratchet runs on EVERY tied iteration (incl. the last), so gated_ws is never a round stale', () => {
+  const cj = slice('async function councilJudge(', '\n// Render the council')
+  // the currentWs ratchet must NOT be guarded by `else if (iter < maxIters)` — that skipped the
+  // final tied round, leaving needs_orchestrator_pick.gated_ws one improvement pass behind.
+  assert.doesNotMatch(cj, /\}\s*else if \(iter < maxIters\)\s*\{\s*\n[^\n]*\n\s*for \(const c of stagedR\) if \(c\.variant === 'boosted'\) currentWs/,
+    'ratchet must not sit behind the iter<maxIters guard')
+  // the iterate-log stays conditional on iter<maxIters, but the ratchet itself is unconditional
+  assert.match(cj, /for \(const c of stagedR\) if \(c\.variant === 'boosted'\) currentWs\[c\.orig\] = c\.ws\s*\n\s*if \(iter < maxIters\) log\(/,
+    'ratchet is unconditional; only the iterating log is guarded')
 })
 test('(structural) cold re-judge: runoff judges get roundNum=1 and no peer block', () => {
   const cj = slice('async function councilJudge(', '\n// Render the council')
@@ -130,7 +142,8 @@ test('(structural) every judge brief carries the anti-length-bias line', () => {
   assert.ok(hits >= 2, `expected the anti-length line in council AND legacy briefs, found ${hits}`)
 })
 test('(structural) feasibility lens owns demand-the-proof claim auditing', () => {
-  assert.match(SRC, /demand the proof: verify cited files, functions, and behaviours against the snapshot/)
+  // Design-briefs altitude change: feasibility still owns demand-the-proof, now phrased for briefs.
+  assert.match(SRC, /demand the proof: verify every factual claim about the codebase/)
 })
 
 // ----- structural: persist v2 -----
@@ -193,4 +206,97 @@ test('je-render renders steelman + fast-tally metadata into verdict.md', () => {
   assert.match(md, /Steelman shootout/)
   assert.match(md, /Fast tally \(intermediate review\)/)
   assert.match(md, /Decided by:\*\* majority/)
+})
+
+// ----- structural: composeOnly (@@FE Fable Engine) -----
+test('(structural) composeOnly stops after the staged pool — no council, no round 2', () => {
+  // flag exists and is implement-exclusive (investigate implies composeOnly semantics — v1 pipeline)
+  assert.match(SRC, /const composeOnly = \(A\.composeOnly === true \|\| investigate\) && !implement/)
+  // the branch returns the pool BEFORE the round-1 judge call and never judges
+  const seam = SRC.indexOf('if (composeOnly) {')
+  const firstJudgeCall = SRC.indexOf("await judge('reviewer'")
+  assert.ok(seam > -1 && firstJudgeCall > -1 && seam < firstJudgeCall,
+    'composeOnly early-return must sit before the round-1 council')
+  const branch = SRC.slice(seam, SRC.indexOf('// Plan Round 1 review', seam))
+  assert.match(branch, /poolPath: `\$\{runDir\}\/review-1\/_pool\.md`/)
+  assert.match(branch, /mode: 'composeOnly'/)
+  assert.doesNotMatch(branch, /await judge\(/)
+  // it still persists the unblinding key + summary and files engine issues
+  assert.match(branch, /mapping\.json/)
+  assert.match(branch, /maybeFileEngineIssues\('Review'\)/)
+})
+
+// ---- run-j2 fix (2026-07-07): the steelman runoff must RE-GATE boosted patches ----
+test('(structural) steelman runoff re-runs the mechanical gate on the boosted copies before the cold re-judge', () => {
+  const stage = SRC.indexOf('runoff staging produced no valid candidates')
+  const gate = SRC.indexOf('mechanicalPatchGate(stagedR, runoffDir, phaseTitle)')
+  const judge = SRC.indexOf('askLens(lens, stagedR, runoffPool')
+  assert.ok(stage > 0 && gate > stage && judge > gate,
+    'stage -> mechanical re-gate -> cold re-judge; a regenerated-broken boost can no longer be judged under its source dir\'s stale clean stamp')
+  const i = SRC.indexOf('failed the MECHANICAL gate — reverted to last gated version')
+  assert.ok(i > 0, 'gate-invalidated boosts ratchet back to the last gated version')
+  assert.ok(SRC.includes('-mechrepair'), 'repair pass re-stages + re-gates under a fresh runoff dir')
+})
+
+// ---- run depth (2026-07-07, Rob): fast/default implement runs skip the Round-2 plan rewrite ----
+test('(structural) run depth gates the R2 rewrite: implement forces two-pass ONLY for deep or an explicit :2', () => {
+  assert.ok(SRC.includes(`const RUN_DEPTH = A.depth === 'deep' ? 'deep' : A.depth === 'fast' ? 'fast' : 'default'`))
+  assert.ok(SRC.includes(`const mode = implement ? (RUN_DEPTH === 'deep' || A.mode === 'two' ? 'two' : 'single') : A.mode`),
+    'fast/default implement runs: R1 review IS the final plan decision point (steelman included); deep or explicit :2 keeps Round 2')
+})
+
+// ---- plan-altitude clamp (2026-07-07, hangman live finding): steelman/boost must never build code ----
+test('(structural) PLAN-point steelman + boost carry the altitude clamp — design briefs stay design briefs', () => {
+  assert.ok(SRC.includes(`const isPlanPoint = (phaseTitle) => phaseTitle === 'Review' || phaseTitle === 'Final rank'`))
+  const sm = SRC.indexOf('You are the STEELMAN for a blind review')
+  assert.ok(SRC.slice(sm, sm + 2600).includes('isPlanPoint(phaseTitle)'), 'steelman change-lists altitude-clamped at plan points')
+  assert.ok(SRC.includes('NEVER emit an item that instructs creating, shipping, or writing code'),
+    'the exact live failure ("Ship the runnable hangman.py") is named and forbidden')
+  const boost = SRC.indexOf('apply a review-driven improvement pass to a COPY')
+  assert.ok(SRC.slice(boost, boost + 2200).includes('isPlanPoint(phaseTitle)'), 'boost brief altitude-clamped at plan points')
+})
+
+test('(structural) implement+default-depth (mode single) still runs the implement phase off the R1 winner', () => {
+  const single = SRC.indexOf(`if (mode === 'single') {`)
+  const seg = SRC.slice(single, single + 4200)
+  assert.ok(seg.includes('if (implement) {'), 'single-mode path carries an implement branch (c5722eb routed fast/default implement runs here)')
+  assert.ok(seg.includes('bundlePlan(planWinner1.ws, seedPlanPath)'), 'seeded with the R1 review winner (steelman-boosted staged dir)')
+  assert.ok(seg.includes('await implementPhase(seedPlanPath)'), 'the same implement phase, R3 (+R4 on gate failure)')
+  assert.ok(seg.includes(`implement: true`) && seg.includes('implementWinner'), 'implement.json + mapping persisted like the two-pass hook')
+})
+
+test('(structural) steelman winner adoption is rename-preserving — no deletion anywhere in the adopt step', () => {
+  const i = SRC.indexOf('adopt it into the staged slot by RENAMING')
+  assert.ok(i > 0, 'rename-preserving adopt prompt present')
+  const seg = SRC.slice(i, i + 700)
+  assert.ok(seg.includes('mv "$DEST" "$BAK"'), 'original moved aside as an audit sibling, never destroyed')
+  assert.ok(!seg.includes('-delete') && !seg.includes('rm -rf "$DEST"'), 'no delete pattern (harness safety classifier blocked find-delete+overwrite twice, live)')
+  assert.ok(seg.includes('pre-steelman-i'), 'backup name records which steelman iteration was superseded')
+})
+
+// ---- security-sweep veto-severity (2026-07-07): UNSAFE fails CLOSED on missing/unknown severity ----
+const { councilTally } = new Function(
+  "const isSecurityLens = (key) => key === 'security' || key === 'security-x';\n" +
+  "const trimStr = s => String(s == null ? '' : s).trim();\n" +
+  "const JUNK_TOKENS = new Set(['placeholder','tbd','n/a','...']);\n" +
+  "const INTEGRITY = { MIN_VETO_EVIDENCE_CHARS: 12 };\n" +
+  sliceFn('vetoEvidenceIssue') + '\n' +
+  'const log = () => {};\n' + sliceFn('councilTally') + '\nreturn { councilTally };')()
+const sVerdict = (safety) => ({ lens: 'security', vote: 'A', ranking: ['A', 'B'], safety })
+const EV = 'file x.js:12 — concrete exploitable path, injected exec'
+
+test('veto stands on high/critical (unchanged)', () => {
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'high', evidence: EV }])]).vetoedSet.has('B'))
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'critical', evidence: EV }])]).vetoedSet.has('B'))
+})
+test('veto-severity: UNSAFE with MISSING severity now vetoes (fail-closed, was silently dropped)', () => {
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', evidence: EV }])]).vetoedSet.has('B'))
+})
+test('veto-severity: UNSAFE with a MISSPELLED severity now vetoes (fail-closed)', () => {
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'High', evidence: EV }])]).vetoedSet.has('B'))
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'severe', evidence: EV }])]).vetoedSet.has('B'))
+})
+test('veto-severity: an EXPLICIT low tier is still not an exclusion', () => {
+  assert.ok(!councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'low', evidence: EV }])]).vetoedSet.has('B'))
+  assert.ok(!councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'medium', evidence: EV }])]).vetoedSet.has('B'))
 })

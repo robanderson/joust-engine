@@ -120,6 +120,8 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
       model: "haiku",                    // opus | sonnet | haiku
       displayModel: "haiku",             // for the report; NOT shown to judges
       r1nudge: "<Pool A nudge>", r2nudge: "<fresh Pool A nudge>" },
+                                         // design-brief rounds: carry a Pool A2 angle-brief PARAGRAPH
+                                         // verbatim in these same fields (see diversity-injection.md).
     { label: "candidate-2",
       dispatch: "glm",                              // runs via a wrapper agent + the runner script
       agentType: "joust-engine:joust-glm-5-2",  // namespaced bundled GLM worker agent
@@ -147,7 +149,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 }
 ```
 
-**Plan/Implement args (2026-07-03 round split).** The tournament is a **Plan phase** (Plan Round 1 + Plan Round 2, always — plans are cheap to produce/judge) plus an optional **Implement phase** (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate). `attempts` seat the plan rounds; two extra args seat the implement rounds:
+**Plan/Implement args (2026-07-03 round split).** The tournament is a **Plan phase** (Plan Round 1 + Plan Round 2, always — attempts produce **design briefs**, cheap to produce/judge) plus an optional **Implement phase** (Implement Round 3, plus Round 4 only if R3 yields no gate-passing candidate). `attempts` seat the plan rounds; two extra args seat the implement rounds:
 
 ```
   implement: true,                        // optional (default false). Enables Implement Round 3 (+ 4).
@@ -156,11 +158,19 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   implementAttempts: [ ... ],             // optional: the implement-phase pool (SAME per-attempt shape
                                           // as `attempts`; a small strong pool). Defaults to `attempts`
                                           // when omitted. From je-parse's `implementAssignment`.
+  abBriefs: true,                         // optional (default false). A/B briefs: when the final rank
+                                          // leaves a second non-vetoed steelman finalist, implementers
+                                          // seed ALTERNATELY from the top-2 finalists' briefs. Judges
+                                          // stay blind to lineage; the readout is derived from mapping
+                                          // (`seedBrief` per implementer; `implement.json` gains
+                                          // `ab: {brief-1, brief-2}`), never from votes.
 ```
 
-- When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning plan is refined before any expensive implementation, then bundles the winning plan verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer (the deliberate seed exception).
+- When `implement` is true the engine forces the plan phase to the **two-pass spine** (Round 2 always) so the winning design brief is refined before any expensive implementation, then bundles the winning brief verbatim into `${runDir}/_winning-plan/plan.md` and hands it to each implementer as an **approach + acceptance-criteria contract** (the deliberate seed exception; implementation details belong to the implementers).
 - **Default pools** (`bin/je-parse.mjs`): plan `PLAN_DEFAULT_POOL` = `2 opus, 2 sonnet, 2 codex-high, 2 glm-5.2, 2 minimax` (N=10); implement `IMPLEMENT_DEFAULT_POOL` = `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6). A phase-scoped spec (`Plan: … , Implement: …`) overrides the relevant pool.
 - **Judging:** plan rounds use the **plan-lens** council (feasibility/completeness/risk/security-by-design/simplicity); implement rounds use the **code-lens** council. Same engine, selected per judging point (see `references/review-rubric.md`). A **plan NO_CONSENSUS returns before any implement spend** (`no_consensus:true`, `winner:null` in `mapping.json`), and a plan-final steelman tie returns `needs_orchestrator_pick` the same way. The implement result is persisted to `${runDir}/implement.json` (`rounds`, `winner`, `winnerRound`, `needs_human`, `needs_orchestrator_pick?`).
+
+**Investigate args (INVESTIGATE→COMPOSITE v1, spec 2026-07-06).** `investigate: true` (default false; ignored when `implement` is set) switches Round 1 attempts to the `investigate` brief kind — each seat returns a short **FINDINGS.md** (diagnosis + VERIFIABLE evidence citations — file:line / artifact paths / log excerpts — + a candidate improvement sketch; altitude-guarded: findings only, never fixes; same single-pass + save contract + hard stop as the other kinds) — and IMPLIES `composeOnly` semantics: the engine stages/validates the pool, runs a G2 **evidence-verification pass** (one deterministic HELPER_MODEL shell step, mechanical-gate shape: extracts each valid candidate's cited paths with the pure-block citation grammar and grep-checks them against the snapshot/context — working tree, pinned `baseRef` via `git cat-file`, or the `contextFiles` bundle — then stamps a `--- Evidence check --- / EVIDENCE: n cited, m verified` block into `_pool.md`; fail-safe: an unverifiable citation is stamped-but-unverified, a dead helper degrades to unstamped, nothing is ever invalidated), and returns `{ poolPath, round1.mapping (rows gain evidence: {cited, verified}), candidates[], investigate: true, rc_summary }` for the orchestrating composer — no councils, no round 2 (see the fable-engine skill's "Investigate mode" for the compose/union discipline). Issue-intake is SKILL-side, not an engine arg: for a `fix #NNN` task the orchestrator runs `gh issue view NNN` and installs the issue title+body verbatim as `task` (the original request/constitution), passing the files the issue names as `contextFiles`.
 
 **Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `joust-engine:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):
 
@@ -332,7 +342,8 @@ And pitfalls that hurt attempts (avoid, unless you have a concrete reason they d
 - [strong] <repeated failure mode> (<why>)
 - [tentative] <one-off weakness> (<why>)
 
-<one drawn Pool A nudge, per references/diversity-injection.md, e.g.
+<one drawn Pool A nudge — or, for design-brief rounds, one Pool A2 angle-brief paragraph —
+per references/diversity-injection.md, e.g.
 "Approach this task starting from the data model or core types.">
 
 Rules:
@@ -385,6 +396,8 @@ A quick liveness check before a big round is cheap: `glm -p "reply OK" --model h
 - **Stage** each candidate's deliverable files into `<blind>/` by copying everything then deleting the known engine files *by exact name* (`_brief.txt`, the two run logs) — an **allowlist**, so a legitimately `_`-prefixed deliverable (e.g. `_config.yml`, `__init__.py`) is kept, not dropped.
 - **Validate**: a candidate must have saved a deliverable AND (for GLM/local/codex) its log must show the **success** provenance contract — the `PROVENANCE` marker *and* `DONE exit=0` *and* no `TIMEOUT`/`ERROR` line (merely "a `JOUST-` line exists" is not enough; the runners write those before/around failures too). The greps are **line-anchored and provider-specific** (`^JOUST-<PROV>-…`, where `<PROV>` is the candidate's own `GLM`/`LOCAL`/`CODEX`), **not** a greedy `JOUST-.*-` — a real fix: the greedy form invalidated two genuinely-successful GLM proposals because the proposals' own text discussed a `JOUST-CODEX-ERROR` marker, which got echoed mid-line into the runner log and matched. Anchoring to column 0 (where the runner writes its markers) and pinning the provider stops an attempt whose deliverable merely *mentions* a marker from false-failing. The agent returns the per-candidate `{deliverable, provenance}` as a **schema** (not scraped prose), and the engine **fails closed** — any candidate missing from the return, or not deliverable+provenance, is invalid and excluded *before* the judge runs (recorded `valid:false` + reason).
 - **Pool**: concatenate the valid deliverables into one blind-labelled `_pool.md` (`===== Candidate A =====` sections). The judge reads that ONE file instead of N per-candidate dirs (the per-candidate dirs remain only so the judge can *run* code when needed) — the same read-cost collapse the context bundle gives the attempts.
+
+**Implement deliverable contract (run G).** Non-repoMode implement briefs mandate ONE fixed deliverable layout — `patches/` (ordered unified diffs) + `APPLY.md` (exact, ordered apply commands) + `VERIFY.md` (how to verify), with a `files/` + `APPLY.md` full-files fallback — and a bounded self-verify (fix the diff until `git apply --check` exits 0 in a scratch `git init`, or use the fallback). The mechanical gate's same pre-council helper call classifies each candidate's layout (`patch_layout | files_layout | engine_diff | freeform | unavailable`) and stamps a judge-visible `--- Contract check --- / CONTRACT: …` line into `_pool.md` beside the orthogonal `MECHANICAL:` stamp (apply-ability vs packaging); `mapping.json` records the class. v1 grandfathers: `freeform` is stamped, never invalidated; repoMode candidates are trivially conformant (`engine_diff`, engine-generated `candidate.diff`); any check failure degrades to UNSTAMPED, never a shrunk field.
 
 Each judge's returned winner/ranking is reconciled against the real blind-label set (normalised, repaired to a full permutation), every judge call is retried-once-then-degrades-to-a-partial-result rather than crashing a fully-paid run, and an empty valid pool short-circuits instead of asking the judge to rank nothing.
 

@@ -43,6 +43,21 @@ const OUT = path.resolve(ROOT, getFlag('--out') ?? '.dev-engine')
 if (!fs.existsSync(path.join(ROOT, '.claude-plugin', 'plugin.json'))) {
   console.error(`rebrand: ${ROOT} is not a plugin root (no .claude-plugin/plugin.json)`) ; process.exit(2)
 }
+// security-sweep H14 (2026-07-07): the wipe below is `fs.rmSync(OUT, {recursive,force})`. The old
+// guard only blocked OUT===ROOT, so `--out ..` (an ANCESTOR of the repo), `--out /tmp/x`, or a
+// symlinked OUT would force-delete an arbitrary tree. Refuse: OUT must be a NON-symlink path that is
+// strictly UNDER the repo root and is NOT an ancestor of it (belt: also reject the fs root).
+{
+  const outReal = path.resolve(OUT)
+  const rootReal = path.resolve(ROOT)
+  const rel = path.relative(rootReal, outReal)
+  const outIsUnderRoot = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  const rootIsUnderOut = (() => { const r = path.relative(outReal, rootReal); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)) })()
+  if (!outIsUnderRoot || rootIsUnderOut || outReal === path.parse(outReal).root) {
+    console.error(`rebrand: --out must be a path strictly UNDER the repo root (got "${OUT}" → ${outReal}); refusing to rm -rf outside the tree`); process.exit(2)
+  }
+  try { if (fs.lstatSync(outReal).isSymbolicLink()) { console.error(`rebrand: --out is a symlink (${outReal}); refusing`); process.exit(2) } } catch { /* not existing yet = fine */ }
+}
 if (path.resolve(OUT) === ROOT) {
   console.error('rebrand: --out must not be the repo root'); process.exit(2)
 }
@@ -61,7 +76,14 @@ const applyReplacements = (s) => {
 const renameRel = (relPosix) => {
   for (const [from, to] of renameDirs) {
     if (relPosix === from || relPosix.startsWith(from + '/')) {
-      return to + relPosix.slice(from.length)
+      const out = to + relPosix.slice(from.length)
+      // security-sweep M10 (2026-07-07): a renameDirs `to` with `..`/absolute would join OUTSIDE the
+      // generated tree (write escape). Reject a non-relative or traversing result (config is trusted,
+      // but this closes a mistake/tamper vector cheaply).
+      if (out.startsWith('/') || out.split('/').includes('..')) {
+        console.error(`rebrand: renameDirs maps "${from}" -> "${to}" producing an unsafe path "${out}" (absolute or ..); fix rebrand.config.json`); process.exit(2)
+      }
+      return out
     }
   }
   return relPosix
@@ -141,10 +163,15 @@ const expandGlob = (pattern) => {
     .map(f => ['node', `${dir}/${f}`])
 }
 
+// security-sweep M11 (2026-07-07): selfTest entries are spawned. Restrict the COMMAND to the known
+// test interpreters so a tampered/mistaken config cannot turn self-verify into arbitrary-binary
+// execution. (glob entries expand to ['node'|'bash', <file>] already; a non-glob entry must too.)
+const SELFTEST_CMDS = new Set(['node', 'bash'])
 const tests = []
 for (const entry of (cfg.selfTest || [])) {
   if (entry[0] === 'glob') tests.push(...expandGlob(entry[1]))
-  else tests.push(entry)
+  else if (SELFTEST_CMDS.has(entry[0])) tests.push(entry)
+  else { console.error(`rebrand: selfTest command "${entry[0]}" not allowed (only ${[...SELFTEST_CMDS].join('/')}); fix rebrand.config.json`); process.exit(2) }
 }
 
 let failed = 0

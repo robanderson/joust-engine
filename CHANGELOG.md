@@ -6,6 +6,418 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ### Added
 
+- **Run-state heartbeat + abort stamping + resume (engine #10, tournament-adopted).** A
+  `run-state.json` sidecar in the runDir (same trust class as mapping.json — unblinding
+  bookkeeping, never judge-visible) is written through the existing `persist()` dataplane
+  (atomic temp+rename, sha-verified, fail-open) at every phase boundary. Resume
+  (`args.resume: true`, `args.reuseDelivered` default true) re-uses completed seats IN PLACE
+  (same blind-letter index) and re-dispatches only missing/failed ones; the reuse decision
+  comes exclusively from a deterministic on-disk probe (provenance + deliverable + JOUST-RC),
+  so a hand-edited run-state.json is inert by construction. Config drift (attempts order/
+  identity, rots, task) refuses reuse via a sha256 fingerprint and falls safe to a clean run;
+  a `resume.lock` (resume-path only, atomic noclobber, symlink-refusing, stale-steal without
+  ever writing through the lock path) guards concurrent resumes; a resumed run's SUMMARY
+  discloses which seats were reused vs re-run. Winner of the run-i implement pool re-judged
+  by run J2 (blind council + steelman), adopted with the steelman's judge-directed
+  improvements and two security fixes found by the run-J3 evidence-quota council (symlink
+  lock truncation; probe label injection). Tests: `tournament-run-state.test.mjs` (28, incl.
+  a real killed-runDir e2e resume).
+
+- **Speculative implement overlap (`args.speculativeImplement`, default OFF).** The steelman
+  shootout is the measured long pole (~30-50 min); when enabled, Implement Round 3 starts the
+  moment the shootout SEEDS its finalists, seeded with the tally leader's pre-steelman brief
+  (disclosed in implement.json). Crowned leader => the pre-started round is adopted; a flip
+  discards it (awaited, staging + workspaces wiped) and re-runs clean at baseline wall-clock.
+  Tests: `tournament-speculative-implement.test.mjs`.
+
+- **Steelman runoff re-gates boosted copies.** The cold runoff used to judge boost outputs
+  under the stamps COPIED from their source dirs — run-j2's winning boost regenerated a patch
+  that did not apply at the pinned baseline yet carried a stale "applies cleanly" stamp. The
+  runoff now re-derives stamps + pool via the same mechanical gate as implement rounds; a
+  gate-invalidated boost ratchets back to the last gated version.
+
+- **Helper-prompt honesty pass.** All "This is an approved internal step" framings (6 sites)
+  replaced with plain statements of what each step does and that paths are engine-managed
+  run scratch — the phrasing was flagged by a codex review con and then live-blocked by a
+  safety classifier on the steelman adopt step. Codex judge fallback reasons now carry the
+  actual guard/reformat error (bounded) instead of only the class.
+
+- **Rejudge mode (`args.rejudgeCandidates`)** — judge an EXISTING staged implement pool with
+  the current mechanical gate + full code council (fresh rotated blind letters, stale gate
+  stamps stripped, no generation rounds). Born as the run-i salvage (a gate bug false-killed
+  11/12 staged candidates after dispatch had already paid for them) and kept as a permanent
+  harness: with `args.rejudgeBaseSha` (strict hex, rev-parse-verified) pinning the gate
+  baseline to the tree the candidates were AUTHORED against, and `args.lensVariant` swapping
+  ONE whitelisted judge-prompt paragraph, a rejudge pair is a pinned-pool judge-prompt A/B
+  (same candidates, same gate, one variable). `mode:'rejudge'` result/mapping carry
+  winner + winnerSource/winnerModel unblinding. Tests: `tournament-rejudge.test.mjs`.
+
+- **Codex review-seat concurrency cap + per-seat model audit.** A semaphore (default 2,
+  `args.codexJudgeConcurrency`) serializes LIVE codex judge dispatches — 4-way concurrent
+  `codex review` measured ~4x single-seat latency (account backpressure); readback/reformat
+  run outside the slot. And every living lens verdict now records intended-vs-actual model
+  (`judge_seats` in `rc_summary`): a codex seat silently falling back to opus was invisible
+  at summary level (run-h's security-x seat ran opus and nothing said so). Mismatches also
+  log `JE-SEAT-AUDIT`. Tests: `tournament-seat-audit.test.mjs`.
+
+- **Judge-lens prompt A/B hook (`args.lensVariant`)** — closed whitelist, currently
+  `evidence-quota` (prompt-lab 03/V2: `checks_run` must cite >=1 concrete check PER
+  candidate). Single-paragraph insertion; production prompt byte-identical otherwise; the
+  arm is recorded as `lens_variant` in mapping + result. Tests:
+  `tournament-lens-variant.test.mjs`.
+
+### Fixed
+
+- **zsh word-splitting false-kill class (live in run-j).** The helper agents' shell can be
+  zsh, which does NOT word-split an unquoted `$patches`/`$cites` — the mechanical gate passed
+  a multi-patch candidate's paths as ONE filename (`git apply` "can't open patch"), false-
+  killing every 0001+0002-style deliverable (4/12 in run-j, including the strongest
+  candidate); the G2 evidence-citation counter had the same latent bug. Both loops now
+  re-emit the list via `$(printf …)`, which bash AND zsh field-split; verified against the
+  real run-j artifacts under both shells. Tests in `tournament-mechanical-gate.test.mjs`.
+
+- **Review-judge dump relay lost the provenance line on real pools (live in run-j).**
+  Review-mode `_codex_run.log` carries the codex session's stderr stream (the stall-watchdog
+  feed), so on a full council pool the log outgrew the relay's `tail -c 4000` window and the
+  startup `JOUST-CODEX-PROVENANCE` line never reached `parseCodexReviewDump` — which then
+  fail-closed-rejected ALL codex seats (silent all-opus council; the smoke test had passed
+  only because its mini-pool log was <4KB). The relay now greps the provenance line from the
+  log top ahead of the tail; a missing log still relays nothing (fail-closed preserved).
+  First genuinely mixed-family council at scale confirmed live in run-j2 (3/3 codex seats
+  ran as codex-high). Test in `tournament-codex-review-judge.test.mjs`.
+
+- **Dedup pool-rebuild is read-back verified before the collapse takes effect.** The
+  post-gate pool rebuild was fire-and-forget: a silently failed rebuild left judges reading
+  a STALE pool (duplicate sections, no stamps) that disagreed with the collapsed contention
+  set. The rebuild script now prints a terminal `JPOOL` line (section count + sorted letters
+  read from the pool ON DISK after the atomic rename) and the engine verifies it against the
+  exact set it is about to judge; two failures DISARM the collapse (uncollapsed contention +
+  loud `JE-DEDUP-POOL-VERIFY` log + best-effort salvage rebuild). A corrupted relay can only
+  ever disarm, never mis-collapse. Tests in `tournament-dedup.test.mjs`.
+
+- **Codex judge seats: `codex review` preset + mechanical reformat (replaces exec VERDICT.json
+  authorship).** The exec-mode seats' self-authored VERDICT.json failed verdict-readback on
+  9/9 codex seats across two full runs; a controlled judge-architecture experiment showed the
+  purpose-built review preset finds equal-or-better issues with no authorship failure mode and
+  ~3x fewer tokens. New pipeline: the engine stages the seat workspace (scratch `git init` +
+  the blind pool copied in as `_pool.md` — codex-cli >=0.141 makes the review presets mutually
+  exclusive, so custom instructions review the WORKING TREE); `codex-run.sh` in
+  `JE_CODEX_MODE=review` runs the bounded preset (report -> `_review_report.md` on stdout;
+  the 200-350KB session stream on stderr feeds the stall watchdog; clean-exit-but-empty-report
+  classifies RC 05); the brief demands explicit machine lines (`RANKING:`/`VOTE:`/`SAFETY
+  <letter>:`); `parseCodexReviewDump` validates provenance/exit/report shape before any
+  reformat spend; a sonnet helper MECHANICALLY reformats the report into the verdict shape
+  under a strict traceability rule (found:false instead of inventing a ranking — the
+  reformatter reformats, it never judges), and the result passes the SAME shape/integrity
+  guards + label reconciliation as native seats. Judge effort defaults to HIGH (the
+  experiment's effort sweep: medium/high/xhigh all surfaced the same core findings; high
+  ~1.7x faster than xhigh; override `args.codexJudgeEffort`), and `judge_model` is tagged
+  with the effort that actually ran. Opus fallback ladder unchanged. Live-verified end-to-end
+  (real `codex review` through the runner on a miniature blind pool). Tests:
+  `tournament-codex-review-judge.test.mjs` (12) + review-mode cases in `codex-run.test.sh`.
+
+- **Mechanical gate: real baseline + all-patches apply (run-i post-mortem).** The non-repo
+  gate false-killed 11/12 implement candidates in run-i with identical "No such file" errors:
+  `git apply --check` in an EMPTY `git init` scratch repo can never pass a patch that MODIFIES
+  an existing file, and the gate checked only `head -n1` of an unsorted `find` — a multi-patch
+  deliverable's fate was a directory-order coin flip (run-h's two "clean" stamps and its one
+  "corrupt-patch kill" were all luck). Fixes: (1) `buildContext` pins the host checkout's HEAD
+  sha to `runDir/_context/base-sha` at bundle time (fail-soft; file-relayed, no model transit) —
+  non-repoMode runs execute FROM the very checkout the context bundle was cut from, so the gate
+  now snapshots a detached worktree at that sha and gets REAL apply verification that also
+  survives mid-run drift; (2) ALL patches are checked in sorted order, and snapshot mode APPLIES
+  them for real so stacked patches (0002-on-0001) verify correctly; (3) the no-repo fallback is
+  a parse-only `--numstat` well-formedness check — still catches the audited malformed/truncated
+  class, structurally cannot false-kill. Verified against live artifacts: run-i's false-killed
+  candidate A now stamps clean against the pinned base, truncated patches still stamp corrupt in
+  both modes, run-h D's 3-patch stack applies clean. +3 structural tests.
+
+- **Launch-and-poll runner dispatch (supersedes the plain foreground mandate).** A foreground
+  wrapper Bash call is capped (~600s) BELOW the runner wall-clocks (glm 1200s) — a glm seat
+  was TERM-killed at ~10m mid-retry-backoff (RC 08) — while a backgrounded task is reaped when
+  the wrapper agent's turn ends (the run-h impl-4 kill). Runners already self-supervise
+  (watchdogs + guaranteed terminal `JOUST-RC` line), so the wrapper now LAUNCHES the runner
+  detached into its own session (`nohup perl -MPOSIX POSIX::setsid` — macOS ships no setsid
+  binary; perl is already a hard runner dependency; launcher echoes `JOUST-LAUNCHED` and
+  returns in seconds) and POLLS the log with short bounded until-loops for the guaranteed
+  terminal line (`JOUST-SETTLED` sentinel; a timed-out poll is re-issued; ending the turn
+  mid-run is forbidden). No wrapper ceiling ever bounds a runner again; an abandoned runner
+  still terminates itself. `detachLaunch` is shared by `runnerCmd` and `codexRunnerCmd`;
+  both RUNVERBATIM prompts carry the protocol; dispatch-hygiene tests updated.
+
+- **Dedup identity-hash hardening (codex-review security findings).** A three-way
+  judge-architecture experiment (native Opus vs `codex exec` vs the `codex review` preset,
+  same artifact, same security lens) surfaced two real integrity hazards in the shipped #36
+  dedup path — which Opus and the run-h council had both passed: (1) the identity hash was a
+  boundary-blind byte concatenation (`xargs -0 cat | shasum`), so different file trees
+  (`'ab'+'c'` vs `'abc'`) alias to one identity without any SHA collision — now a MANIFEST
+  hash (per-file `shasum` lines with $dest-relative paths, sorted, hashed again; identical
+  trees still match across blind letters, empirically verified); (2) the relayed hash token
+  was trusted if non-empty, letting a corrupted/dishonest relay forge collapses with a junk
+  token — now a strict `^[0-9a-f]{64}$` shape guard (non-hex degrades to no-collapse
+  singleton). Both fixes fail-open. Third finding (fail-open pool rewrite after collapse)
+  queued — needs a read-back verify design. Tests: 2 new structural guards in
+  `tournament-dedup.test.mjs`.
+
+- **Dispatch + workspace hygiene guards (run-h codex-implementer post-mortem).** Run H's
+  "3/6 codex implementers failed staging" cluster decomposed into three distinct defects —
+  none of them codex code quality — each now guarded: (1) every verbatim-run dispatch prompt
+  mandates ONE FOREGROUND Bash call and forbids backgrounding (a backgrounded runner is
+  TERM-killed when the wrapper agent's turn ends; cost an implement seat 11 minutes of work,
+  RC 08); (2) `codex-run.sh` default zero-output stall window raised 120s→300s (codex exec
+  goes legitimately quiet composing one large patch — a seat was stall-killed twice mid-write,
+  RC 01); (3) provenance self-destruction guard: a workspace-write worker that deletes
+  `_codex_run.log`/`_brief.txt` while tidying its deliverables destroyed the up-front
+  PROVENANCE stamp and turned an honest, self-verified patch into a fail-closed RC 06 reject —
+  `finish()` in `_je-run-lib.sh` now restamps a missing provenance line from `PROV_LINE`
+  (set by all five runners; restamped copy suffixed `restamped=finish` for auditability), and
+  the attempt brief forbids deleting workspace scratch files. Tests:
+  `workflows/tournament-dispatch-hygiene.test.mjs` (structural) + a `clobber` behavioural case
+  in `bin/codex-run.test.sh`.
+
+- **Model fallback ladder for native anthropic seats (operator-requested resilience).** The
+  orchestrating session may run on a model (Fable) whose safety sensitivity can block a
+  sub-agent call outright or downgrade it — a blocked seat now degrades one rung down the
+  ladder instead of dying. Pure marked block `model ladder`: `MODEL_LADDER =
+  ['fable','opus','sonnet']` + `nextModelDown()` (sonnet is the hard FLOOR — haiku is retired
+  by operator policy; unknown/haiku/sonnet → null). One shared wrapper `agentLadder(prompt,
+  opts, ladder)` (no per-site copies): runner dispatches (`agentType`) pass straight through;
+  `opts.model` is otherwise REQUIRED (runtime guard — no engine sub-agent may inherit the
+  session model); a thrown/blocked attempt (throw OR null) retries ONCE at
+  `nextModelDown(opts.model)`, records `{label, phase, from, to}` in the `model_downgrades`
+  array surfaced on every terminal workflow return, logs loudly (`JE-MODEL-DOWNGRADE`), and
+  tags council `judge_model` with the model that ACTUALLY answered (`ladder.used`). The rung
+  slots AFTER a site's own same-model retries and BEFORE its dead/fallback path (askLensNative:
+  opus try, opus retry, THEN sonnet rung, then dead; guidance synthesis likewise); a rung
+  failure re-surfaces the ORIGINAL outcome so every existing dead-seat path is byte-identical.
+  EXCEPTIONS: the primary `security` lens and the `security-x` opus-fallback seat NEVER
+  downgrade (sonnet retry forbidden — their failure keeps today's dead-judge/fail-closed path);
+  sonnet-seated helpers (persist/stage/etc.) have no rung below by construction. Explicit-model
+  AUDIT: every `agent()`/`agentLadder()` call in `workflows/tournament.mjs` carries an explicit
+  `model:` or `agentType:` — pinned as a structural test so it can never regress. Tests: pure
+  ladder units + the audit + security-exclusion / return-value / log-line structural guards in
+  `workflows/tournament-model-ladder.test.mjs`.
+
+- **INVESTIGATE→COMPOSITE pipeline v1 (`args.investigate`, default OFF; spec
+  `docs/superpowers/specs/2026-07-06-investigate-composite-pipeline.md`).** For vague-goal /
+  issue-shaped tasks where the expensive part is finding WHAT is true: findings COMPOSE (the
+  union of verified diagnoses beats the best single one), so no winner is picked. G1: a third
+  `brief()` kind `'investigate'` — Round 1 attempts return a short FINDINGS.md (diagnosis +
+  VERIFIABLE evidence citations (file:line / artifact paths / log excerpts) + a candidate
+  improvement sketch), altitude-guarded (findings only — no code blocks, no fixes) with the same
+  single-pass + save contract + hard stop as the other kinds; `investigate: true` IMPLIES
+  composeOnly semantics (stage/validate/pool then return `{poolPath, mapping, candidates,
+  investigate: true}` — reuses the @@FE seam; no councils, no round 2; ignored under
+  `implement`). G2: an evidence-verification pass — one HELPER_MODEL deterministic shell step
+  (mechanicalPatchGate's shape) after staging/enrichment and before the pool return: extracts
+  each valid candidate's cited paths (pure marked-block citation parser `parseCitations` +
+  its POSIX-ERE twin `CITE_GREP`), grep-checks them against the snapshot/context (working tree /
+  pinned baseRef via `git cat-file` / contextFiles bundle), and stamps `EVIDENCE: n cited,
+  m verified` per candidate into `_pool.md` (letters only; fail-safe: unverifiable =
+  stamped-but-unverified, garbled/dead helper = unstamped, NEVER invalidates; mapping rows gain
+  `evidence: {cited, verified}`). G3+G4 are skill-side (no engine): the fable-engine SKILL gains
+  an "Investigate mode" section (@@FE + `investigate: true`; composer UNIONS verified findings —
+  diagnosis union, approach, approach-neutral acceptance criteria, credit table; a finding whose
+  citation failed verification is demoted/dropped visibly) and issue-intake (`@@FE fix #NNN` →
+  `gh issue view NNN` as the task + named files as contextFiles); orchestration.md documents the
+  args. Flag off => byte-identical behavior. Tests: pure citation-parser/stamp/merge units +
+  structural brief/ordering coverage in `workflows/tournament-investigate.test.mjs`.
+
+- **Structural persist phase 2 — per-seat verdict files + deterministic assembler (issue #33,
+  spec `docs/superpowers/specs/2026-07-06-persist-phase2-author-writes.md`).** The last large
+  model-transiting artifact (verdict.json, ~130KB typed per checkpoint after phase 1) is
+  eliminated. As each judging round's verdicts land, councilJudge persists every living seat's
+  exact `roundRecord` verdict entry as a SMALL typed sha-verified file under
+  `<reviewDir>/_judges/` (steelman runoffs persist their orig-letter-mapped verdicts too),
+  amortized during judging. At the checkpoint, a small typed `tally.json` skeleton — the full
+  result with each `council.rounds[*].verdicts[*]` replaced by a runDir-relative
+  `{"$seat", "sha256"}` ref (`buildTallySkeleton`, pure) — plus a new persist() entry kind
+  `{ path, content, assemble: { tally } }` drive the new **`bin/je-assemble.mjs`**: a
+  deterministic splice-only assembler (no tally/merge logic re-implemented) that sha-verifies
+  each seat file with node:crypto and writes verdict.json ON DISK, byte-identical to
+  `json(review)`. Assemble is FULLY verified against the engine-computed
+  `sha256Hex(json(review))` (stronger than derive's bytes>0); any failure — corrupt seat file,
+  truncated tally, missing ref, assembler crash, byte drift — falls back through the existing
+  retry ladder to today's typed write (a seat whose own persist failed simply stays inline in
+  the skeleton). je-render derivation (verdict.md/council.json/guidance.md), the `judges:1`
+  legacy path, and SUMMARY typed writes are unchanged. Checkpoint model transit for a >=100KB
+  council verdict drops to a <30KB skeleton (acceptance test included). Tests: byte-parity
+  fixtures vs the typed pipeline across 6 council shapes + je-render parity + corruption
+  injection in `bin/je-assemble.test.mjs`; skeleton-builder units, stubbed-agent fallback-ladder
+  runs, and checkpoint wiring in `workflows/tournament-persist-phase2.test.mjs`.
+
+- **Aspect verifiers with binary approvals (`args.aspectVerifiers`, default OFF)** (research
+  BoN-MAV, arXiv:2502.20379: many cheap BINARY aspect checks beat a single continuous score —
+  spend marginal budget on verification, not candidates). When enabled, every council decision
+  point fans out 4 HELPER_MODEL verifiers (correct-behaviour / spec-fit / simplicity /
+  robustness; question phrased per phase for a design brief or code) CONCURRENTLY with the
+  round-1 lens fan-out, each returning a strict binary approve/reject per candidate. Fail-safe: a
+  dead aspect agent abstains — never crashes, never shrinks the field. Approval counts NEVER
+  touch the majority tally, the veto, or the `judges:1` legacy path: they only break EXACT ties
+  in `nonVetoedOrder` (slotting between mean-rank and blind-letter via the pure `aspectTiebreak`)
+  and are surfaced to the steelman's change-list context. Results persist in `council.json` as
+  `aspects` (per-candidate approval counts + per-aspect votes). Pure logic in a marked
+  extract-and-eval block; tests in `workflows/tournament-aspect-verifiers.test.mjs`.
+
+- **Prompt Lab (`docs/superpowers/prompt-lab/`)** — a document library of 70 optimised
+  drop-in variants (10 per family) for every worker sub-agent prompt: plan design brief,
+  implement brief, judge lens brief, steelman, boost implementer, guidance synthesis, and
+  the @@FE composer. Each family file quotes the current production prompt verbatim with
+  its `tournament.mjs`/SKILL.md anchor; each variant carries a variation-axis rationale
+  and a testable metric prediction, and preserves every engine-contract invariant (blind
+  letters, `checks_run`, single-pass + save contract, design-brief altitude, no model
+  identities, JOUST literals). `INDEX.md` holds the A/B protocol (one variable, n>=5,
+  je-ledger/je-evolve/je-council-audit comparison) and a top-10 test-first list. Docs
+  only — no production prompt changed.
+
+- **Brief dry-run tester — `bin/je-brief-test.mjs`** (research: Anthropic's multi-agent
+  system work — exercising and rewriting a flawed tool description cut downstream task
+  time 40%; same trick applied to attempt briefs). A deterministic STATIC LINTER (no
+  model, no network) the orchestrator runs on the composed task brief BEFORE spending
+  on a wide round (SKILL.md Phase 1). Eight checks, one PASS/WARN/FAIL line each with
+  a concrete fix on failure: ambiguous deixis without an in-brief antecedent (attempts
+  have no conversation context), unresolved/nonexistent path references (missing bare
+  filenames WARN), missing deliverable contract (save/write + filename), missing
+  single-pass/hard-stop rule, conflicting directives (do-not-implement vs implement,
+  smallest-change vs comprehensive/exhaustive — WARN), design-brief altitude mixed with
+  file-level edit/code-block demands, undefined one-off repo codenames (WARN), and a
+  6000-word length budget (WARN). `-` reads stdin; `--json` for machine output;
+  `--root` overrides the path-resolution root. Exit 0 = all pass/warn, 1 = any FAIL,
+  2 = usage error. Tests in `bin/je-brief-test.test.mjs` (fixture briefs exercising
+  every rule both ways, plus CLI exit-code/JSON/stdin coverage).
+
+- **GEPA-LITE brief-evidence miner (`bin/je-evolve.mjs`)** — deterministic run-archive
+  miner for reflective prompt evolution (GEPA, arXiv:2507.19457: mutate prompts from
+  execution-trace evidence; WORKER prompts only, never orchestrator prose). v1 is the
+  EVIDENCE step only — a human or frontier session does the reflection. Mines each run
+  for: per-model valid-rate + failReason clusters (mapping.json), recurring challenge
+  themes (review-\*/verdict.json guidance), council cons that repeat across
+  rounds/reviews/runs (review-\*/council.json; same-round lens echo never counts), and
+  rc_summary RC 03 turn-cap / RC 05 no-deliverable seats. Emits a markdown
+  "Brief-evolution evidence report": observation + citing runs (n= everywhere) + a
+  SUGGESTED BRIEF DELTA phrased as a hypothesis, plus a final suggestion→template map
+  (attempt plan-brief / implement-brief / judge lens brief / composer prompt).
+  `<runDir>...` or `--runs-root [<dir>]`; timestamps from artifact mtimes only;
+  missing/malformed inputs degrade gracefully. Tests in `bin/je-evolve.test.mjs`.
+
+- **Standardized implement-deliverable contract (run G).** Non-repoMode implement briefs now
+  mandate ONE fixed deliverable layout — `patches/` (ordered unified diffs) + `APPLY.md` (exact,
+  ordered apply commands) + `VERIFY.md` (how to verify), with a `files/` + `APPLY.md` full-files
+  fallback — and require a bounded self-verify (fix the diff until `git apply --check` exits 0 in
+  a scratch `git init`, or fall back) before saving. The run-F mechanical gate's SAME helper call
+  now also classifies layout conformance — `patch_layout | files_layout | engine_diff (repoMode;
+  trivially conformant) | freeform | unavailable` — and stamps a judge-visible
+  `--- Contract check --- / CONTRACT: …` line into the pool, PARALLEL to (not merged into) the
+  orthogonal `MECHANICAL:` stamp; `mapping.json` records the class per candidate. v1 grandfathers:
+  a non-conforming (freeform) layout is stamped, NEVER invalidated — only the pre-existing
+  mechanical `corrupt_patch` excludes. Fail-safe degrades to UNSTAMPED (no CONTRACT block at all),
+  blind (fixed literals, letters only), deterministic (shell presence checks; no LLM judgment).
+  Plan briefs and the repoMode brief are untouched. Tests:
+  `workflows/tournament-deliverable-contract.test.mjs`.
+
+- **Judge-panel decorrelation audit** (`bin/je-council-audit.mjs`): reads every
+  `review-*/council.json` across the given run dirs (or `--runs-root [<dir>]`, default
+  `/tmp/de-runs`) and reports per-seat-pair first-place vote agreement + mean Spearman
+  rank correlation (n everywhere), a ranked redundancy list (pairs at agreement ≥0.8 with
+  n≥5 flagged as ~1 effective vote), an effective-votes estimate, and hypotheses only —
+  never prescriptions below n≥5. Security seats are never pruning candidates (veto
+  redundancy is deliberate, cross-family). Basis: arXiv:2605.29800 "Nine Judges, Two
+  Effective Votes". Tests in `bin/je-council-audit.test.mjs`.
+
+- **Pool A2 angle briefs — specification-level diversity injection.** New reusable library of
+  10 orthogonal one-paragraph angle briefs for design-brief rounds (minimal-diff conservative,
+  refactor-first structural, data-model-led, interface/contract-led, test-harness-led,
+  operational/observability-led, failure-mode-led, performance-budget-led, security-posture-led,
+  simplest-thing-spec-purist). Each commits an explorer to a distinct solution-space STARTING
+  ANGLE without biasing quality criteria (blind-review-safe); drawn without replacement,
+  same-model siblings get most-distant angles, text rides the existing `r1nudge`/`r2nudge`
+  fields verbatim, draw logged. Preferred over one-line nudges for wide rounds (distinct
+  per-explorer spec angles yield 2-3x measured diversity vs sampling randomness;
+  arXiv:2606.10302). Docs-only: `diversity-injection.md` + pointers in joust/fable SKILL.md
+  and `orchestration.md`.
+
+- **Cross-run leaderboard ledger (issue #41): `bin/je-ledger.mjs`.** `record <runDir>`
+  appends one JSON line per completed run (unblinded seats, winners, rc_summary, and — when
+  `timeline.jsonl` exists — per-phase barrier + attempt durations) to an append-only ledger
+  (`$JE_LEDGER_PATH`, default `~/.joust-engine/ledger.jsonl`); `report` aggregates it to a
+  markdown leaderboard (per-model seats/valid-rate/wins/vetoes/durations, two-pass value,
+  diversity, cost-vs-contribution) with sample sizes on every row and hypothesis-only
+  phrasing below/at n>=5. Purely additive — no engine changes. Tests:
+  `bin/je-ledger.test.mjs` (synthetic fixtures, no model/network).
+
+- **Design briefs replace file-level plans (+ split-brief A/B implement rounds).** The plan phase
+  deliverable is re-altituded: attempts now produce a DESIGN BRIEF — at most 10 bullets (approach
+  + why, surfaces touched, risks, testable approach-neutral acceptance criteria) with a HARD
+  altitude rule (no code blocks/diffs/line numbers; weeds are judged DOWN) — instead of the
+  line-level pseudo-implementations plans had drifted into. Plan lenses retuned to match
+  (feasibility verifies claimed surfaces/constraints exist; completeness = decision coverage,
+  never edit-level detail; simplicity: a longer brief is not a better brief). Implementers are
+  seeded with the brief as an approach+criteria contract (details are theirs). NEW `abBriefs:
+  true`: when the final rank leaves a second non-vetoed steelman finalist, the implementer pool
+  seeds ALTERNATELY from both briefs (per-attempt seedPlanPath) — judges stay blind to lineage
+  and judge code against the ORIGINAL task + fundamentals only; `mapping.json` records
+  `seedBrief` per implementer and `implement.json` gains `ab: {brief-1, brief-2}`, so approach
+  A/B results are derived from bookkeeping, never votes. Briefs compete through their children;
+  children are judged as orphans.
+
+- **Mechanical pre-council patch gate + guidance-stub launch gate (run F).** Before the code
+  council convenes on implement candidates, ONE deterministic helper step classifies each valid
+  staged deliverable — `clean_patch` (incl. `--recount`/structure-only nuance) | `corrupt_patch` |
+  `full_files` | `empty` | `unavailable` — by running `git apply --check` against a DETACHED
+  scratch worktree at the tournament snapshot (structure-only `git init` check when no snapshot;
+  `unavailable` when the gate itself cannot run — which never invalidates). A judge-visible
+  `--- Mechanical check --- / MECHANICAL: …` stamp (letters-only; git error text path-stripped +
+  capped) lands in `_pool.md` via one shared stamp-shell used by both pool writers, and
+  `mapping.json` records the class. ONLY a corrupt patch auto-invalidates (like a provenance
+  failure, with a distinct `:mech` RC 04 seat); full-files candidates stay judged (loose
+  deliverable contract). Retires the audited 5-6x duplicated per-judge apply-checks; corrupt
+  patches (t2/t3b/t7) and no-patch "valid" candidates (t4) no longer reach councils unflagged.
+  Fold-in: `guidanceStub` gates round-2 AND implement-round-4 launches — stub/placeholder guidance
+  (empty, or all-junk per guidanceIntegrityIssue) is nulled with a loud `JE-GUIDANCE-STUB` line and
+  the round runs task-only (the round-1 dispatch shape) instead of seeding briefs with placeholders
+  (reached round-2 briefs in 3 audited runs). Fail-safe end to end; tally/veto/judging semantics
+  unchanged. Tests: `workflows/tournament-mechanical-gate.test.mjs`. Plan: run F @@FE composite
+  (7-draft blind pool; backbone A/opus + B/sonnet's path-stripping sanitizer + C/sonnet's
+  no-snapshot edge discipline + F,G/codex-high's recount visibility; H/minimax's keep-but-flag
+  routing argued and rejected).
+
+- **Runner watchdogs, guaranteed terminal markers, retryable hangs + N-1 quorum close (run E).**
+  New shared `bin/_je-run-lib.sh` (sourced by all five runners): idempotent `finish()` writes
+  exactly one terminal `JOUST-<PROV>-{DONE|TIMEOUT|KILLED|ERROR}` + one `JOUST-RC` line on EVERY
+  exit path (TERM/INT→KILLED/08, uncaught EXIT→ERROR/09), and `run_watchdog_perl` adds a
+  zero-output stall watchdog (kills the child's process GROUP; exit 125) alongside the existing
+  wall clock (124). Wall-clock hangs and stalls are each retryable ONCE via a non-terminal
+  `JOUST-<PROV>-RETRY` line (a successful retry never leaves a terminal failure word; the staging
+  gate's reject set gains `KILLED`, stays mention-proof). Stall windows: `JE_STALL_SECS`
+  (defaults: glm/minimax/grok 90s, local 60s, codex 120s). Engine: `parallelQuorum` lets a round
+  close when all but one seat returned and the straggler exceeded 2x its wall clock + grace
+  (`quorumGraceSecs`, default 90; `quorumClose:false` to disable) — NEVER over a security-gate
+  seat, never over a native seat (no engine-known clock), capability-gated on the runtime having
+  timers + a usable clock (this workflow sandbox does not; inert there with one log line).
+  Fold-ins: codex judge VERDICT read-back failures reclassified RC 02→04 (structural
+  dispatch/readback split in `askLensCodex`); runners `unset ANTHROPIC_API_KEY` so the Anthropic
+  key never reaches a non-Anthropic child (each provider injects only its own credential). Tests:
+  `bin/je-run-lib.test.sh` (13), `bin/runners-source-lib.test.sh`, KILLED/watchdog/retry/scrub
+  cases in all five `bin/*-run.test.sh` suites, quorum + reclass cases in
+  `workflows/tournament-return-codes.test.mjs`. Plan authored by the run E tournament (winner
+  A/opus, steelman-boosted); implementation adapted from implementer draft impl-1/opus with one
+  real bug found and fixed in review: a child that exited during a poll tick could be
+  misclassified as stalled (kill-after-success race) — the watchdog now re-reaps after each sleep
+  before any deadline judgment.
+
+- **Fable Engine (`@@FE[:N]`)** — fast composer variant (new `fable-engine` skill + engine
+  `composeOnly: true` flag). One WIDE blind round (default N=10: `2 opus, 2 sonnet,
+  2 glm-5.2, 2 codex-high, 2 minimax-m3`), staged/validated exactly like @@JE but with NO
+  councils; the orchestrating model (Fable/Opus tier) composes the best composite plan from
+  the blind pool with a per-candidate credit table, implements it with unit tests, and
+  reports with timeline telemetry. Trades the council's independent ranking + second
+  security gate for ~30-minute turnarounds; @@JE remains the calibration baseline.
+- **`bin/je-timeline.mjs`** — per-run agent timeline (`timeline.jsonl` + `TIMELINE.md` in
+  the runDir) mined deterministically from workflow transcripts (the workflow sandbox
+  cannot self-timestamp): ordered start/duration per agent, the gating predecessor, peak
+  concurrency, and a deterministic Observations section (barrier seats vs group median,
+  codex judge chain legs). Works mid-run on partial transcripts.
+
 - **Judging-v3: councils never deliberate** (2026-07-05/06 designs; peer-deliberation rounds
   are retired after a live run burned hours re-arguing fixed artifacts).
   - **Fast tally at intermediate reviews** (two-pass Round-1 review): one independent vote

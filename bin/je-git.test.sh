@@ -120,6 +120,20 @@ check "C2: XAI_API_KEY dropped from verify env" "$got" "EMPTY"
 rm -rf "$C2"
 
 # ---------------------------------------------------------------------------
+# C3) security-sweep L7: secret-drop now also covers CLOUD/forge creds that the
+#     old provider-only denylist left readable (AWS*, SSH_AUTH_SOCK, NPM_TOKEN,
+#     GOOGLE_APPLICATION_CREDENTIALS). Assert two representatives are gone.
+# ---------------------------------------------------------------------------
+C3=$(mktemp -d); repo="$C3/repo"; mkrepo "$repo"
+printf 'edited\n' >> "$repo/README.md"
+leak="$C3/leak.sh"; keyout="$C3/KEYOUT"; rm -f "$keyout"
+printf '#!/usr/bin/env bash\necho "${AWS_SECRET_ACCESS_KEY:-EMPTY}:${SSH_AUTH_SOCK:-EMPTY}" > "$1"\n' > "$leak"
+( cd "$repo" && printf '%s\n' "bash $leak $keyout" | AWS_SECRET_ACCESS_KEY=awssecret SSH_AUTH_SOCK=/tmp/agent.sock bash "$FLGIT" run_verify ) >/dev/null 2>&1
+got="$(cat "$keyout" 2>/dev/null || echo MISSING)"
+check "C3: AWS+SSH_AUTH_SOCK dropped from verify env" "$got" "EMPTY:EMPTY"
+rm -rf "$C3"
+
+# ---------------------------------------------------------------------------
 # D) no live re-detection: empty frozen set -> rc 2, never scans the tree.
 #    (committed package.json, clean tree -> gate passes; empty stdin -> rc 2.)
 # ---------------------------------------------------------------------------
@@ -171,12 +185,18 @@ gate_trips() { # gate_trips <relpath> -> echoes "unsafe"/"safe"
   if ( cd "$repo" && bash "$FLGIT" verify_safe_diff >/dev/null 2>&1 ); then echo safe; else echo unsafe; fi
   rm -rf "$d"
 }
+# security-sweep H5 (2026-07-07): a verify command runs the WHOLE tree's code, so EXECUTABLE SOURCE
+# (src/app.py, main.go, util.rs, *.js, …) and framework configs (jest/vite/webpack/gradle/…) are
+# now correctly gated too — the old narrow allowlist let them through and they ran unsandboxed.
 for u in package.json src/web/package.json Makefile makefile build.mk \
          pyproject.toml conftest.py pkg/conftest.py tests/test_login.py api_test.py \
-         Cargo.toml build.rs go.mod .github/workflows/ci.yml; do
+         Cargo.toml build.rs go.mod .github/workflows/ci.yml \
+         src/app.py main.go util.rs lib/index.js web/app.ts jest.config.js vite.config.ts \
+         build.gradle pom.xml Rakefile Gemfile CMakeLists.txt noxfile.py; do
   check "H: gate trips on $u" "$(gate_trips "$u")" "unsafe"
 done
-for s in README.md JE-NOTES.md docs/notes.txt src/app.py main.go util.rs; do
+# Only genuinely non-executable deliverables (docs/data) verify unsandboxed against the trusted tree.
+for s in README.md JE-NOTES.md docs/notes.txt data/fixtures.json config.yaml notes.md; do
   check "H: gate allows $s" "$(gate_trips "$s")" "safe"
 done
 
@@ -314,6 +334,18 @@ check "T2: fast failure -> real rc 7 (not 124)" "$rc" "7"
 # T3: a command that sleeps past a tiny timeout is killed and reported as 124.
 ( bash "$FLGIT" je_run_with_timeout 1 -- sleep 30 ) >/dev/null 2>&1; rc=$?
 check "T3: overrun -> rc 124 (timed out)" "$rc" "124"
+
+# security-sweep M22: a timed-out command's BACKGROUNDED CHILD must also be reaped (process-group
+# kill), not left alive holding inherited creds / mutating files. Run a command that backgrounds a
+# long unique sleep then itself sleeps past the timeout; after the timeout, that grandchild sleep
+# must be GONE (the old single-pid kill left it running).
+m22=97531
+( bash "$FLGIT" je_run_with_timeout 1 -- sh -c "sleep $m22 & sleep 30" ) >/dev/null 2>&1
+gchild=""
+for _t in 1 2 3 4 5 6 7 8; do
+  if ps -Ao args 2>/dev/null | grep -v grep | grep -q "sleep $m22"; then gchild="alive"; sleep 0.5; else gchild=""; break; fi
+done
+[ -z "$gchild" ] && ok "M22: timed-out command's backgrounded child was group-killed" || { bad "M22: backgrounded child ($m22) survived the timeout"; pkill -f "sleep $m22" 2>/dev/null; }
 
 # T4: NO LEAK on the early-completion path. A reparented orphan is invisible to
 #     `jobs -p`, so we scan the REAL process table for the watchdog's sleep.

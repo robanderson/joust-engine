@@ -43,10 +43,29 @@
 // =============================================================================
 
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, appendFileSync, existsSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { mkdirSync, appendFileSync, existsSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs'
+import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+
+// security-sweep M9 (2026-07-07): the OMLX bearer token must NEVER ride in curl's argv — process
+// listings (`ps -ef`, /proc/<pid>/cmdline) are world-readable, so a co-tenant could scrape it. Write
+// the Authorization header to a 0600 curl config file consumed with -K, then unlink it. The config
+// file is only readable by our own uid for the ~milliseconds the request is in flight.
+function curlAuthed(baseArgv, bearer, spawnOpts) {
+  const dir = mkdtempSync(join(tmpdir(), 'je-bench-'))
+  const cfg = join(dir, 'curl.cfg')
+  // curl config: `header = "<value>"`. A bearer token is an opaque credential with no `"`/`\`/newline
+  // in any provider we support; strip those defensively so a malformed token can't break out of the
+  // quoted value or inject a second directive.
+  const safeBearer = String(bearer).replace(/["\\\r\n]/g, '')
+  writeFileSync(cfg, `header = "Authorization: Bearer ${safeBearer}"\n`, { mode: 0o600 })
+  try {
+    return spawnSync('curl', ['-K', cfg, ...baseArgv], spawnOpts)
+  } finally {
+    try { unlinkSync(cfg) } catch { /* best effort */ }
+  }
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const PLUGIN_ROOT = resolve(__dirname, '..')          // bin/.. = plugin root
@@ -268,11 +287,10 @@ const GROK_MODELS = [
 function discoverLocalModels() {
   const tok = process.env.OMLX_AUTH_TOKEN
   if (!tok) return { models: [], note: 'OMLX_AUTH_TOKEN unset — local discovery skipped (export in ~/.zshrc and relaunch)' }
-  const r = spawnSync('curl', [
+  const r = curlAuthed([
     '-s', '--max-time', '15',
     'http://127.0.0.1:8000/v1/models',
-    '-H', `Authorization: Bearer ${tok}`,
-  ], { encoding: 'utf8' })
+  ], tok, { encoding: 'utf8' })
   if (r.status !== 0 || !r.stdout) {
     return { models: [], note: `omlx server unreachable at 127.0.0.1:8000 (curl rc=${r.status}) — local discovery skipped` }
   }
@@ -451,6 +469,24 @@ function perlAlarmArgv(timeoutSecs, cmdArgv) {
   return ['-e', PERL, String(timeoutSecs), ...cmdArgv]
 }
 
+// security-sweep H2 (2026-07-07): bench children (esp. codex/grok, which have agentic tools)
+// inherited the FULL process.env — every provider key + forge/cloud secret. Mirror the runner-lib
+// je_scrub_child_secrets: return process.env with every known secret name removed, so a benched
+// agentic child cannot exfiltrate cross-provider/forge/cloud creds. Each provider dispatch adds
+// back ONLY the one auth var it needs.
+const BENCH_SECRET_KEYS = [
+  'ZAI_API_KEY', 'MINIMAX_API_KEY', 'OMLX_AUTH_TOKEN', 'OPENAI_API_KEY', 'XAI_API_KEY', 'ANTHROPIC_API_KEY',
+  'GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_PAT', 'GH_ENTERPRISE_TOKEN',
+  'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS', 'GCP_SA_KEY', 'GCLOUD_SERVICE_KEY',
+  'NPM_TOKEN', 'NODE_AUTH_TOKEN', 'SSH_AUTH_SOCK', 'CLOUDFLARE_API_TOKEN', 'DIGITALOCEAN_TOKEN',
+]
+function scrubbedEnv() {
+  const e = { ...process.env }
+  for (const k of BENCH_SECRET_KEYS) delete e[k]
+  return e
+}
+
 // Run a claude-family call (anthropic/glm/minimax) and time JUST this call.
 // env: the provider-specific ANTHROPIC_* env (auth, base url, default models).
 // flagArgv: extra `claude` args (e.g. ['--model','opus']) — [] for minimax.
@@ -466,8 +502,8 @@ function runClaudeFamily({ env, flagArgv, timeoutSecs, cfg }) {
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['claude', ...claudeArgs])
   const fullEnv = {
-    ...process.env,
-    ...env,
+    ...scrubbedEnv(),          // security-sweep H2: base env with all secrets stripped
+    ...env,                    // provider ANTHROPIC_* (auth/base-url/models) added back explicitly
     // SOFT output cap for claude-family (no --max-tokens flag exists). MUST be
     // >= 1024 or an extended-thinking model rejects the request with a 400 (the
     // root cause of D-0005's haiku failure); profile caps are 2048 / 8192.
@@ -541,11 +577,10 @@ function dispatchLocal(target, timeoutSecs, cfg) {
     '-s', '--max-time', String(timeoutSecs),
     'http://127.0.0.1:8000/v1/chat/completions',
     '-H', 'Content-Type: application/json',
-    '-H', `Authorization: Bearer ${tok}`,
     '-d', body,
   ]
   const t0 = Date.now()
-  const r = spawnSync('curl', curlArgv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
+  const r = curlAuthed(curlArgv, tok, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
   if (r.status !== 0) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `curl exit ${r.status} (omlx unreachable/timeout)` }
   let j
@@ -581,7 +616,8 @@ function dispatchCodex(target, timeoutSecs, cfg) {
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['codex', ...codexArgs])
   const t0 = Date.now()
-  const r = spawnSync('perl', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
+  // security-sweep H2: codex authenticates from ~/.codex/auth.json — give it a secret-scrubbed env.
+  const r = spawnSync('perl', argv, { env: scrubbedEnv(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
   if (r.status === 124) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
   const out = (r.stdout || '')
@@ -661,7 +697,11 @@ function dispatchGrok(target, timeoutSecs, cfg) {
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['grok', ...grokArgs])
   const t0 = Date.now()
-  const r = spawnSync('perl', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
+  // security-sweep H2: grok resolves its own credential (OAuth session or XAI_API_KEY); give it a
+  // secret-scrubbed env but ADD BACK its own XAI key if the operator set one.
+  const grokEnv = scrubbedEnv()
+  if (process.env.XAI_API_KEY) grokEnv.XAI_API_KEY = process.env.XAI_API_KEY
+  const r = spawnSync('perl', argv, { env: grokEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
   if (r.status === 124) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
   const out = (r.stdout || '')
