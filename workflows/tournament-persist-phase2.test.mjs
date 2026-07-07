@@ -126,6 +126,21 @@ test('persist(assemble): assembled bytes != json(review) is a VERIFIED miss -> r
   assert.ok(scripts[1].includes(VERDICT.content), 'the retry types the full verdict content through the verified heredoc')
 })
 
+test('security-sweep H9: an EMPTY relayed sha on a typed write is treated as UNVERIFIED (fail-closed), not passed on bytes alone', async () => {
+  const scripts = []
+  const stub = async (prompt) => {
+    scripts.push(prompt)
+    // First pass: the relay returns the right byte-count but an EMPTY sha (dropped/garbled). The old
+    // `got.sha && …` short-circuit would have accepted this as VERIFIED on bytes>0 alone.
+    if (scripts.length === 1) return { results: [{ path: TALLY.path, bytes: TALLY.content.length, sha: '' }] }
+    return { results: [{ path: TALLY.path, bytes: TALLY.content.length, sha: shaOf(TALLY.content) }] } // retry relays the real sha
+  }
+  const persist = makePersist(stub, '/plugin/bin')
+  const ok = await persist([TALLY], 'Review') // TALLY is a typed write (expected[] sha set)
+  assert.equal(scripts.length, 2, 'empty sha must force a RETRY, not a fail-open accept')
+  assert.deepEqual(ok, [TALLY.path], 'only accepted once the sha actually verifies')
+})
+
 test('persist(assemble): je-assemble missing/crashed (no FLP line) -> typed fallback; still-bad target reported, good file returned', async () => {
   const scripts = []
   const stub = async (prompt) => {

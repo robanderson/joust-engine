@@ -3637,7 +3637,14 @@ async function persist(pairs, phaseTitle) {
   const bad = (f, seen) => {
     const got = seen[f.path]
     if (!got || !(got.bytes > 0)) return 'missing/empty'
-    if (expected[f.path] && got.sha && got.sha !== expected[f.path]) return `sha mismatch (relay corruption): expected ${expected[f.path].slice(0, 12)}…, got ${got.sha.slice(0, 12)}…`
+    // security-sweep H9 (2026-07-07): a typed write (expected[path] set) MUST carry a matching sha.
+    // The old `got.sha && got.sha !== expected` short-circuited when the relay returned an EMPTY sha,
+    // so an UNVERIFIED write passed on bytes>0 alone — a fail-open hole in the #33 sha-verified
+    // dataplane invariant. Now a missing/empty sha on a sha-required write is itself a failure.
+    if (expected[f.path]) {
+      if (!got.sha) return 'sha missing on a sha-verified write (relay dropped it; treated as unverified → retry)'
+      if (got.sha !== expected[f.path]) return `sha mismatch (relay corruption): expected ${expected[f.path].slice(0, 12)}…, got ${got.sha.slice(0, 12)}…`
+    }
     return null
   }
   try {
@@ -4087,6 +4094,11 @@ function canonicalConfig(cfg) {
   return JSON.stringify({
     mode: (cfg && cfg.mode) || null,
     implement: !!(cfg && cfg.implement),
+    // security-sweep H10 (2026-07-07): task_sha MUST be in the fingerprint. It was set on
+    // RUN_STATE_CONFIG (steelman F5) but never serialized here, so a resume against the SAME runDir
+    // with a CHANGED task silently reused the prior task's deliverables — the F5 task-binding was
+    // inert. Including it makes any task change refuse reuse (fingerprint mismatch → clean re-run).
+    task_sha: (cfg && cfg.task_sha) || null,
     rots: (cfg && cfg.rots) || {},
     attempts: ids(cfg && cfg.attempts),
     implementAttempts: ids(cfg && cfg.implementAttempts),

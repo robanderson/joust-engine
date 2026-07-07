@@ -142,6 +142,15 @@ test('canonicalConfig is order/shape-stable and changes when a seat identity cha
   assert.notEqual(canonicalConfig(cfg), canonicalConfig(drifted))
 })
 
+test('security-sweep H10: task_sha is IN the fingerprint — a changed task refuses resume reuse', () => {
+  const base = { mode: 'two', implement: true, task_sha: 'a'.repeat(64), rots: { 'round-1': 1 }, attempts: ids(A0), implementAttempts: ids(A0) }
+  const changedTask = { ...base, task_sha: 'b'.repeat(64) }
+  assert.notEqual(canonicalConfig(base), canonicalConfig(changedTask),
+    'task_sha must change the fingerprint, else a resume against the same runDir reuses the prior task deliverables (F5 was inert until H10)')
+  const noTask = { ...base }; delete noTask.task_sha
+  assert.equal(canonicalConfig(noTask), canonicalConfig({ ...noTask })) // absent task_sha stays deterministic
+})
+
 // ---------- STRUCTURAL pins: heartbeat call sites, abort write-ahead, reuse wiring, blindness ----------
 test('structural: run-state.json is written through persist() (atomic+sha-verified), never a raw write', () => {
   assert.ok(SRC.includes('const RUN_STATE_PATH = `${runDir}/run-state.json`'))
