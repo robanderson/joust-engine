@@ -137,8 +137,40 @@ walk(ROOT)
 const baseVer = JSON.parse(
   fs.readFileSync(path.join(ROOT, cfg.versionBaseFrom || '.claude-plugin/plugin.json'), 'utf8')
 ).version || '0.0.0'
-const build = process.env.DEV_BUILD_NUMBER || process.env.GITHUB_RUN_NUMBER || `local.${Date.now()}`
-const stampedVer = `${baseVer}-dev.${build}`
+// Dev-channel base (cfg.devPatchBump): publish as a PRERELEASE of the NEXT patch of the canonical
+// release (X.Y.Z -> X.Y.(Z+1)), so a @@DE dev build sorts ABOVE the current @@JE release (X.Y.Z) and
+// BELOW the next (X.Y.(Z+1)). This keeps the two channels in lockstep: whenever @@JE bumps its patch,
+// @@DE's base advances with it (e.g. JE 0.1.0 -> DE 0.1.1-dev.N; JE releases 0.1.1 -> DE 0.1.2-dev.N).
+// A malformed (non X.Y.Z) base falls back to verbatim, never crashing the publish. PURE + sliceable.
+function devVersionBase(ver, bump) {
+  if (!bump) return ver
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(ver == null ? '' : ver).trim())
+  return m ? `${m[1]}.${m[2]}.${Number(m[3]) + 1}` : ver
+}
+// build number (cfg.devBuildFromCommits): commits since the latest release tag
+// (`git rev-list <tag>..HEAD --count`), so the dev number RESETS to a small value after each JE patch
+// release — 0.1.1-dev.1, dev.2, …, then a JE 0.1.1 release rolls the base to 0.1.2 and the count
+// resets: 0.1.2-dev.1. Requires tags + history in the checkout (CI uses fetch-depth: 0). Falls back
+// to the CI run number, then a local timestamp, when no tag is reachable (a branch with no tag
+// ancestor) or git is unavailable. Cache-bust note: a NEW commit always yields a higher count => a
+// new version => Claude Code's version-keyed cache re-pulls; re-publishing the SAME commit yields the
+// same version AND identical content (correct). The one degenerate case is two SIBLING branches at
+// the exact same tag-distance (same count, different content) — rare on a single-dev channel; if a
+// dev build's version looks unchanged after such a push, force a re-pull.
+function devBuildNumber() {
+  if (cfg.devBuildFromCommits) {
+    try {
+      const tag = spawnSync('git', ['describe', '--tags', '--abbrev=0'], { cwd: ROOT, encoding: 'utf8' })
+      if (tag.status === 0 && tag.stdout.trim()) {
+        const cnt = spawnSync('git', ['rev-list', `${tag.stdout.trim()}..HEAD`, '--count'], { cwd: ROOT, encoding: 'utf8' })
+        if (cnt.status === 0 && /^\d+$/.test(cnt.stdout.trim())) return cnt.stdout.trim()
+      }
+    } catch { /* git absent / not a repo -> fall through to the CI/local fallback */ }
+  }
+  return process.env.DEV_BUILD_NUMBER || process.env.GITHUB_RUN_NUMBER || `local.${Date.now()}`
+}
+const build = devBuildNumber()
+const stampedVer = `${devVersionBase(baseVer, cfg.devPatchBump)}-dev.${build}`
 for (const rel of (cfg.stampVersionIn || [])) {
   const p = path.join(OUT_REAL, ...rel.split('/'))
   if (!fs.existsSync(p)) continue

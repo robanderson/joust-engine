@@ -31,6 +31,8 @@
     ["skills/joust-bench", "skills/development-bench"]
   ],
   "versionBaseFrom": ".claude-plugin/plugin.json",
+  "devPatchBump": true,
+  "devBuildFromCommits": true,
   "stampVersionIn": [".claude-plugin/plugin.json", ".claude-plugin/marketplace.json"],
   "selfTest": [
     ["node", "bin/je-parse.test.mjs"],
