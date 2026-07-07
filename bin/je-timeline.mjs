@@ -5,8 +5,16 @@
 // Deterministic, zero tokens: transcripts carry real timestamps; the workflow sandbox
 // cannot self-timestamp (Date.now() is forbidden there for resume-safety), so timing is
 // reconstructed here, post-run or mid-run (partial transcripts produce a partial timeline).
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, lstatSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+
+// security-sweep M26 (2026-07-07): writeFileSync FOLLOWS a preexisting symlink, so a run artifact
+// planted as a symlink could clobber an arbitrary writable file. Remove any existing symlink at the
+// target before writing (the timeline is always a fresh regular file under runDir).
+function writeNoFollow(p, data) {
+  try { if (lstatSync(p).isSymbolicLink()) rmSync(p) } catch { /* absent = fine */ }
+  writeFileSync(p, data)
+}
 
 const [transcriptDir, runDir] = process.argv.slice(2)
 if (!transcriptDir || !runDir) { console.error('usage: je-timeline.mjs <transcriptDir> <runDir>'); process.exit(2) }
@@ -26,7 +34,10 @@ export function labelFor(c) {
   if (/shasum|heredoc/i.test(c)) return 'persist-helper'
   if (/stage/i.test(c) && /blind/i.test(c)) return `stage${pool ? ':' + pool[1] : ''}`
   if (/positives|challenges/i.test(c) && /guidance/i.test(c)) return 'guidance-synthesis'
-  return `other:${c.slice(0, 50).replace(/\s+/g, ' ')}`
+  // security-sweep M27 (2026-07-07): the raw transcript prompt prefix could carry a secret into the
+  // durable timeline. Redact obvious secret shapes before slicing into the label.
+  const scrubbed = String(c).replace(/(sk-[A-Za-z0-9_-]{12,}|gh[ps]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[:=]\s*\S+)/gi, '<REDACTED>')
+  return `other:${scrubbed.slice(0, 50).replace(/\s+/g, ' ')}`
 }
 
 const files = readdirSync(transcriptDir).filter(f => f.startsWith('agent-') && f.endsWith('.jsonl'))
@@ -71,8 +82,8 @@ if (chains.length) obs.push(`**codex judge chains**: ${chains.length} dispatch l
 const peak = Math.max(0, ...agents.map(a => a.concurrent + 1))
 obs.push(`**peak concurrency**: ${peak} (workflow cap 16) — ${peak >= 15 ? 'cap may be binding' : 'cap not binding'}.`)
 
-writeFileSync(join(runDir, 'timeline.jsonl'), agents.map(a => JSON.stringify(a)).join('\n') + '\n')
-writeFileSync(join(runDir, 'TIMELINE.md'), `# Run timeline (${agents.length} agents)
+writeNoFollow(join(runDir, 'timeline.jsonl'), agents.map(a => JSON.stringify(a)).join('\n') + '\n')
+writeNoFollow(join(runDir, 'TIMELINE.md'), `# Run timeline (${agents.length} agents)
 
 | start (UTC) | dur | agent | started after (gap) | concurrent |
 |---|---|---|---|---|

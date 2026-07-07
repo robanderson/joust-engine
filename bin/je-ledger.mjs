@@ -244,8 +244,14 @@ export function convergence(bucket, path) {
   for (const rec of records) {
     if (!rec || rec.taskBucket == null || String(rec.taskBucket) !== String(bucket)) continue
     samples++
+    // security-sweep M25 (2026-07-07): convergence trusts the artifact's `collapse.group`. Add a
+    // SHAPE guard so a poisoned/garbled ledger record can't inflate convergence evidence with junk:
+    // require the group to be >=2 DISTINCT single blind letters (A-Z). This can't re-verify byte
+    // identity (the artifacts may be gone at record time), but it rejects malformed group markers.
+    const validGroup = (g) => Array.isArray(g) && g.length >= 2 &&
+      new Set(g).size === g.length && g.every((x) => typeof x === 'string' && /^[A-Z]$/.test(x))
     const didConverge = (rec.seats || []).some(
-      (s) => s.phase === 'implement' && s.collapse && Array.isArray(s.collapse.group) && s.collapse.group.length >= 2,
+      (s) => s.phase === 'implement' && s.collapse && validGroup(s.collapse.group),
     )
     if (didConverge) converged++
   }

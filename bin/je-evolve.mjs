@@ -359,7 +359,13 @@ export function templateForRcSeat(seat) {
 // report
 // ---------------------------------------------------------------------------
 const pct = (num, den) => (den > 0 ? `${Math.round((100 * num) / den)}%` : '—')
-const trunc = (s, n = 160) => (s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s)
+// security-sweep H22 (2026-07-07): `c.seed` is MODEL-AUTHORED review text and is rendered into the
+// evolution report, which a human reads and may feed back into brief mutation — so a candidate can
+// inject instructions/markdown that steer FUTURE briefs (self-perpetuating). Neutralise the two
+// break-out vectors before display: collapse newlines to spaces (can't spawn a new markdown block or
+// heading) and defang backticks/backslashes (can't open/close a code fence). trunc still bounds length.
+const fence = (s) => String(s == null ? '' : s).replace(/[\r\n]+/g, ' ').replace(/[`\\]/g, '·')
+const trunc = (s, n = 160) => { const t = fence(s); return t.length > n ? t.slice(0, n - 1).trimEnd() + '…' : t }
 
 export function reportMd(agg) {
   const out = []

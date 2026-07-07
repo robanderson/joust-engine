@@ -21,7 +21,7 @@
 // FLP check then drives the typed-content fallback (worst case = today's behaviour, never a crash).
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { dirname, resolve } from 'node:path'
+import { dirname, resolve, relative, isAbsolute } from 'node:path'
 
 const [tallyPath, outPath] = process.argv.slice(2)
 if (!tallyPath || !outPath) {
@@ -39,7 +39,11 @@ for (const r of rounds) {
   if (!r || !Array.isArray(r.verdicts)) continue
   r.verdicts = r.verdicts.map(v => {
     if (!v || typeof v.$seat !== 'string') return v // inline verdict (no on-disk ref) — kept verbatim
+    // security-sweep L6 (2026-07-07): a $seat ref with an absolute path or `..` would resolve OUTSIDE
+    // runDir, reading an arbitrary file into the assembled verdict. Require containment.
     const p = resolve(runDir, v.$seat)
+    const relFromRun = relative(runDir, p)
+    if (v.$seat.startsWith('/') || relFromRun.startsWith('..') || relFromRun === '' || isAbsolute(relFromRun)) fail(`seat ref escapes runDir: ${v.$seat}`)
     let bytes
     try { bytes = readFileSync(p) } catch { fail(`missing seat file ${p} (ref ${v.$seat})`) }
     const sha = createHash('sha256').update(bytes).digest('hex')
