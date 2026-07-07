@@ -582,14 +582,18 @@ const modelDowngrades = [] // { label, phase, from, to }
 // intended?" — run-h's security-x seat silently ran as opus (fallback) and nothing surfaced it at
 // summary level. Every LIVING lens verdict records intended vs actual here; rcSummaryLive attaches
 // the list as `judge_seats` so mapping.json / the result make silent-fallback councils auditable.
-// `as_intended` is a FAMILY check for codex seats (displayModel says the configured effort, e.g.
-// codex-xhigh, while the actual runs args.codexJudgeEffort — effort drift is config, not fallback).
+// security-sweep M15 (2026-07-07): audit against the EXACT configured effort, not just the family.
+// The old `actual.startsWith('codex-')` marked a codex-xhigh seat that actually ran codex-LOW as
+// healthy — a judge-strength DOWNGRADE was hidden. CODEX_JUDGE_EFFORT is the single resolved effort
+// (same resolution askLensCodex uses to tag judgeModel), so intended = `codex-${CODEX_JUDGE_EFFORT}`
+// and an exact compare flags any effort drift while never false-positiving on the effort default.
+const CODEX_JUDGE_EFFORT = /^(low|medium|high|xhigh)$/.test(String(A.codexJudgeEffort || '')) ? String(A.codexJudgeEffort) : 'high'
 const seatModelAudit = [] // { seat, lens, phase, intended, actual, as_intended }
 function auditSeatModel(phaseTitle, label, lens, dispatchMode, verdict) {
   if (!verdict) return verdict
-  const intended = dispatchMode === 'codex' ? ((lens.judge && lens.judge.displayModel) || 'codex') : 'opus'
+  const intended = dispatchMode === 'codex' ? `codex-${CODEX_JUDGE_EFFORT}` : 'opus'
   const actual = String(verdict.judgeModel || 'opus')
-  const as_intended = dispatchMode === 'codex' ? actual.startsWith('codex-') : actual === 'opus'
+  const as_intended = actual === intended
   seatModelAudit.push({ seat: label, lens: lens.key, phase: phaseTitle, intended, actual, as_intended })
   if (!as_intended) log(`JE-SEAT-AUDIT [${phaseTitle}] ${label} (${lens.key}): ran as ${actual}, intended ${intended}`)
   return verdict
@@ -2462,7 +2466,7 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
   const briefBody = lensPrompt(lens, blindList, poolPath, roundNum, peerBlock, rot) +
     `\n\nThe working tree you are reviewing contains _pool.md — a byte-identical copy of that pool file; it IS the artifact under review. Deliver a prioritized PLAIN-TEXT review report (you are a review preset run — do NOT write any files):\n- One section per candidate, headed exactly "Candidate <letter>:", with your lens's pros and cons, each grounded in evidence QUOTED from the pool.\n- Then finish with EXACTLY these machine-parsed lines, one per line:\nRANKING: <all candidate letters, best first, separated by " > ">\nVOTE: <the single best candidate's letter>${isSecurityLens(lens.key) ? '\nSAFETY <letter>: SAFE — or — SAFETY <letter>: UNSAFE <high|critical> <one-line concrete evidence> (one SAFETY line per candidate; UNSAFE only with evidence you can point to — a standing UNSAFE flag excludes that candidate regardless of votes)' : ''}${delibExtra}\n- Close with one reasoning paragraph explaining the ranking.`
   const seatWs = judgeWs(label)
-  const judgeEffort = /^(low|medium|high|xhigh)$/.test(String(A.codexJudgeEffort || '')) ? String(A.codexJudgeEffort) : 'high'
+  const judgeEffort = CODEX_JUDGE_EFFORT // security-sweep M15: single resolved effort (audit + dispatch agree)
   const flag = CODEX_FLAG[`codex-${judgeEffort}`]
   const prep = `git init -q . 2>/dev/null; cp ${q(poolPath)} _pool.md && `
   const dispatchCmd = codexRunnerCmd(codexRunner, flag, seatWs, briefBody, codexJudgeTimeout, prep, 'JE_CODEX_MODE=review ')
@@ -3990,14 +3994,30 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
   // more kill per commit batch). A rejudge MUST judge against the tree the candidates targeted, and
   // an A/B pair (same pool, two prompt arms) MUST share one baseline. Strict 7-40 hex or ignored.
   if (/^[0-9a-f]{7,40}$/.test(String(A.rejudgeBaseSha || ''))) {
-    const pinCmd = `mkdir -p ${q(`${runDir}/_context`)} && { git rev-parse --verify ${q(`${String(A.rejudgeBaseSha)}^{commit}`)} 2>/dev/null || printf ''; } > ${q(gateBaseShaFile)} && wc -c ${q(gateBaseShaFile)}`
-    await agentLadder(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${pinCmd}`,
-      { model: HELPER_MODEL, phase: 'Rejudge', label: 'rejudge-base-pin' }).catch(() => null)
+    // security-sweep M19 (2026-07-07): the old pin wrote an EMPTY file via `|| printf ''` on a
+    // rev-parse failure, swallowed the relay error, and logged "pinned" regardless — so a
+    // hex-but-unresolvable rejudgeBaseSha silently fell back to today's HEAD while claiming it
+    // pinned the authoring tree, gating candidates against the WRONG baseline. Now the pin emits
+    // `JRPIN <bytes>`; a given-but-unresolvable sha (0 bytes) FAILS the rejudge (fail closed).
+    const pinCmd = `mkdir -p ${q(`${runDir}/_context`)} && { git rev-parse --verify ${q(`${String(A.rejudgeBaseSha)}^{commit}`)} 2>/dev/null || printf ''; } > ${q(gateBaseShaFile)}; echo "JRPIN $(wc -c < ${q(gateBaseShaFile)} 2>/dev/null | tr -d ' ')"`
+    const pinRes = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${pinCmd}`,
+      { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: 'Rejudge', label: 'rejudge-base-pin' }).catch(() => null)
+    const pinBytes = Number(((pinRes && pinRes.raw) || '').match(/JRPIN\s+(\d+)/)?.[1] || 0)
+    if (!pinBytes) {
+      return { mode: 'rejudge', n: A.rejudgeCandidates.length, __failed: `rejudgeBaseSha ${A.rejudgeBaseSha} did not resolve to a commit in this repo — refusing to gate against the wrong baseline (fail-closed)`, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+    }
     log(`REJUDGE baseline pinned to ${A.rejudgeBaseSha} (the tree the candidates were authored against)`)
   }
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
   const rjN = A.rejudgeCandidates.length
-  const rjRot = Number.isInteger(A.rejudgeRot) ? A.rejudgeRot : 3
+  // security-sweep M20 (2026-07-07): blind letters come from a 26-char alphabet, so >26 candidates
+  // or a negative rot made `letters[(i+rot)%N]` undefined → candidates collided at `.../undefined`,
+  // silently overwriting each other and corrupting the rejudge pool. Bound N<=26 and normalise rot
+  // to a non-negative index (fail loud on overflow rather than mangle the pool).
+  if (rjN > letters.length) {
+    return { mode: 'rejudge', n: rjN, __failed: `rejudge supports at most ${letters.length} candidates (got ${rjN}); split into batches`, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+  }
+  const rjRot = Number.isInteger(A.rejudgeRot) ? ((A.rejudgeRot % rjN) + rjN) % rjN : 3 % rjN // non-negative, in-range
   const reviewDir = `${runDir}/review-rejudge`
   const rjAssign = A.rejudgeCandidates.map((r, i) => ({ ...r, blind: letters[(i + rjRot) % rjN] }))
   // Stage: copy each source dir into its fresh blind slot; STRIP the source run's engine stamps
@@ -4005,7 +4025,13 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
   // corrupt-patch stamp from the buggy gate must never leak into the rebuilt pool.
   const copyScript = [`mkdir -p ${q(reviewDir)}`].concat(rjAssign.map(c => {
     const dest = `${reviewDir}/${c.blind}`
-    return `rm -rf ${q(dest)}; mkdir -p ${q(dest)}; cp -R ${q(c.dir)}/. ${q(dest)}/ 2>/dev/null; ` +
+    // security-sweep H17 (2026-07-07): c.dir is caller-supplied (args.rejudgeCandidates). The old
+    // `cp -R ${dir}/.` copied WHATEVER it named — a `$HOME` or a symlinked candidate dir — straight
+    // into the blind judged pool, leaking arbitrary local files/secrets to the judges. Copy ONLY
+    // when the source is a real directory AND not a symlink; otherwise stage nothing (0 files → the
+    // candidate fails the mechanical gate's empty check, never silently pulling in outside files).
+    return `rm -rf ${q(dest)}; mkdir -p ${q(dest)}; ` +
+           `if [ -d ${q(c.dir)} ] && [ ! -L ${q(c.dir)} ]; then cp -R ${q(c.dir)}/. ${q(dest)}/ 2>/dev/null; else echo "JRJ-REFUSE ${c.blind} not-a-plain-dir" >&2; fi; ` +
            `rm -f ${q(dest)}/mechanical.txt ${q(dest)}/contract.txt ${q(dest)}/convergence.txt ${q(dest)}/enrichment.txt; ` +
            `echo "JRJ ${c.blind} $(find ${q(dest)} -type f 2>/dev/null | grep -c .)"`
   })).join('\n')

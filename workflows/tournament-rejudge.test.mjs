@@ -66,3 +66,21 @@ test('rejudgeBaseSha pins the gate baseline to the tree the candidates were AUTH
   const ctx = SRC.indexOf('await buildContext() // pins gateBaseShaFile (HEAD)')
   assert.ok(ctx > 0 && ctx < i, 'pin overwrite runs AFTER buildContext so it wins')
 })
+
+// ---- security-sweep rejudge hardening (2026-07-07) ----
+test('M20: >26 candidates is refused (blind alphabet is 26); rot normalised non-negative', () => {
+  assert.ok(BLOCK.includes('rjN > letters.length'), 'N>26 guard')
+  assert.match(BLOCK, /const rjRot = Number\.isInteger\(A\.rejudgeRot\) \? \(\(A\.rejudgeRot % rjN\) \+ rjN\) % rjN/, 'rot normalised to a non-negative in-range index')
+})
+
+test('H17: rejudge copy refuses a non-directory / symlinked source (no arbitrary-file leak into the pool)', () => {
+  assert.ok(BLOCK.includes('if [ -d ${q(c.dir)} ] && [ ! -L ${q(c.dir)} ]; then cp -R'),
+    'copy only when the source is a real directory AND not a symlink')
+  assert.ok(BLOCK.includes('JRJ-REFUSE'), 'a refused source is logged, staged as 0 files (fails the empty gate)')
+})
+
+test('M19: a hex-but-unresolvable rejudgeBaseSha FAILS the rejudge (fail-closed, no silent HEAD fallback)', () => {
+  assert.ok(BLOCK.includes('echo "JRPIN $(wc -c'), 'the pin reports resolved bytes')
+  assert.ok(BLOCK.includes('if (!pinBytes) {'), 'zero bytes (unresolved) is a failure')
+  assert.match(BLOCK, /did not resolve to a commit in this repo — refusing to gate against the wrong baseline/)
+})

@@ -733,6 +733,12 @@ cliParseCase('CLI FE bare default pool', 'do abc @@FE',
 cliParseCase('CLI FE M segment errors, exit 0', 'do abc @@FE:6:2',
   { n: null }, { errorIncludes: 'not valid for @@FE' });
 
+parseCase('security-sweep M23: a 4th colon segment is a MALFORMED marker error, not a silent :N:M:Z prefix',
+  '@@JE:4:2:5:99 do the thing',
+  { n: null, assignment: null }, { errorIncludes: 'more than 3 colon segments' });
+parseCase('M23: valid 3-segment marker with trailing task is unaffected', '@@JE:4:2:5 do the thing',
+  { n: 4, z: 5, task: 'do the thing' }, { noErrors: true });
+
 // ===========================================================================
 // 2026-07-07: run-depth keyword (fast|deep) — variable steelman shootout budget.
 // fast = 1 iteration, deep = 5, absent = null (engine default 3). Marker-adjacent

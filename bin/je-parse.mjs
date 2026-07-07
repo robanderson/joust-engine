@@ -671,6 +671,21 @@ function parse(rawInput) {
     return result;
   }
 
+  // security-sweep M23 (2026-07-07): the sigil regex captures at most 3 colon segments and has no
+  // end-assertion, so a MALFORMED marker with a 4th+ segment (`@@JE:4:2:5:99`) matched the `:4:2:5`
+  // prefix and left `:99` in the task — silently running a valid-looking prefix instead of erroring.
+  // For repo-mutating Z configs a fat-fingered extra segment could run a DIFFERENT tournament than
+  // typed. Reject a 4th colon-number segment immediately after the marker (fail loud, don't guess).
+  if (marker.kind === 'sigil' || marker.kind === 'fe') {
+    const afterMarker = msg.slice(marker.index + marker.length);
+    const extra = afterMarker.match(/^\s*:\s*\d+/);
+    if (extra) {
+      errors.push(`Malformed marker: "${(marker.rawTail + extra[0]).trim()}" has more than 3 colon segments (@@JE takes :N:M:Z only). Remove the extra segment and re-run.`);
+      result.errors = errors;
+      return result;
+    }
+  }
+
   // --- 2. Detect positional skips (empty middle segment). ---
   // A skip looks like '@@JE:5::3' — N present, M EMPTY, Z present. Because we
   // captured \d* per segment, an empty-but-colon-supplied M shows as

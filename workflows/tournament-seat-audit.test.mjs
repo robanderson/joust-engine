@@ -37,8 +37,12 @@ test('every living lens verdict is audited: codex path and native path both rout
   assert.match(SRC, /return auditSeatModel\(phaseTitle, label, lens, dispatchMode,\s*\n\s*await askLensNative\(/, 'native (incl. codex->opus fallback) audited')
 })
 
-test('as_intended is a FAMILY check for codex seats and exact-opus for native; mismatch logs JE-SEAT-AUDIT', () => {
-  assert.match(SRC, /as_intended = dispatchMode === 'codex' \? actual\.startsWith\('codex-'\) : actual === 'opus'/)
+test('security-sweep M15: as_intended is an EXACT-effort check (a codex-xhigh→codex-low downgrade is flagged, not hidden)', () => {
+  assert.match(SRC, /const intended = dispatchMode === 'codex' \? `codex-\$\{CODEX_JUDGE_EFFORT\}` : 'opus'/,
+    'intended is the exact configured effort, not the family — the old startsWith("codex-") hid effort downgrades')
+  assert.ok(SRC.includes('const as_intended = actual === intended'), 'exact compare')
+  assert.ok(SRC.includes('const CODEX_JUDGE_EFFORT ='), 'single resolved-effort constant')
+  assert.ok(SRC.includes('const judgeEffort = CODEX_JUDGE_EFFORT'), 'dispatch + audit share the one resolution')
   assert.ok(SRC.includes('JE-SEAT-AUDIT ['), 'mismatch is loudly logged')
 })
 
