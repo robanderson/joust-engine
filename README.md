@@ -344,7 +344,7 @@ Install Joust Engine **from inside Claude Code** — it installs straight from t
 What each line does:
 
 1. **`/plugin marketplace add robanderson/joust-engine`** — register this repo as a plugin marketplace (Claude Code accepts the GitHub `owner/repo` shorthand). The repo root holds `.claude-plugin/marketplace.json` (marketplace name `joust-engine`).
-2. **`/plugin install joust-engine@joust-engine`** — install the plugin. The form is `<plugin-name>@<marketplace-name>`; here both are `joust-engine` (the plugin manifest is `.claude-plugin/plugin.json`, name `joust-engine`, version `0.0.1`). It ships two skills (`joust-engine`, `joust-bench`) and ten agents.
+2. **`/plugin install joust-engine@joust-engine`** — install the plugin. The form is `<plugin-name>@<marketplace-name>`; here both are `joust-engine` (the plugin manifest is `.claude-plugin/plugin.json`, name `joust-engine`, version `0.1.0`). It ships two skills (`joust-engine`, `joust-bench`) and ten agents.
 3. **`/reload-plugins`** — **apply it.** This is the step the install command doesn't do for you: the newly installed plugin's skills and agents only load once you reload (or restart the session). *(If you install interactively instead — see below — Claude Code prints "Run /reload-plugins to apply" for you.)*
 
 **Interactive alternative:** if you prefer to browse, run `/plugin` with **no arguments** after step 1 to open the marketplace, then install `joust-engine` through the menu. Either path ends the same way — at step 3, apply it with `/reload-plugins`.
