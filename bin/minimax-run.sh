@@ -19,6 +19,8 @@ STALL="${JE_STALL_SECS:-180}"       # zero-output stall window (seconds); 180 is
 MAXTURNS="${JE_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 
 [ -z "${MINIMAX_API_KEY:-}" ] && { finish DONE "exit=3 (missing-key)" 07 missing-key; exit 3; }
+# security-sweep H1: capture token, strip all other secrets from the acceptEdits child env.
+_prov_token="$MINIMAX_API_KEY"; je_scrub_child_secrets
 [ -f _brief.txt ]            || { finish DONE "exit=4 (missing-brief)" 07 missing-brief; exit 4; }
 
 PROV_LINE="JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io model=MiniMax-M3 max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s"
@@ -29,7 +31,7 @@ echo "$PROV_LINE" >> "$LOG"
 # thinking) so $LOG grows while claude works and the stall watchdog sees real liveness.
 run_try() {
   ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic" \
-  ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY" \
+  ANTHROPIC_AUTH_TOKEN="$_prov_token" \
   ANTHROPIC_MODEL="MiniMax-M3" \
   ANTHROPIC_DEFAULT_OPUS_MODEL="MiniMax-M3" \
   ANTHROPIC_DEFAULT_SONNET_MODEL="MiniMax-M3" \

@@ -9,6 +9,27 @@
 : "${PROV:?_je-run-lib.sh: PROV must be set before sourcing}"
 : "${LOG:?_je-run-lib.sh: LOG must be set before sourcing}"
 
+# security-sweep H1 (2026-07-07): every runner launches `claude`/`codex` in acceptEdits with a Bash
+# tool, so a prompt-injected attempt can `echo $SOME_KEY` / `env` and exfiltrate any credential the
+# child inherits into its own (pooled, logged) output. The child needs exactly ONE auth token; it
+# must NEVER see the operator's OTHER provider keys, forge tokens, or cloud creds. Each runner
+# CAPTURES its own token into `_prov_token` first, then calls this to strip EVERY known secret name
+# from the environment (including its own raw key name), then passes `_prov_token` as
+# ANTHROPIC_AUTH_TOKEN command-scoped. Residual, documented honestly: the auth token is still
+# readable as ANTHROPIC_AUTH_TOKEN (the CLI needs it in-env) — a full fix needs an out-of-env
+# credential broker, out of scope; this closes the CROSS-provider + forge + cloud exfil surface,
+# which is the real multi-credential exposure. Internal name (no JE_ prefix) so rebrand won't touch it.
+je_scrub_child_secrets() {
+  local v
+  for v in ZAI_API_KEY MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY ANTHROPIC_API_KEY \
+           GH_TOKEN GITHUB_TOKEN GITHUB_PAT GH_ENTERPRISE_TOKEN \
+           AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+           GOOGLE_APPLICATION_CREDENTIALS GCP_SA_KEY GCLOUD_SERVICE_KEY \
+           NPM_TOKEN NODE_AUTH_TOKEN SSH_AUTH_SOCK CLOUDFLARE_API_TOKEN DIGITALOCEAN_TOKEN; do
+    unset "$v"
+  done
+}
+
 _finished=0
 # finish <STATUS_WORD DONE|TIMEOUT|KILLED|ERROR> <status-detail> <rc-code> <rc-reason>
 # IDEMPOTENT: the first call wins; every later call (explicit, or via a trap firing after an explicit

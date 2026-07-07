@@ -12,6 +12,11 @@ PROV=CODEX
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/_je-run-lib.sh"           # provides finish() + guaranteed-terminal traps + run_watchdog_perl
 unset ANTHROPIC_API_KEY            # fold-in B: never leak the Anthropic key into a non-Anthropic child
+# security-sweep H1: codex authenticates from ~/.codex/auth.json (on disk), needing NO provider env
+# key, so strip every provider/forge/cloud secret from the env before `codex exec -s workspace-write`
+# (whose shell can run model-authored commands). On-disk creds are a separate finding; this closes
+# the ENV-secret exfil surface.
+je_scrub_child_secrets
 
 TIMEOUT="${JE_TIMEOUT_SECS:-600}"   # wall-clock backstop (seconds)
 STALL="${JE_STALL_SECS:-300}"       # zero-output stall window (seconds). 300 not 120: codex exec goes

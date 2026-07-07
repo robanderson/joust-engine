@@ -112,7 +112,9 @@ rm -rf "$WS"
 mk_ws; run_runner FAKE_MODE=scrub ANTHROPIC_API_KEY=leaked-test-key; RC=$?
 check "scrub: exits 0"                     '[ "$RC" -eq 0 ]'
 check "scrub: ANTHROPIC_API_KEY absent"    '! grep -q "^ANTHROPIC_API_KEY=" "$WS/child-env.txt"'
-check "scrub: own OMLX key still present"  'grep -q "^OMLX_AUTH_TOKEN=" "$WS/child-env.txt"'
+# security-sweep H1: raw provider key must NOT reach the child; token flows only as ANTHROPIC_AUTH_TOKEN.
+check "scrub: raw OMLX_AUTH_TOKEN gone"   '! grep -q "^OMLX_AUTH_TOKEN=" "$WS/child-env.txt"'
+check "scrub: auth token carries key"    'grep -q "^ANTHROPIC_AUTH_TOKEN=test-key" "$WS/child-env.txt"'
 rm -rf "$WS"
 
 echo "== $PASS passed, $FAIL failed =="

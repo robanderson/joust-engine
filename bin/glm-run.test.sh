@@ -63,9 +63,14 @@ check "timeout-exhausted: one TIMEOUT" '[ "$(grep -c "^JOUST-GLM-TIMEOUT " "$WS/
 check "timeout-exhausted: one RC 01"  '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 01 " "$WS/_glm_run.log"'
 rm -rf "$WS"
 
-mk_ws; run_runner FAKE_MODE=scrub ANTHROPIC_API_KEY=leaked-test-key; RC=$?
+mk_ws; run_runner FAKE_MODE=scrub ANTHROPIC_API_KEY=leaked-test-key OPENAI_API_KEY=foreign-key GH_TOKEN=foreign-gh; RC=$?
 check "scrub: ANTHROPIC_API_KEY gone" '! grep -q "^ANTHROPIC_API_KEY=" "$WS/child-env.txt"'
-check "scrub: own ZAI key present"    'grep -q "^ZAI_API_KEY=" "$WS/child-env.txt"'
+# security-sweep H1: the RAW provider key name must NOT reach the child (a prompt-injected attempt
+# could echo it); the token instead flows only as ANTHROPIC_AUTH_TOKEN, which the CLI needs to auth.
+check "scrub: raw ZAI_API_KEY gone"   '! grep -q "^ZAI_API_KEY=" "$WS/child-env.txt"'
+check "scrub: auth token carries key" 'grep -q "^ANTHROPIC_AUTH_TOKEN=test-key" "$WS/child-env.txt"'
+check "scrub: foreign OPENAI key gone" '! grep -q "^OPENAI_API_KEY=" "$WS/child-env.txt"'
+check "scrub: foreign GH token gone"   '! grep -q "^GH_TOKEN=" "$WS/child-env.txt"'
 rm -rf "$WS"
 
 echo "== $PASS passed, $FAIL failed =="

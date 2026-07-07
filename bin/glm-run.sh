@@ -30,6 +30,9 @@ JITTER_MAX="${JE_GLM_JITTER_MAX:-10}" # random 0..N s added to startup + each ba
 
 [ -z "${ZAI_API_KEY:-}" ] && { finish DONE "exit=3 (missing-key)" 07 missing-key; exit 3; }
 [ -f _brief.txt ]        || { finish DONE "exit=4 (missing-brief)" 07 missing-brief; exit 4; }
+# security-sweep H1: capture our token, then strip EVERY secret name (incl. our raw ZAI_API_KEY) from
+# the env so the acceptEdits child cannot exfiltrate cross-provider/forge/cloud creds.
+_prov_token="$ZAI_API_KEY"; je_scrub_child_secrets
 
 # Portable random 0..N seconds (macOS has no shuf; sh has no reliable $RANDOM).
 jitter() { perl -e 'print int(rand($ARGV[0]+1))' "$1"; }
@@ -51,7 +54,7 @@ fi
 # old buffered-until-done text output.
 run_try() {
   ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
-  ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" \
+  ANTHROPIC_AUTH_TOKEN="$_prov_token" \
   ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.2[1m]" \
   ANTHROPIC_DEFAULT_SONNET_MODEL="glm-4.7" \
   ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-4.5-air" \

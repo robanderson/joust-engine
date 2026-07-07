@@ -19,6 +19,8 @@ MAXTURNS="${JE_MAX_TURNS:-20}"       # tight cap: local models tend to ignore "s
 
 # OMLX_AUTH_TOKEN comes from the environment — uniform key handling across every runner.
 [ -z "${OMLX_AUTH_TOKEN:-}" ] && { finish DONE "exit=3 (missing-key)" 07 missing-key; exit 3; }
+# security-sweep H1: capture token, strip all other secrets from the acceptEdits child env.
+_prov_token="$OMLX_AUTH_TOKEN"; je_scrub_child_secrets
 [ -f _brief.txt ]           || { finish DONE "exit=4 (missing-brief)" 07 missing-brief; exit 4; }
 
 PROV_LINE="JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000 flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s stall=${STALL}s"
@@ -29,7 +31,7 @@ echo "$PROV_LINE" >> "$LOG"
 # thinking) so $LOG grows while claude works and the stall watchdog sees real liveness.
 run_try() {
   ANTHROPIC_BASE_URL="http://127.0.0.1:8000" \
-  ANTHROPIC_AUTH_TOKEN="$OMLX_AUTH_TOKEN" \
+  ANTHROPIC_AUTH_TOKEN="$_prov_token" \
   ANTHROPIC_DEFAULT_OPUS_MODEL="Qwen3.5-122B-A10B-LM-MLX-6.5bit" \
   ANTHROPIC_DEFAULT_SONNET_MODEL="mlx-community--Qwen3.6-35B-A3B-8bit" \
   ANTHROPIC_DEFAULT_HAIKU_MODEL="gemma-4-26b-a4b-it-8bit" \

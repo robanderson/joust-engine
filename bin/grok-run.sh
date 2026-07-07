@@ -22,6 +22,9 @@ command -v grok >/dev/null 2>&1 || { finish DONE "exit=5 (missing-runner)" 07 mi
 # Auth: grok resolves its OWN credential (model.api_key > env_key > OAuth session > XAI_API_KEY). On an
 # OAuth-only box NO key is set and that is NORMAL — so, unlike glm/minimax, require NEITHER credential.
 if [ -n "${XAI_API_KEY:-}" ]; then AUTHMODE="env-key"; else AUTHMODE="oauth-session"; fi
+# security-sweep H1: grok's agentic tool can run model-authored shell, so strip every OTHER provider/
+# forge/cloud secret from its env; PRESERVE grok's own XAI_API_KEY (it resolves its own credential).
+_xai="${XAI_API_KEY:-}"; je_scrub_child_secrets; [ -n "$_xai" ] && export XAI_API_KEY="$_xai"
 
 # Web search OFF by default (hermetic/fair); opt IN with JE_GROK_WEB=1.
 if [ "${JE_GROK_WEB:-0}" = "1" ]; then WEBFLAG=""; WEBMODE="on"; else WEBFLAG="--disable-web-search"; WEBMODE="off"; fi
