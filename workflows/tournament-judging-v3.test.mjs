@@ -254,3 +254,12 @@ test('(structural) implement+default-depth (mode single) still runs the implemen
   assert.ok(seg.includes('await implementPhase(seedPlanPath)'), 'the same implement phase, R3 (+R4 on gate failure)')
   assert.ok(seg.includes(`implement: true`) && seg.includes('implementWinner'), 'implement.json + mapping persisted like the two-pass hook')
 })
+
+test('(structural) steelman winner adoption is rename-preserving — no deletion anywhere in the adopt step', () => {
+  const i = SRC.indexOf('adopt it into the staged slot by RENAMING')
+  assert.ok(i > 0, 'rename-preserving adopt prompt present')
+  const seg = SRC.slice(i, i + 700)
+  assert.ok(seg.includes('mv "$DEST" "$BAK"'), 'original moved aside as an audit sibling, never destroyed')
+  assert.ok(!seg.includes('-delete') && !seg.includes('rm -rf "$DEST"'), 'no delete pattern (harness safety classifier blocked find-delete+overwrite twice, live)')
+  assert.ok(seg.includes('pre-steelman-i'), 'backup name records which steelman iteration was superseded')
+})

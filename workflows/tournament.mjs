@@ -3232,7 +3232,12 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
       // ship the version that WON: copy the winning gated artifact over the winner's staged dir so
       // every downstream consumer (plan bundling, adoption, reports) gets the polished artifact.
       if (winEntry.ws !== `${reviewDir}/${finalWinner}`) {
-        await agentLadder(`Joust-engine staging step: the council's steelman pass produced an improved copy of the winning candidate, and the staged review copy must now be synced to it (BOTH paths are engine-managed scratch dirs inside this run's staging area; nothing outside the run directory is touched). Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; find "$DEST" -mindepth 1 -delete 2>/dev/null; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
+        // Rename-preserving adopt (2026-07-07): NO deletion — the pre-boost original is moved
+        // aside as an audit sibling (<letter>.pre-steelman-iN) and the boosted copy takes the
+        // staged slot. The old find-delete+overwrite form was blocked by the harness safety
+        // classifier in auto mode (twice, live), which left the staged winner UN-boosted; a
+        // rename keeps every byte recoverable and gives the runDir a free audit trail.
+        await agentLadder(`Joust-engine staging step: the council's steelman pass produced an improved copy of the winning candidate; adopt it into the staged slot by RENAMING the current copy aside as an audit backup and copying the improved version in (nothing is deleted; both paths are engine-managed scratch dirs inside this run's staging area). Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; BAK="$DEST.pre-steelman-i${iter}"; [ -e "$BAK" ] && BAK="$BAK.$$"; mv "$DEST" "$BAK"; mkdir -p "$DEST"; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
           { model: HELPER_MODEL, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`))
       }
     } else if (iter < maxIters) {
