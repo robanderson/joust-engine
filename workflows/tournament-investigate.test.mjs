@@ -140,6 +140,12 @@ test('(structural) evidence pass: HELPER_MODEL step, after staging/enrich, befor
   assert.match(fn, /if \(!investigate\) return staged/, 'flag-off => byte-identical (no agent spend)')
   assert.match(fn, /model: HELPER_MODEL, schema: EVIDENCE_SCHEMA/, 'one HELPER_MODEL step (mechanicalPatchGate shape)')
   assert.match(fn, /grep -ohE \$\{q\(CITE_GREP\)\}/, 'shell extractor pins the pure block CITE_GREP pattern')
+  // security-sweep M1: a cited path earns verified credit ONLY inside the pinned snapshot scope.
+  // Absolute paths and `..` path segments are rejected BEFORE any existence check (still counted as
+  // cited, never as verified), so a candidate cannot inflate its evidence stamp with an out-of-scope
+  // file that happens to exist (/etc/hosts, ../secret).
+  assert.match(fn, /case "\$p" in /, 'verification is guarded by a path-scope case')
+  assert.match(fn, /\/\*\|\.\.\|\.\.\/\*\|\*\/\.\.\|\*\/\.\.\/\*\) ok=0/, 'absolute + .. segments -> no verified credit')
   assert.match(fn, /echo "JEVID \$\{c\.blind\} \$n \$m"/, 'letters only in relayed lines')
   assert.match(fn, /mergeEvidence\(staged, byBlind\)/, 'routing decision lives in pure code')
   assert.match(fn, /evidenceStampShell\(dest\)/, 'pool rebuild carries the grammar-guarded stamp')

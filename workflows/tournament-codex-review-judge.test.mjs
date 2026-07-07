@@ -29,8 +29,9 @@ new Function('sandbox', `
   ${block}
   sandbox.parseCodexReviewDump = parseCodexReviewDump
   sandbox.REVIEW_CHECKS_RUN = REVIEW_CHECKS_RUN
+  sandbox.codexReportUnsafeLabels = codexReportUnsafeLabels
 `)(sandbox)
-const { parseCodexReviewDump, REVIEW_CHECKS_RUN } = sandbox
+const { parseCodexReviewDump, REVIEW_CHECKS_RUN, codexReportUnsafeLabels } = sandbox
 
 const LOGM = '===JE-CODEX-JUDGE-LOG==='
 const REPM = '===JE-CODEX-JUDGE-VERDICT==='
@@ -74,6 +75,31 @@ test('REVIEW_CHECKS_RUN is an engine-written constant (never model-invented tele
   assert.ok(REVIEW_CHECKS_RUN.every(s => typeof s === 'string' && s.includes('_pool.md')))
 })
 
+// ----- L2: report-derived UNSAFE ground truth (reformat drop-guard) -----
+test('codexReportUnsafeLabels: extracts exactly the UNSAFE SAFETY letters from the verbatim report', () => {
+  const s = codexReportUnsafeLabels(goodReport)   // B is UNSAFE, A is SAFE
+  assert.deepEqual([...s].sort(), ['B'])
+})
+test('codexReportUnsafeLabels: multiple UNSAFE, case/space tolerant, ignores SAFE + prose mentions', () => {
+  const rep = 'SAFETY a: UNSAFE high x\n  SAFETY C : unsafe critical y\nSAFETY D: SAFE\nprose: this is unsafe maybe\nRANKING: a > c\nVOTE: a'
+  assert.deepEqual([...codexReportUnsafeLabels(rep)].sort(), ['A', 'C'])
+})
+test('codexReportUnsafeLabels: empty/junk never throws, returns empty set', () => {
+  assert.equal(codexReportUnsafeLabels('').size, 0)
+  assert.equal(codexReportUnsafeLabels(null).size, 0)
+  assert.equal(codexReportUnsafeLabels(undefined).size, 0)
+})
+test('(structural) L2: reformat fails closed when it drops a report UNSAFE flag', () => {
+  assert.match(SRC, /const reportUnsafe = codexReportUnsafeLabels\(parsedResult\.report\)/,
+    'engine re-derives the UNSAFE set from the verbatim report')
+  assert.match(SRC, /const dropped = \[\.\.\.reportUnsafe\]\.filter\(l => !keptUnsafe\.has\(l\)\)/,
+    'compares report UNSAFE set against the reformatted safety array')
+  assert.match(SRC, /codex security reformat DROPPED UNSAFE flag/, 'a dropped veto throws (fail-closed -> retry/opus fallback)')
+  // the guard must be scoped to security lenses only
+  const idx = SRC.indexOf('const reportUnsafe = codexReportUnsafeLabels')
+  assert.ok(SRC.lastIndexOf('if (isSecurityLens(lens.key)) {', idx) > -1, 'guard is inside an isSecurityLens branch')
+})
+
 // ----- 2. STRUCTURAL: engine wiring -----
 test('askLensCodex dispatches the runner in JE_CODEX_MODE=review with a staged pool copy', () => {
   assert.ok(SRC.includes(`'JE_CODEX_MODE=review '`), 'dispatch env selects the review mode')
@@ -91,7 +117,7 @@ test('the reformat helper is traceability-bound sonnet with found:false as the n
 
 test('reformatted verdicts pass the SAME shape+integrity guards as native seats, then reconcile', () => {
   const i = SRC.indexOf('parseCodexReviewDump(rawForParse)')
-  const tail = SRC.slice(i, i + 3000)
+  const tail = SRC.slice(i, i + 4200)   // window spans the L2 drop-guard block between found-check and verdict build
   assert.ok(tail.includes('verdictShapeIssue(verdict)'), 'shape guard applied to the reformatted verdict')
   assert.ok(tail.includes('verdictIntegrityIssue(verdict)'), 'schema-valid-junk guard applied')
   assert.ok(tail.includes('reconcileLens(verdict, labels)'), 'label-permutation repair unchanged')

@@ -120,6 +120,20 @@ check "C2: XAI_API_KEY dropped from verify env" "$got" "EMPTY"
 rm -rf "$C2"
 
 # ---------------------------------------------------------------------------
+# C3) security-sweep L7: secret-drop now also covers CLOUD/forge creds that the
+#     old provider-only denylist left readable (AWS*, SSH_AUTH_SOCK, NPM_TOKEN,
+#     GOOGLE_APPLICATION_CREDENTIALS). Assert two representatives are gone.
+# ---------------------------------------------------------------------------
+C3=$(mktemp -d); repo="$C3/repo"; mkrepo "$repo"
+printf 'edited\n' >> "$repo/README.md"
+leak="$C3/leak.sh"; keyout="$C3/KEYOUT"; rm -f "$keyout"
+printf '#!/usr/bin/env bash\necho "${AWS_SECRET_ACCESS_KEY:-EMPTY}:${SSH_AUTH_SOCK:-EMPTY}" > "$1"\n' > "$leak"
+( cd "$repo" && printf '%s\n' "bash $leak $keyout" | AWS_SECRET_ACCESS_KEY=awssecret SSH_AUTH_SOCK=/tmp/agent.sock bash "$FLGIT" run_verify ) >/dev/null 2>&1
+got="$(cat "$keyout" 2>/dev/null || echo MISSING)"
+check "C3: AWS+SSH_AUTH_SOCK dropped from verify env" "$got" "EMPTY:EMPTY"
+rm -rf "$C3"
+
+# ---------------------------------------------------------------------------
 # D) no live re-detection: empty frozen set -> rc 2, never scans the tree.
 #    (committed package.json, clean tree -> gate passes; empty stdin -> rc 2.)
 # ---------------------------------------------------------------------------

@@ -503,14 +503,22 @@ run_verify() {
   fi
 
   # SECRET-DROP: strip credentials from this process (and thus every command it runs).
-  # Covers EVERY provider key this plugin uses, including XAI_API_KEY (Grok — read by
-  # bin/grok-run.sh / bin/je-bench.mjs); omitting it left a Grok token readable by a
-  # verify command. NOTE: this only scrubs ENVIRONMENT secrets — on-disk credentials
-  # (~/.config/gh, ~/.git-credentials, ~/.codex/auth.json, ~/.grok/auth.json, ~/.aws, …)
-  # are NOT protected here; the OS sandbox (je_verify_sandbox_exec) is the boundary for
-  # those, so untrusted-repo runs should additionally enable JE_VERIFY_SANDBOX.
+  # security-sweep L7 (2026-07-07): this list was a provider-only denylist that left the operator's
+  # CLOUD/forge secrets (AWS*, GOOGLE_APPLICATION_CREDENTIALS/GCP, NPM_TOKEN/NODE_AUTH_TOKEN,
+  # SSH_AUTH_SOCK, Cloudflare/DigitalOcean) readable by an implementer-authored verify command. It now
+  # mirrors the canonical je_scrub_child_secrets() set (the same superset the runners scrub) so verify
+  # can neither read nor exfiltrate them. A true env ALLOWLIST is deliberately NOT used: toolchains
+  # (npm/pytest/cargo) need PATH/HOME/LANG/etc., and a whitelist would break legitimate verify. NOTE:
+  # this scrubs ENVIRONMENT secrets only — on-disk credentials (~/.config/gh, ~/.git-credentials,
+  # ~/.codex/auth.json, ~/.grok/auth.json, ~/.aws, …) are NOT protected here; the OS sandbox
+  # (je_verify_sandbox_exec) is the boundary for those, so untrusted-repo runs should ALSO enable
+  # JE_VERIFY_SANDBOX.
   unset ZAI_API_KEY MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY \
-        ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GH_TOKEN GITHUB_TOKEN 2>/dev/null || true
+        ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
+        GH_TOKEN GITHUB_TOKEN GITHUB_PAT GH_ENTERPRISE_TOKEN \
+        AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+        GOOGLE_APPLICATION_CREDENTIALS GCP_SA_KEY GCLOUD_SERVICE_KEY \
+        NPM_TOKEN NODE_AUTH_TOKEN SSH_AUTH_SOCK CLOUDFLARE_API_TOKEN DIGITALOCEAN_TOKEN 2>/dev/null || true
 
   local -a cmds=()
   if [ ! -t 0 ]; then

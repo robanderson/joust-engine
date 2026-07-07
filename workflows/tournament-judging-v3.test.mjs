@@ -112,6 +112,16 @@ test('(structural) boost failure ratchets to the last gated version, never worse
   assert.match(cj, /ratchet/)
   assert.match(cj, /currentWs\[/)
 })
+test('(structural) M13: the tie ratchet runs on EVERY tied iteration (incl. the last), so gated_ws is never a round stale', () => {
+  const cj = slice('async function councilJudge(', '\n// Render the council')
+  // the currentWs ratchet must NOT be guarded by `else if (iter < maxIters)` — that skipped the
+  // final tied round, leaving needs_orchestrator_pick.gated_ws one improvement pass behind.
+  assert.doesNotMatch(cj, /\}\s*else if \(iter < maxIters\)\s*\{\s*\n[^\n]*\n\s*for \(const c of stagedR\) if \(c\.variant === 'boosted'\) currentWs/,
+    'ratchet must not sit behind the iter<maxIters guard')
+  // the iterate-log stays conditional on iter<maxIters, but the ratchet itself is unconditional
+  assert.match(cj, /for \(const c of stagedR\) if \(c\.variant === 'boosted'\) currentWs\[c\.orig\] = c\.ws\s*\n\s*if \(iter < maxIters\) log\(/,
+    'ratchet is unconditional; only the iterating log is guarded')
+})
 test('(structural) cold re-judge: runoff judges get roundNum=1 and no peer block', () => {
   const cj = slice('async function councilJudge(', '\n// Render the council')
   assert.match(cj, /-runoff\$\{iter\}-\$\{lens\.key\}-r1`, 1, null, i\)/)

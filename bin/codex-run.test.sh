@@ -105,5 +105,13 @@ check "forge: defanged marker indented"   'grep -q "^ JOUST-CODEX-DONE exit=0" "
 check "forge: one real terminal RC line"  '[ "$(rc_count)" = "1" ] && ! grep -q "^JOUST-RC 00 ok" "$WS/_codex_run.log"'
 rm -rf "$WS"
 
+# security-sweep L5 (structural): in exec mode the sandbox/approval/mcp policy flags MUST come after
+# $FLAG so a caller-supplied flag can never override policy (codex takes the last -s/-c occurrence).
+EXECBLK=$(awk '/codex exec \\/{f=1} f{print} /_brief.txt.*dev\/null 2>&1/{if(f)exit}' "$RUNNER")
+FLAG_LN=$(printf '%s\n' "$EXECBLK" | grep -n '\$FLAG' | head -1 | cut -d: -f1)
+POL_LN=$(printf '%s\n' "$EXECBLK" | grep -n -- '-s workspace-write' | head -1 | cut -d: -f1)
+check "L5: exec \$FLAG before -s policy flag" '[ -n "$FLAG_LN" ] && [ -n "$POL_LN" ] && [ "$FLAG_LN" -lt "$POL_LN" ]'
+check "L5: exec approval_policy after \$FLAG" 'AP=$(printf "%s\n" "$EXECBLK" | grep -n "approval_policy" | head -1 | cut -d: -f1); [ -n "$AP" ] && [ "$FLAG_LN" -lt "$AP" ]'
+
 echo "== $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

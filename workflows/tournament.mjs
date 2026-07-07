@@ -1751,10 +1751,19 @@ async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
       // an unquoted $cites — re-emit through $(printf), which BOTH bash and zsh field-split.
       `n=0; m=0; top=$(git rev-parse --show-toplevel 2>/dev/null); ` +
       `for p in $(printf '%s\\n' "$cites"); do n=$((n+1)); ok=0; ` +
-        `if [ -e "$p" ]; then ok=1; ` +
-        `elif [ -n "$top" ] && [ -e "$top/$p" ]; then ok=1; ` +
-        `elif [ -n "$top" ] && [ -n "$base" ] && git -C "$top" cat-file -e "$base:$p" >/dev/null 2>&1; then ok=1; ` +
-        `elif [ -n "$ctx" ] && grep -qF -- "$p" "$ctx" 2>/dev/null; then ok=1; fi; ` +
+        // security-sweep M1: a citation is verifiable ONLY inside the pinned snapshot scope. An
+        // ABSOLUTE path (/etc/hosts) or a `..` path SEGMENT escapes that scope, so it earns NO
+        // verified credit — it is still counted as cited (n), never as verified (m). This blocks a
+        // candidate inflating its evidence stamp by citing a real out-of-snapshot file. Guard first,
+        // so the resolution branches below only ever see in-scope relative paths.
+        `case "$p" in ` +
+          `/*|..|../*|*/..|*/../*) ok=0 ;; ` +          // absolute or a .. path segment -> out of scope, no credit
+          `*) ` +
+            `if [ -e "$p" ]; then ok=1; ` +
+            `elif [ -n "$top" ] && [ -e "$top/$p" ]; then ok=1; ` +
+            `elif [ -n "$top" ] && [ -n "$base" ] && git -C "$top" cat-file -e "$base:$p" >/dev/null 2>&1; then ok=1; ` +
+            `elif [ -n "$ctx" ] && grep -qF -- "$p" "$ctx" 2>/dev/null; then ok=1; fi ;; ` +
+        `esac; ` +
         `[ "$ok" -eq 1 ] && m=$((m+1)); ` +
       `done; ` +
       `printf 'EVIDENCE: %s cited, %s verified\\n' "$n" "$m" > "$ev"; ` +
@@ -2154,6 +2163,19 @@ function parseCodexReviewDump(rawDump) {
   if (!/^RANKING:/m.test(report)) return { ok: false, reason: 'codex review judge: report has no explicit RANKING: line' }
   if (!/^VOTE:/m.test(report)) return { ok: false, reason: 'codex review judge: report has no explicit VOTE: line' }
   return { ok: true, report }
+}
+// security-sweep L2 (2026-07-07): the set of candidate letters the SECURITY report flagged UNSAFE,
+// derived DETERMINISTICALLY from the verbatim (sha-verified) report — the ground truth the sonnet
+// reformatter must not silently drop. A veto is the highest-stakes exclusion; validating only the
+// flags the reformatter KEPT can never catch a MISSING one, so the engine re-derives the UNSAFE set
+// here and fails closed if the reformatted verdict lost any. PURE (extract-and-eval'able). Matches
+// the prompt's "SAFETY <letter>: UNSAFE ..." grammar; SAFE lines and prose are ignored. Uppercased.
+function codexReportUnsafeLabels(reportText) {
+  const out = new Set()
+  const re = /^\s*SAFETY\s+([A-Za-z])\s*:\s*UNSAFE\b/gim
+  let m
+  while ((m = re.exec(String(reportText == null ? '' : reportText)))) out.add(m[1].toUpperCase())
+  return out
 }
 // checks_run is exec-mode honesty telemetry (commands the agentic session ran); the review preset's
 // evidence discipline lives in the report's inline quotes instead. The verdict still needs the field
@@ -2557,6 +2579,19 @@ async function askLensCodex(lens, blindList, poolPath, phaseTitle, label, roundN
         { model: HELPER_MODEL, schema: CODEX_REVIEW_VERDICT_SCHEMA, phase: phaseTitle, label: `${label}-codex-reformat` }
       )
       if (!fmt || fmt.found !== true) throw new Error('codex review judge: reformatter reported no traceable RANKING/VOTE in the report')
+      // security-sweep L2 (2026-07-07): fail closed if the reformat DROPPED any UNSAFE flag present in
+      // the verbatim (sha-verified) report. The reformatter is a sonnet helper; a lost SAFETY line
+      // would silently strip a security VETO, and the downstream shape/integrity guards only inspect
+      // the flags that SURVIVED — they cannot see a missing one. Re-derive the report's UNSAFE set and
+      // require the reformatted safety array to preserve every one (throw -> retry -> opus fallback).
+      if (isSecurityLens(lens.key)) {
+        const reportUnsafe = codexReportUnsafeLabels(parsedResult.report)
+        const keptUnsafe = new Set((Array.isArray(fmt.safety) ? fmt.safety : [])
+          .filter(s => s && s.safety === 'UNSAFE')
+          .map(s => String(s.label == null ? '' : s.label).trim().charAt(0).toUpperCase()))
+        const dropped = [...reportUnsafe].filter(l => !keptUnsafe.has(l))
+        if (dropped.length) throw new Error(`codex security reformat DROPPED UNSAFE flag(s) present in the verbatim report: ${dropped.join(', ')} — failing closed (a veto must never be lost in reformat)`)
+      }
       const verdict = {
         lens: lens.key,
         candidates: fmt.candidates, ranking: fmt.ranking, vote: fmt.vote, reasoning: fmt.reasoning,
@@ -3303,10 +3338,15 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
         steelmanMeta.adopt_verified = adoptVerified
         if (!adoptVerified) log(`JE-STEELMAN-ADOPT-UNVERIFIED [${label}]: the boosted winner's staged copy did NOT verify against its source (${am ? 'hash mismatch' : 'no fingerprint returned'}); downstream may read the pre-boost artifact — the winner determination is unaffected. Boosted content is intact at ${winEntry.ws}.`)
       }
-    } else if (iter < maxIters) {
-      // tie -> iterate: next boosts are gated versions of THIS round (ratchet forward on gate pass)
+    } else {
+      // tie -> ratchet forward: currentWs advances to THIS round's gated boosted versions. variant
+      // 'boosted' means it PASSED the mechanical gate above; 'ratchet'/'mechrepair' reverts keep their
+      // prior gated ws. security-sweep M13 (2026-07-07): ratchet on EVERY tied iteration INCLUDING the
+      // last — the old `iter < maxIters` guard skipped the final ratchet, so a tie that exhausted the
+      // loop handed the orchestrator needs_orchestrator_pick.gated_ws pointing at the SECOND-TO-LAST
+      // round's artifacts, silently one improvement pass stale (never ungated, just not the latest).
       for (const c of stagedR) if (c.variant === 'boosted') currentWs[c.orig] = c.ws
-      log(`council ${label}: STEELMAN runoff i${iter} tied (${Object.keys(rt.votes).sort().map(k => `${k}:${rt.votes[k]}`).join(', ') || 'no votes'}); iterating.`)
+      if (iter < maxIters) log(`council ${label}: STEELMAN runoff i${iter} tied (${Object.keys(rt.votes).sort().map(k => `${k}:${rt.votes[k]}`).join(', ') || 'no votes'}); iterating.`)
     }
   }
 

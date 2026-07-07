@@ -159,6 +159,22 @@ test('record twice + duplicate skip; report contains expected rows', () => {
   assert.match(md, /Insufficient data for any hypothesis \(need n>=5 per row\)\./)
 })
 
+// security-sweep L10: record() serializes the read-check-append under a best-effort exclusive lock
+// and must leave no lockfile behind; a STALE lock (older than the budget) must not wedge the ledger.
+test('L10: record leaves no lockfile; a stale lock is broken and record still succeeds', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'je-ledger-lock-'))
+  const ledger = join(dir, 'ledger.jsonl')
+  // seed a STALE lock (mtime far in the past) — record must break it, not hang or fail
+  const lock = ledger + '.lock'
+  writeFileSync(lock, '')
+  const old = new Date(Date.now() - 60000)
+  utimesSync(lock, old, old)
+  const r = record(runA, ledger)
+  assert.equal(r.skipped, false, 'record proceeds despite the stale lock')
+  assert.equal(existsSync(lock), false, 'lockfile is released after record')
+  assert.equal(readFileSync(ledger, 'utf8').trim().split('\n').length, 1)
+})
+
 test('reportMd: empty ledger says how to record', () => {
   assert.match(reportMd([]), /No runs recorded yet/)
 })

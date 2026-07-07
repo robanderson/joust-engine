@@ -64,15 +64,20 @@ run_try() {
         review \
         "$(cat _brief.txt)" </dev/null > "$REPORT" 2> >(perl -pe "$JE_DEFANG" >> "$LOG")
   else
+    # security-sweep L5 (2026-07-07): the sandbox/approval/mcp policy flags go LAST — AFTER $FLAG —
+    # because codex takes the LAST occurrence of a repeated -s / -c key. If a caller-supplied $FLAG
+    # ever carried `-s danger-full-access` or `-c approval_policy=on-request`, an EARLIER policy flag
+    # would be silently overridden; placing policy last makes it un-overridable. (The brief positional
+    # stays last of all — it is the prompt.)
     run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
       codex exec \
-        -s workspace-write \
         -C "$PWD" \
         --skip-git-repo-check \
-        -c approval_policy="never" \
-        -c 'mcp_servers={}' \
         -o "$LAST" \
         $FLAG \
+        -s workspace-write \
+        -c approval_policy="never" \
+        -c 'mcp_servers={}' \
         "$(cat _brief.txt)" </dev/null 2>&1 | perl -pe "$JE_DEFANG" >> "$LOG"
   fi
 }

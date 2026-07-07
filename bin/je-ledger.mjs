@@ -27,7 +27,7 @@
 // Every report row carries its sample size (n=…); hypotheses need n — nothing is phrased
 // as a recommendation below n>=5, and even then only as a hypothesis.
 
-import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync } from 'node:fs'
+import { readFileSync, appendFileSync, mkdirSync, existsSync, statSync, openSync, closeSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -220,14 +220,43 @@ export function readLedger(path) {
   return [...byRun.values()]
 }
 
+// security-sweep L10 (2026-07-07): the dup-check + append below is a read-check-append TOCTOU — two
+// concurrent recorders could both pass the dup-check and double-append (a ledger line can exceed the
+// PIPE_BUF atomic-append size, so O_APPEND alone doesn't serialize them). Serialize with a best-effort
+// exclusive lockfile (O_EXCL create): the holder does the whole read-check-append, then releases. It
+// FAILS SAFE — if the lock can't be taken within the budget (a stale/held lock) we proceed anyway, so
+// telemetry recording never HANGS; the worst case degrades to today's behavior (a possible dup line),
+// which readLedger already collapses (dedupe by run name, last-wins). A stale lock older than the
+// budget is broken so a crashed recorder can't wedge the ledger forever.
+function withLedgerLock(path, fn) {
+  const lock = path + '.lock'
+  const STALE_MS = 10000
+  let fd = null
+  for (let i = 0; i < 50; i++) {
+    try { fd = openSync(lock, 'wx'); break } // atomic exclusive create — only one winner
+    catch (e) {
+      if (e && e.code === 'EEXIST') {
+        try { if (Date.now() - statSync(lock).mtimeMs > STALE_MS) { unlinkSync(lock); continue } } catch { /* raced away */ }
+        // brief spin (no async in this sync tool); ~50 * a few statSync ops bounds the wait
+        continue
+      }
+      break // any other error (perm, missing dir): give up on locking, fall through unlocked
+    }
+  }
+  try { return fn() }
+  finally { if (fd !== null) { try { closeSync(fd) } catch { /* */ } try { unlinkSync(lock) } catch { /* */ } } }
+}
+
 export function record(runDir, path) {
   const rec = buildRecord(runDir)
-  if (readLedger(path).some((r) => r.run === rec.run)) {
-    return { rec, skipped: true }
-  }
   mkdirSync(dirname(path), { recursive: true })
-  appendFileSync(path, JSON.stringify(rec) + '\n')
-  return { rec, skipped: false }
+  return withLedgerLock(path, () => {
+    if (readLedger(path).some((r) => r.run === rec.run)) {
+      return { rec, skipped: true }
+    }
+    appendFileSync(path, JSON.stringify(rec) + '\n')
+    return { rec, skipped: false }
+  })
 }
 
 // ---------------------------------------------------------------------------
