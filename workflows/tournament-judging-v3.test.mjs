@@ -263,3 +263,30 @@ test('(structural) steelman winner adoption is rename-preserving — no deletion
   assert.ok(!seg.includes('-delete') && !seg.includes('rm -rf "$DEST"'), 'no delete pattern (harness safety classifier blocked find-delete+overwrite twice, live)')
   assert.ok(seg.includes('pre-steelman-i'), 'backup name records which steelman iteration was superseded')
 })
+
+// ---- security-sweep veto-severity (2026-07-07): UNSAFE fails CLOSED on missing/unknown severity ----
+const { councilTally } = new Function(
+  "const isSecurityLens = (key) => key === 'security' || key === 'security-x';\n" +
+  "const trimStr = s => String(s == null ? '' : s).trim();\n" +
+  "const JUNK_TOKENS = new Set(['placeholder','tbd','n/a','...']);\n" +
+  "const INTEGRITY = { MIN_VETO_EVIDENCE_CHARS: 12 };\n" +
+  sliceFn('vetoEvidenceIssue') + '\n' +
+  'const log = () => {};\n' + sliceFn('councilTally') + '\nreturn { councilTally };')()
+const sVerdict = (safety) => ({ lens: 'security', vote: 'A', ranking: ['A', 'B'], safety })
+const EV = 'file x.js:12 — concrete exploitable path, injected exec'
+
+test('veto stands on high/critical (unchanged)', () => {
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'high', evidence: EV }])]).vetoedSet.has('B'))
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'critical', evidence: EV }])]).vetoedSet.has('B'))
+})
+test('veto-severity: UNSAFE with MISSING severity now vetoes (fail-closed, was silently dropped)', () => {
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', evidence: EV }])]).vetoedSet.has('B'))
+})
+test('veto-severity: UNSAFE with a MISSPELLED severity now vetoes (fail-closed)', () => {
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'High', evidence: EV }])]).vetoedSet.has('B'))
+  assert.ok(councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'severe', evidence: EV }])]).vetoedSet.has('B'))
+})
+test('veto-severity: an EXPLICIT low tier is still not an exclusion', () => {
+  assert.ok(!councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'low', evidence: EV }])]).vetoedSet.has('B'))
+  assert.ok(!councilTally([sVerdict([{ label: 'B', safety: 'UNSAFE', severity: 'medium', evidence: EV }])]).vetoedSet.has('B'))
+})

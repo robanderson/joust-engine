@@ -2608,7 +2608,16 @@ function councilTally(verdicts) {
   for (const secV of secVs) {
     if (!Array.isArray(secV.safety)) continue
     for (const s of secV.safety) {
-      if (s && s.safety === 'UNSAFE' && (s.severity === 'high' || s.severity === 'critical')) {
+      // security-sweep veto-severity (2026-07-07): an UNSAFE flag used to VETO only on an EXACT
+      // 'high'/'critical' severity, so a MISSING or misspelled severity (the schema only requires
+      // label+safety) silently dropped the veto — fail-open. Now an UNSAFE flag STANDS as a veto
+      // unless its severity is EXPLICITLY a low tier (low/medium/info/none); an absent/unknown
+      // severity on an UNSAFE flag fails CLOSED (vetoes), so a malformed model verdict can't smuggle
+      // an unsafe candidate past the gate.
+      if (s && s.safety === 'UNSAFE') {
+        const sev = String(s.severity == null ? '' : s.severity).toLowerCase().trim()
+        const lowTier = sev === 'low' || sev === 'medium' || sev === 'info' || sev === 'informational' || sev === 'none'
+        if (lowTier) continue // explicitly low-severity UNSAFE: not an exclusion (as before)
         // Highest-stakes exclusion path: don't let a vacuous-but-schema-valid evidence string stand as a
         // veto (EV-judge-placeholder.md class of failure). A rejected veto does NOT kill the security
         // lens's other votes/ranking — only this one flag is disregarded, so a real veto on another
@@ -2969,7 +2978,10 @@ function aspectSteelmanContext(aspects, finalists) {
     const rejected = (aspects.by_aspect || [])
       .map(a => ({ aspect: a.aspect, v: Array.isArray(a.votes) ? a.votes.find(x => x && x.label === f) : null }))
       .filter(x => x.v && x.v.approve === false)
-      .map(x => `${x.aspect} ("${x.v.reason}")`)
+      // security-sweep M2 (2026-07-07): x.v.reason is MODEL-AUTHORED; interpolated raw, a newline or
+      // quote breaks out of the ("...") context block and injects instructions that steer the
+      // steelman/booster. Collapse newlines and neutralise quotes before embedding.
+      .map(x => `${x.aspect} ("${String(x.v.reason == null ? '' : x.v.reason).replace(/[\r\n]+/g, ' ').replace(/["`]/g, "'").slice(0, 300)}")`)
     return `- Candidate ${f}: ${aspects.approvals[f] ?? 0} of ${(aspects.by_aspect || []).length} aspects approved${rejected.length ? `; rejected by ${rejected.join('; ')}` : ''}`
   })
   return `\n\nASPECT VERIFIER RESULTS (independent cheap binary checks; CONTEXT ONLY — they are not judges, cast no votes, and never pick winners; use a rejection reason only where it corroborates a judge-cited con):\n${lines.join('\n')}`
@@ -3202,6 +3214,17 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
     })
     const rVerdicts = rRaw.filter(Boolean)
     if (!rVerdicts.length) { log(`steelman ${label} i${iter}: all runoff judges died — ending loop on seed result.`); break }
+    // security-sweep H12 (2026-07-07): the runoff must apply the SAME security-dead fail-closed policy
+    // as round 1 (line ~3081). If the primary security lens produced no runoff verdict, veto coverage
+    // is lost for the boosted finalists; in repoMode that is unresolvable → NO_CONSENSUS (needs-human),
+    // never a crown without a security gate. (Non-repo isolated runs warn and proceed, as round 1 does.)
+    if (!rVerdicts.some(v => v.lens === 'security')) {
+      if (repoMode) {
+        log(`council ${label}: SECURITY lens dead in the steelman runoff (repoMode) — veto coverage unresolvable; failing closed to NO_CONSENSUS.`)
+        return attachAspects(buildCouncilResult({ winner: null, verdicts, roundsLog, labels, lenses, no_consensus: true, humanReason: 'security judge unavailable in the steelman runoff (repo mode) — veto coverage lost (fail-closed)' }))
+      }
+      log(`JE-COUNCIL-WARNING [${phaseTitle}]: security lens dead in the steelman runoff — veto coverage LOST for this isolated run; proceeding WITHOUT a runoff security veto.`)
+    }
     const rt = councilTally(rVerdicts)
     const origOf = (blind) => { const e = stagedR.find(c => c.blind === blind); return e ? e.orig : null }
     const mapVerdict = v => ({ ...v, vote: origOf(v.vote) || v.vote })
@@ -3241,8 +3264,18 @@ async function councilJudge(kind, blindList, guidanceWanted, poolPath, phaseTitl
         // staged slot. The old find-delete+overwrite form was blocked by the harness safety
         // classifier in auto mode (twice, live), which left the staged winner UN-boosted; a
         // rename keeps every byte recoverable and gives the runDir a free audit trail.
-        await agentLadder(`Joust-engine staging step: the council's steelman pass produced an improved copy of the winning candidate; adopt it into the staged slot by RENAMING the current copy aside as an audit backup and copying the improved version in (nothing is deleted; both paths are engine-managed scratch dirs inside this run's staging area). Run in ONE Bash call: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; BAK="$DEST.pre-steelman-i${iter}"; [ -e "$BAK" ] && BAK="$BAK.$$"; mv "$DEST" "$BAK"; mkdir -p "$DEST"; cp -R "$SRC"/. "$DEST"/; echo done. Then reply "done".`,
-          { model: HELPER_MODEL, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`))
+        // security-sweep H13 (2026-07-07): the adopt copy is delegated to a helper. The old code
+        // swallowed the .catch and never CONFIRMED the copy landed, so a skipped/partial copy shipped
+        // the STALE pre-boost artifact while the result reported the boosted one won. The command now
+        // emits a content fingerprint of SRC and DEST after the copy; the engine compares them and, on
+        // mismatch/failure, records adopt_verified:false in steelmanMeta (auditable) — the WINNER
+        // determination is unaffected (correct either way; the staged copy is what may be stale).
+        const adoptRaw = await agentLadder(`Joust-engine staging step: the council's steelman pass produced an improved copy of the winning candidate; adopt it into the staged slot by RENAMING the current copy aside as an audit backup and copying the improved version in (nothing is deleted; both paths are engine-managed scratch dirs inside this run's staging area). Run in ONE Bash call and return its stdout VERBATIM in the "raw" field: SRC=${q(winEntry.ws)}; DEST=${q(`${reviewDir}/${finalWinner}`)}; BAK="$DEST.pre-steelman-i${iter}"; [ -e "$BAK" ] && BAK="$BAK.$$"; mv "$DEST" "$BAK" && mkdir -p "$DEST" && cp -R "$SRC"/. "$DEST"/; h(){ cd "$1" 2>/dev/null && find . -type f ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | sort | shasum -a 256 2>/dev/null | cut -d' ' -f1; }; echo "JADOPT src=$(h "$SRC") dest=$(h "$DEST")"`,
+          { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: phaseTitle, label: `${label}-adopt-boost` }).catch(e => { log(`steelman ${label}: winner-adoption copy failed (${String(e).slice(0, 100)}) — the winning content remains at ${winEntry.ws}`); return null })
+        const am = ((adoptRaw && adoptRaw.raw) || '').match(/JADOPT src=([0-9a-f]{64}) dest=([0-9a-f]{64})/)
+        const adoptVerified = !!(am && am[1] === am[2])
+        steelmanMeta.adopt_verified = adoptVerified
+        if (!adoptVerified) log(`JE-STEELMAN-ADOPT-UNVERIFIED [${label}]: the boosted winner's staged copy did NOT verify against its source (${am ? 'hash mismatch' : 'no fingerprint returned'}); downstream may read the pre-boost artifact — the winner determination is unaffected. Boosted content is intact at ${winEntry.ws}.`)
       }
     } else if (iter < maxIters) {
       // tie -> iterate: next boosts are gated versions of THIS round (ratchet forward on gate pass)
@@ -3347,19 +3380,25 @@ function councilTallyMd(council) {
 // genericise a failReason for the BLIND summary so a provider-specific failure can't re-identify a model
 const blindFail = r => r ? 'excluded (did not pass validation)' : r
 
+// security-sweep M3 (2026-07-07): reasoning/pros/cons are MODEL-AUTHORED and rendered into verdict.md
+// as markdown. A candidate-influenced judge could embed `## Winner` / `**VETO**` / a table to SPOOF
+// the engine-written sections a human reads. Defang model text before rendering: collapse newlines
+// (no new block), strip leading markdown structural chars (#>|`*-+ so it can't open a heading/quote/
+// table/fence/list), and cap length. The engine's own labels/headers are written directly, unescaped.
+const mdSafe = (s) => String(s == null ? '' : s).replace(/[\r\n]+/g, ' ').replace(/^[\s#>|`*+-]+/, '').replace(/[`]/g, "'").slice(0, 4000)
 // verdict object (blind, letters only): { candidates:[{label,pros,cons}], ranking, winner, reasoning, guidance? }
 function verdictToMd(v, title) {
   // Council NO_CONSENSUS carries winner:null — render it as a HALT banner, never a fake "Candidate ".
   const winnerLine = (v.no_consensus || !v.winner) ? '**Winner:** NO CONSENSUS (routed to human review)' : `**Winner:** Candidate ${v.winner}`
   const L = [`# ${title}`, '', winnerLine, '',
     `**Ranking (best first):** ${(v.ranking || []).map(r => `Candidate ${r}`).join(' > ')}`, '',
-    '## Reasoning', '', v.reasoning || '_(none given)_', '', '## Per-candidate', '']
+    '## Reasoning', '', v.reasoning ? mdSafe(v.reasoning) : '_(none given)_', '', '## Per-candidate', '']
   for (const c of (v.candidates || [])) {
     L.push(`### Candidate ${c.label}`, '', '**Pros**')
-    for (const p of (c.pros || [])) L.push(`- ${p}`)
+    for (const p of (c.pros || [])) L.push(`- ${mdSafe(p)}`)
     if (!(c.pros || []).length) L.push('- _(none)_')
     L.push('', '**Cons**')
-    for (const x of (c.cons || [])) L.push(`- ${x}`)
+    for (const x of (c.cons || [])) L.push(`- ${mdSafe(x)}`)
     if (!(c.cons || []).length) L.push('- _(none)_')
     L.push('')
   }
