@@ -48,6 +48,18 @@ const { task, runDir, attempts } = A
 if (!Array.isArray(attempts) || attempts.length === 0) {
   return { error: 'no attempts provided', argsType: typeof args, keys: Object.keys(A || {}) }
 }
+// security-sweep M14 (2026-07-07): attempt `label`s are joined RAW into workspace/worktree/staging
+// paths (scratchPath/worktreePath: `${root}/${roundName}/${label}`). A label containing `../` or a
+// leading `/` escapes the intended root (shell quoting stops injection, not traversal), letting a
+// worker's _brief.txt / logs / staging reads target attacker-chosen locations. Require every label to
+// be a simple filename token BEFORE any path is built from it — reject the whole run otherwise.
+{
+  const okLabel = (l) => typeof l === 'string' && /^[A-Za-z0-9._-]+$/.test(l) && l !== '.' && l !== '..'
+  const badAttempt = (A.attempts || []).concat(A.implementAttempts || []).find(a => a && !okLabel(a.label))
+  if (badAttempt) {
+    return { error: `unsafe attempt label ${JSON.stringify(badAttempt.label)} — labels must match [A-Za-z0-9._-]+ (path-traversal guard)`, keys: Object.keys(A || {}) }
+  }
+}
 // ---- Plan/Implement round split (2026-07-03) ----------------------------------------------
 // `attempts` seat the PLAN phase (Plan Round 1 + Plan Round 2). `implement` (default off) gates
 // the IMPLEMENT phase (Implement Round 3, + Round 4 only if R3 yields no gate-passing candidate).
@@ -326,7 +338,12 @@ const codexJudgeTimeout = Number(A.codexJudgeTimeoutSecs) > 0 ? Math.floor(Numbe
 // grokMaxTurns (default = glm's 30) as the primary iteration cap + grokTimeout as the wall-clock backstop.
 const grokMaxTurns = Number(A.grokMaxTurns) > 0 ? Math.floor(Number(A.grokMaxTurns)) : glmMaxTurns
 const grokTimeout = Number(A.grokTimeoutSecs) > 0 ? Math.floor(Number(A.grokTimeoutSecs)) : 600
-const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
+// security-sweep L1 (2026-07-07): the per-attempt workspace lives under a predictable, world-writable
+// `/tmp/je-workspaces/<runId>` root (guessable), and `mkdir -p`/`cd` FOLLOW symlinks — so a local
+// co-tenant who pre-plants the guessed path as a symlink can redirect a worker's writes (and the
+// deliverable that later feeds the judged/applied pool) outside the workspace. Refuse a symlinked
+// workspace path before writing (mirrors the contextCatCmd `[ ! -L ]` guard added for issue #23).
+const cmdHead = (ws, b) => `[ -L ${q(ws)} ] && { echo "JE-WS-REFUSE ${q(ws)} is a symlink" >&2; exit 3; }; mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
 // DETACHED LAUNCH (2026-07-06, run-i glm post-mortem): the runner command is no longer executed
 // inside one long wrapper Bash call — a foreground tool call is CAPPED (~600s) below the runner
 // wall-clocks (glm 1200s), and a run_in_background task is reaped when the wrapper agent's turn
@@ -3657,7 +3674,11 @@ async function persist(pairs, phaseTitle) {
     if (f.derive && allowDerive && PLUGIN_BIN) {
       delete expected[f.path]
       const extra = f.derive.title ? ` ${q(f.derive.title)}` : ''
-      return `mkdir -p ${q(dir)} && node ${q(`${PLUGIN_BIN}/je-render.mjs`)} ${q(f.derive.mode)} ${q(f.derive.from)} ${q(f.path)}${extra}; ${report}`
+      // security-sweep M17 (2026-07-07): a derived write is only bytes>0-verified (no sha). The old
+      // `; ${report}` ran the report REGARDLESS of render success, so a FAILED render that left a
+      // STALE non-empty target from a prior write was accepted as fresh. Remove any existing target
+      // first, so a failed render reports bytes=0 → a verified miss → retry as typed content.
+      return `mkdir -p ${q(dir)} && rm -f ${q(f.path)} 2>/dev/null; node ${q(`${PLUGIN_BIN}/je-render.mjs`)} ${q(f.derive.mode)} ${q(f.derive.from)} ${q(f.path)}${extra}; ${report}`
     }
     if (f.content == null) return `printf 'FLP %s 0 none\\n' ${q(f.path)}` // derive-only entry with no bin dir: report the miss honestly
     const body = heredocBody(f.content)
@@ -4314,7 +4335,10 @@ async function heartbeat(phaseLabel, opts = {}) {
 
 async function readRunState() {
   try {
-    const cmd = `cat ${q(RUN_STATE_PATH)} 2>/dev/null || true`
+    // security-sweep M21 (2026-07-07): refuse to cat run-state.json through a SYMLINK — resume reads
+    // and trusts this file to decide reuse; a pre-planted symlink could feed it arbitrary content
+    // (the config-fingerprint gate still refuses reuse on drift, but don't read through the link).
+    const cmd = `[ -L ${q(RUN_STATE_PATH)} ] || cat ${q(RUN_STATE_PATH)} 2>/dev/null || true`
     const res = await agentLadder(`Run this exact shell command in ONE Bash call and return its stdout VERBATIM in the "raw" field. Do nothing else:\n\n${cmd}`,
       { model: HELPER_MODEL, schema: RUN_STATE_DUMP_SCHEMA, phase: 'Round 1', label: 'read-run-state' }).catch(() => null)
     const raw = res && typeof res.raw === 'string' ? res.raw : ''
