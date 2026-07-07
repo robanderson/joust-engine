@@ -1,5 +1,5 @@
 {
-  "$comment": "Brand map for bin/rebrand.mjs. Generates a renamed, coexisting copy of this plugin (the '@@DE Development Engine' channel) into a gitignored out-dir. The canonical source is NEVER modified. See docs/gitea-github-pipeline.md and the plan. Replacements are LITERAL (not regex), applied IN ORDER, globally. Tokens are disjoint so order is not load-bearing, but more-specific tokens are listed first for safety.",
+  "$comment": "Brand map for bin/rebrand.mjs. Generates a renamed, coexisting copy of this plugin (the '@@DE Development Engine' channel) into a gitignored out-dir. The canonical source is NEVER modified. Replacements are LITERAL (not regex), applied IN ORDER, globally. Tokens are disjoint so order is not load-bearing, but more-specific tokens are listed first for safety.",
   "brand": {
     "name": "Development Engine",
     "plugin": "development-engine",

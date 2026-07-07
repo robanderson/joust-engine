@@ -20,7 +20,7 @@ jobs:
       - name: Configure git identity (je-git.test.sh creates temp repos & commits)
         run: |
           git config --global user.name  "ci-rebrand"
-          git config --global user.email "ci-rebrand@git.1hut.com"
+          git config --global user.email "ci-rebrand@noreply.invalid"
           git config --global init.defaultBranch main
       - name: Generate + self-verify the dev-channel rebrand
         run: node bin/rebrand.mjs --out /tmp/de-check
