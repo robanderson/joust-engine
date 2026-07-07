@@ -451,6 +451,24 @@ function perlAlarmArgv(timeoutSecs, cmdArgv) {
   return ['-e', PERL, String(timeoutSecs), ...cmdArgv]
 }
 
+// security-sweep H2 (2026-07-07): bench children (esp. codex/grok, which have agentic tools)
+// inherited the FULL process.env — every provider key + forge/cloud secret. Mirror the runner-lib
+// je_scrub_child_secrets: return process.env with every known secret name removed, so a benched
+// agentic child cannot exfiltrate cross-provider/forge/cloud creds. Each provider dispatch adds
+// back ONLY the one auth var it needs.
+const BENCH_SECRET_KEYS = [
+  'ZAI_API_KEY', 'MINIMAX_API_KEY', 'OMLX_AUTH_TOKEN', 'OPENAI_API_KEY', 'XAI_API_KEY', 'ANTHROPIC_API_KEY',
+  'GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_PAT', 'GH_ENTERPRISE_TOKEN',
+  'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS', 'GCP_SA_KEY', 'GCLOUD_SERVICE_KEY',
+  'NPM_TOKEN', 'NODE_AUTH_TOKEN', 'SSH_AUTH_SOCK', 'CLOUDFLARE_API_TOKEN', 'DIGITALOCEAN_TOKEN',
+]
+function scrubbedEnv() {
+  const e = { ...process.env }
+  for (const k of BENCH_SECRET_KEYS) delete e[k]
+  return e
+}
+
 // Run a claude-family call (anthropic/glm/minimax) and time JUST this call.
 // env: the provider-specific ANTHROPIC_* env (auth, base url, default models).
 // flagArgv: extra `claude` args (e.g. ['--model','opus']) — [] for minimax.
@@ -466,8 +484,8 @@ function runClaudeFamily({ env, flagArgv, timeoutSecs, cfg }) {
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['claude', ...claudeArgs])
   const fullEnv = {
-    ...process.env,
-    ...env,
+    ...scrubbedEnv(),          // security-sweep H2: base env with all secrets stripped
+    ...env,                    // provider ANTHROPIC_* (auth/base-url/models) added back explicitly
     // SOFT output cap for claude-family (no --max-tokens flag exists). MUST be
     // >= 1024 or an extended-thinking model rejects the request with a 400 (the
     // root cause of D-0005's haiku failure); profile caps are 2048 / 8192.
@@ -581,7 +599,8 @@ function dispatchCodex(target, timeoutSecs, cfg) {
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['codex', ...codexArgs])
   const t0 = Date.now()
-  const r = spawnSync('perl', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
+  // security-sweep H2: codex authenticates from ~/.codex/auth.json — give it a secret-scrubbed env.
+  const r = spawnSync('perl', argv, { env: scrubbedEnv(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
   if (r.status === 124) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
   const out = (r.stdout || '')
@@ -661,7 +680,11 @@ function dispatchGrok(target, timeoutSecs, cfg) {
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['grok', ...grokArgs])
   const t0 = Date.now()
-  const r = spawnSync('perl', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
+  // security-sweep H2: grok resolves its own credential (OAuth session or XAI_API_KEY); give it a
+  // secret-scrubbed env but ADD BACK its own XAI key if the operator set one.
+  const grokEnv = scrubbedEnv()
+  if (process.env.XAI_API_KEY) grokEnv.XAI_API_KEY = process.env.XAI_API_KEY
+  const r = spawnSync('perl', argv, { env: grokEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
   if (r.status === 124) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
   const out = (r.stdout || '')
