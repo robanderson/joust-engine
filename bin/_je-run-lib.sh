@@ -9,6 +9,15 @@
 : "${PROV:?_je-run-lib.sh: PROV must be set before sourcing}"
 : "${LOG:?_je-run-lib.sh: LOG must be set before sourcing}"
 
+# security-sweep M7/H18/H19 (2026-07-07): the runner writes trust markers (PROVENANCE / DONE / RC) to
+# $LOG and, in review mode, the report to $REPORT — both in a workspace a model can pre-populate. If
+# either is a pre-planted SYMLINK, the runner's own writes (and restamps) follow it OUTSIDE the
+# workspace, clobbering an arbitrary file. Remove any symlink at these paths up front so every runner
+# write lands on a fresh regular file it owns. Call je_unlink_symlink for any workspace path opened
+# for writing.
+je_unlink_symlink() { [ -L "$1" ] && rm -f "$1"; return 0; }
+je_unlink_symlink "$LOG"
+
 # security-sweep H1 (2026-07-07): every runner launches `claude`/`codex` in acceptEdits with a Bash
 # tool, so a prompt-injected attempt can `echo $SOME_KEY` / `env` and exfiltrate any credential the
 # child inherits into its own (pooled, logged) output. The child needs exactly ONE auth token; it

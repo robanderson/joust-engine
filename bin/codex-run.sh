@@ -43,7 +43,18 @@ REPORT=_review_report.md
 
 # Headless codex exec policy (all VERIFIED on codex-cli 0.139.0). </dev/null pins codex's stdin so it
 # never blocks reading additional input; $FLAG is unquoted so the shell word-splits it into argv.
+# security-sweep H11/H19 (2026-07-07): the codex CHILD's stdout/stderr is appended to $LOG, which
+# carries the runner's own line-anchored ^JOUST- trust markers. In exec mode the child runs the
+# (possibly untrusted) attempt task and could emit a forged `JOUST-CODEX-DONE exit=0` / `JOUST-RC 00`
+# line to fake success. Pipe the child stream through an UNBUFFERED defang that indents any line
+# beginning `JOUST-` so it can never match `^JOUST-` — the runner's markers (written directly by
+# finish()/echo, not through this pipe) stay at column 0 and remain the only trustworthy ones. `pipefail`
+# (set at the top of every runner) preserves the watchdog/child exit code through the pipe; the defang
+# writes to $LOG so the stall watchdog still sees real growth. Existing mitigations (gate reads RC via
+# tail -n1; provenance written unconditionally) already blunted this — this closes the residual.
+JE_DEFANG='BEGIN{$|=1} s/^(JOUST-)/ $1/'
 run_try() {
+  je_unlink_symlink "$REPORT"
   if [ "$MODE" = review ]; then
     run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
       codex \
@@ -51,7 +62,7 @@ run_try() {
         -c approval_policy="never" \
         -c 'mcp_servers={}' \
         review \
-        "$(cat _brief.txt)" </dev/null > "$REPORT" 2>> "$LOG"
+        "$(cat _brief.txt)" </dev/null > "$REPORT" 2> >(perl -pe "$JE_DEFANG" >> "$LOG")
   else
     run_watchdog_perl "$TIMEOUT" "$STALL" "$LOG" \
       codex exec \
@@ -62,7 +73,7 @@ run_try() {
         -c 'mcp_servers={}' \
         -o "$LAST" \
         $FLAG \
-        "$(cat _brief.txt)" </dev/null >> "$LOG" 2>&1
+        "$(cat _brief.txt)" </dev/null 2>&1 | perl -pe "$JE_DEFANG" >> "$LOG"
   fi
 }
 

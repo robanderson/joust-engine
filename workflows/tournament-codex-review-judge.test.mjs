@@ -109,7 +109,9 @@ test('codex-run.sh review mode: global flags, review subcommand, report to stdou
   assert.ok(i > 0, 'review branch exists')
   const branch = RUNNER.slice(i, RUNNER.indexOf('else', i))
   assert.ok(branch.includes('review \\'), 'uses the review subcommand')
-  assert.ok(branch.includes('> "$REPORT" 2>> "$LOG"'), 'report on stdout; session stream (stderr) is the liveness feed')
+  // security-sweep H11/H19: report on stdout ($REPORT), stderr session stream feeds $LOG THROUGH the
+  // JOUST- defang (so the codex child can't forge a column-0 trust marker into the watchdog log).
+  assert.ok(branch.includes('> "$REPORT" 2> >(perl -pe "$JE_DEFANG" >> "$LOG")'), 'report on stdout; stderr defanged into the log')
   assert.ok(!branch.includes('--skip-git-repo-check'), 'review runs in the staged scratch repo')
   const flagIdx = branch.indexOf('$FLAG'), revIdx = branch.indexOf('review \\')
   assert.ok(flagIdx > 0 && flagIdx < revIdx, 'model/effort flags are GLOBAL — `codex review` has no -m')
