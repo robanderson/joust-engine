@@ -4590,6 +4590,48 @@ if (mode === 'single') {
     { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode, n: N, unblind: false, r1mapping, r1review: review, resume: resumeSummary() }) },
     { path: `${runDir}/contributions.json`, content: json({ note: 'ESTIMATE — per-model attribution is a HEURISTIC, not ground truth. See workflows/tournament.mjs (computeContributions) for the exact formula. Forward-improvable.', mode, contributions }) },
   ], 'Review')
+  // Run depth (2026-07-07 fix): fast/default IMPLEMENT runs land HERE — c5722eb routes them to
+  // mode 'single' so the R1 review (a FINAL decision point: steelman included, winner gated and
+  // boosted) replaces the Round-2 rewrite. The implement phase must therefore hang off THIS path
+  // too, seeded with the R1 winner's brief; without it an implement+default run silently ended at
+  // the plan review (caught pre-dispatch on the first live default-depth implement invocation).
+  if (implement) {
+    const planWinner1 = blind1.find(c => c.blind === review.winner)
+    if (!planWinner1) {
+      await maybeFileEngineIssues('Review')
+      await heartbeat('done', { phaseComplete: 'final' })
+      return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions, no_consensus: false, error: 'implement requested but the review winner is not a valid staged candidate' }
+    }
+    const seedPlanPath = `${runDir}/_winning-plan/plan.md`
+    await bundlePlan(planWinner1.ws, seedPlanPath)
+    if (DYNAMIC_M_ON) {
+      const ev = await readConvergenceEvidence(dynamicMBucket)
+      const trimmed = trimSeatsForConvergence(implementSeats, ev)
+      if (trimmed.length < implementSeats.length) { log(`JE-DYNAMIC-M: trimming implementers ${implementSeats.length} -> ${trimmed.length}.`); implementSeats = trimmed }
+    }
+    // A/B briefs: runner-up = the R1 steelman's second seeded finalist (same source as two-pass).
+    let abInfo = null
+    if (AB_BRIEFS) {
+      const sm = review.council && review.council.steelman
+      const fin = (sm && Array.isArray(sm.seeds) && sm.seeds.length) ? sm.seeds : []
+      const ruLetter = fin.find(l => l !== review.winner) || null
+      const ru = ruLetter ? blind1.find(c => c.blind === ruLetter) : null
+      if (ru) {
+        const brief2Path = `${runDir}/_winning-plan/brief-2.md`
+        await bundlePlan(ru.ws, brief2Path)
+        implementSeats = assignAbSeeds(implementSeats, [seedPlanPath, brief2Path])
+        abInfo = { 'brief-1': review.winner, 'brief-2': ruLetter }
+      }
+    }
+    const impl = await implementPhase(seedPlanPath)
+    await persist([
+      { path: `${runDir}/implement.json`, content: json({ winningPlan: review.winner, ...(abInfo ? { ab: abInfo } : {}), ...impl }) },
+      { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, planWinner: review.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human }) },
+    ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+    await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+    await heartbeat('done', { phaseComplete: 'final' })
+    return { mode, n: N, implement: true, plan: { round1: { mapping: r1mapping, review }, winner: review.winner }, implementPhase: impl, contributions, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
+  }
   await maybeFileEngineIssues('Review')
   await heartbeat('done', { phaseComplete: 'final' })
   return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions }

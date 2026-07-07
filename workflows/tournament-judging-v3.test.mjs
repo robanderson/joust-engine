@@ -245,3 +245,12 @@ test('(structural) PLAN-point steelman + boost carry the altitude clamp — desi
   const boost = SRC.indexOf('apply a review-driven improvement pass to a COPY')
   assert.ok(SRC.slice(boost, boost + 2200).includes('isPlanPoint(phaseTitle)'), 'boost brief altitude-clamped at plan points')
 })
+
+test('(structural) implement+default-depth (mode single) still runs the implement phase off the R1 winner', () => {
+  const single = SRC.indexOf(`if (mode === 'single') {`)
+  const seg = SRC.slice(single, single + 4200)
+  assert.ok(seg.includes('if (implement) {'), 'single-mode path carries an implement branch (c5722eb routed fast/default implement runs here)')
+  assert.ok(seg.includes('bundlePlan(planWinner1.ws, seedPlanPath)'), 'seeded with the R1 review winner (steelman-boosted staged dir)')
+  assert.ok(seg.includes('await implementPhase(seedPlanPath)'), 'the same implement phase, R3 (+R4 on gate failure)')
+  assert.ok(seg.includes(`implement: true`) && seg.includes('implementWinner'), 'implement.json + mapping persisted like the two-pass hook')
+})
