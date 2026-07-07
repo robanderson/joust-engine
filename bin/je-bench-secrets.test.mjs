@@ -31,3 +31,15 @@ test('claude-family fullEnv starts from the scrubbed base, not raw process.env',
   assert.ok(SRC.includes('...scrubbedEnv(),'), 'fullEnv base is scrubbed')
   assert.ok(!/const fullEnv = \{\s*\n\s*\.\.\.process\.env,/.test(SRC), 'no raw ...process.env base for the child')
 })
+
+// security-sweep M9 (2026-07-07): the OMLX bearer token must go through a 0600 curl -K config file,
+// never `-H "Authorization: Bearer <tok>"` in argv (world-readable via ps / /proc cmdline).
+test('OMLX bearer never rides in curl argv — routed through a 0600 -K config file', () => {
+  assert.ok(SRC.includes('function curlAuthed('), 'curlAuthed helper exists')
+  assert.match(SRC, /writeFileSync\(cfg, [^\n]*Authorization: Bearer[^\n]*\{ mode: 0o600 \}\)/,
+    'header written to a 0600 config file')
+  assert.match(SRC, /spawnSync\('curl', \['-K', cfg, \.\.\.baseArgv\]/, 'curl consumes the header via -K')
+  assert.ok(SRC.includes('unlinkSync(cfg)'), 'config file is unlinked after use')
+  // No remaining `-H`/argv form of the Authorization header anywhere in the file.
+  assert.ok(!/'-H', `Authorization: Bearer/.test(SRC), 'no -H Authorization: Bearer in any curl argv')
+})

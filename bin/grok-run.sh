@@ -56,8 +56,11 @@ while :; do
   RC=$?
   # Defensive fail-closed auth/model/version force-fail (non-retryable). GUARDED on "no deliverable file
   # other than the engine files exists" (grok has no codex-style -o capture). Scanned against the fresh slice.
-  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qiE '401 Unauthorized|403 Forbidden|invalid api key|model .* (not found|unavailable)|session (expired|token expired)|requires a newer version of Grok' \
-     && ! find . -type f ! -name '_brief.txt' ! -name '_grok_run.log' | grep -q .; then
+  # security-sweep M6 (2026-07-07): an auth/model/version failure is TERMINAL regardless of any file
+  # the model may have created — the old `&& ! find <deliverable>` let a prompt-injected grok drop a
+  # decoy file to SUPPRESS the force-fail and pass a real auth failure off as success. Auth errors now
+  # force-fail unconditionally (they are unambiguous in the session stream).
+  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qiE '401 Unauthorized|403 Forbidden|invalid api key|model .* (not found|unavailable)|session (expired|token expired)|requires a newer version of Grok'; then
     echo "JOUST-GROK-ERROR grok reported a model/auth/version failure (see log)" >> "$LOG"
     [ "$RC" -eq 0 ] && RC=6
     finish DONE "exit=${RC}" 02 provider-auth-endpoint

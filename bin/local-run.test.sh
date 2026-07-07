@@ -64,10 +64,13 @@ check "missing-brief: one JOUST-RC" '[ "$(rc_count)" = "1" ]'
 check "missing-brief: JOUST-RC 07"  'grep -q "^JOUST-RC 07 " "$WS/_local_run.log"'
 rm -rf "$WS"
 
-# turn-cap -> 03
+# security-sweep M5: the plain-text "Reached max turns" is MODEL-INJECTABLE (task/candidate content
+# echoed to the log could forge it), so it is NO LONGER trusted as a turn-cap signal — only the
+# structured {"subtype":"error_max_turns"} result event is. A plain-text-only failure is now an
+# unclassified runner error (RC 09), not a turn-cap (03).
 mk_ws; run_runner FAKE_MODE=turncap; RC=$?
-check "turncap: one JOUST-RC"       '[ "$(rc_count)" = "1" ]'
-check "turncap: JOUST-RC 03"        'grep -q "^JOUST-RC 03 " "$WS/_local_run.log"'
+check "turncap-plaintext: one JOUST-RC"        '[ "$(rc_count)" = "1" ]'
+check "turncap-plaintext: RC 09 not 03 (M5)"   'grep -q "^JOUST-RC 09 " "$WS/_local_run.log" && ! grep -q "^JOUST-RC 03 " "$WS/_local_run.log"'
 rm -rf "$WS"
 
 # stream-json turn-cap: {"subtype":"error_max_turns"} result event (no plain "Reached max turns") -> 03

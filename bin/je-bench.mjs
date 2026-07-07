@@ -43,10 +43,29 @@
 // =============================================================================
 
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, appendFileSync, existsSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { mkdirSync, appendFileSync, existsSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs'
+import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+
+// security-sweep M9 (2026-07-07): the OMLX bearer token must NEVER ride in curl's argv — process
+// listings (`ps -ef`, /proc/<pid>/cmdline) are world-readable, so a co-tenant could scrape it. Write
+// the Authorization header to a 0600 curl config file consumed with -K, then unlink it. The config
+// file is only readable by our own uid for the ~milliseconds the request is in flight.
+function curlAuthed(baseArgv, bearer, spawnOpts) {
+  const dir = mkdtempSync(join(tmpdir(), 'je-bench-'))
+  const cfg = join(dir, 'curl.cfg')
+  // curl config: `header = "<value>"`. A bearer token is an opaque credential with no `"`/`\`/newline
+  // in any provider we support; strip those defensively so a malformed token can't break out of the
+  // quoted value or inject a second directive.
+  const safeBearer = String(bearer).replace(/["\\\r\n]/g, '')
+  writeFileSync(cfg, `header = "Authorization: Bearer ${safeBearer}"\n`, { mode: 0o600 })
+  try {
+    return spawnSync('curl', ['-K', cfg, ...baseArgv], spawnOpts)
+  } finally {
+    try { unlinkSync(cfg) } catch { /* best effort */ }
+  }
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const PLUGIN_ROOT = resolve(__dirname, '..')          // bin/.. = plugin root
@@ -268,11 +287,10 @@ const GROK_MODELS = [
 function discoverLocalModels() {
   const tok = process.env.OMLX_AUTH_TOKEN
   if (!tok) return { models: [], note: 'OMLX_AUTH_TOKEN unset — local discovery skipped (export in ~/.zshrc and relaunch)' }
-  const r = spawnSync('curl', [
+  const r = curlAuthed([
     '-s', '--max-time', '15',
     'http://127.0.0.1:8000/v1/models',
-    '-H', `Authorization: Bearer ${tok}`,
-  ], { encoding: 'utf8' })
+  ], tok, { encoding: 'utf8' })
   if (r.status !== 0 || !r.stdout) {
     return { models: [], note: `omlx server unreachable at 127.0.0.1:8000 (curl rc=${r.status}) — local discovery skipped` }
   }
@@ -559,11 +577,10 @@ function dispatchLocal(target, timeoutSecs, cfg) {
     '-s', '--max-time', String(timeoutSecs),
     'http://127.0.0.1:8000/v1/chat/completions',
     '-H', 'Content-Type: application/json',
-    '-H', `Authorization: Bearer ${tok}`,
     '-d', body,
   ]
   const t0 = Date.now()
-  const r = spawnSync('curl', curlArgv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
+  const r = curlAuthed(curlArgv, tok, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
   if (r.status !== 0) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `curl exit ${r.status} (omlx unreachable/timeout)` }
   let j

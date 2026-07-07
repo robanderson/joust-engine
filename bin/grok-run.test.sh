@@ -21,6 +21,7 @@ case "${FAKE_MODE:-ok}" in
   stallonce) if [ "$n" -ge 2 ]; then echo done; echo x>solution.py; exit 0; else echo boot; sleep 30; fi ;;
   hang)      sleep 30; exit 0 ;;
   scrub)     env > "$WS/child-env.txt"; echo x>solution.py; exit 0 ;;
+  authdecoy) echo "401 Unauthorized"; echo "print('decoy')" > solution.py; exit 0 ;;
 esac
 STUB
   chmod +x "$WS/stub/grok"
@@ -59,6 +60,14 @@ rm -rf "$WS"
 
 mk_ws; run_runner FAKE_MODE=scrub ANTHROPIC_API_KEY=leaked-test-key; RC=$?
 check "scrub: ANTHROPIC_API_KEY gone" '! grep -q "^ANTHROPIC_API_KEY=" "$WS/child-env.txt"'
+rm -rf "$WS"
+
+# security-sweep M6: an auth failure force-fails even when the model dropped a decoy deliverable file
+# (the old `&& ! find <deliverable>` let a prompt-injected grok suppress the force-fail by writing one).
+mk_ws; run_runner FAKE_MODE=authdecoy JE_STALL_SECS=30 JE_TIMEOUT_SECS=30; RC=$?
+check "authdecoy: nonzero exit"       '[ "$RC" -ne 0 ]'
+check "authdecoy: RC 02 (not 00)"     '[ "$(rc_count)" = "1" ] && grep -q "^JOUST-RC 02 " "$WS/_grok_run.log" && ! grep -q "^JOUST-RC 00 " "$WS/_grok_run.log"'
+check "authdecoy: GROK-ERROR emitted" 'grep -q "^JOUST-GROK-ERROR " "$WS/_grok_run.log"'
 rm -rf "$WS"
 
 echo "== $PASS passed, $FAIL failed =="

@@ -118,7 +118,7 @@ while :; do
   # stream-json signals turn-cap as {"type":"result","subtype":"error_max_turns",...} — the plain
   # "Reached max turns" text is GONE (verified live, CLI 2.1.201); keep both patterns. The quoted-JSON
   # form is mention-proof: task content quoting it gets escaped (\"subtype\") and cannot match.
-  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE 'Reached max turns|"subtype":"error_max_turns"'; then
+  if tail -n +"$((LINES_BEFORE + 1))" "$LOG" | grep -qE '"subtype":"error_max_turns"'; then
     finish DONE "exit=${RC}" 03 turn-cap
   else
     finish DONE "exit=${RC}" 09 runner-error
