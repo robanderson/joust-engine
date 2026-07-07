@@ -106,6 +106,13 @@ je_verify_exec() {
   if _je_sandbox_active; then
     je_verify_sandbox_exec "$@"
   else
+    # security-sweep H3/H4 (2026-07-07): the actual fail-open the finding targets was verify_safe_diff
+    # letting IMPLEMENTER-AUTHORED CODE through its gate (its exec-file list was incomplete — H5) and
+    # then run_verify running it unsandboxed. With H5's comprehensive code+config gate, verify_safe_diff
+    # now REFUSES any code change when no sandbox is active, so nothing that reaches this direct branch
+    # under `auto`+no-sandbox is implementer-authored code — only safe (docs/data-only) diffs verifying
+    # against the trusted baseline tree. Running those directly is correct; the fail-closed is upstream
+    # at the gate (H5), not here. (Explicit JE_VERIFY_SANDBOX=0 is an operator opt-out either way.)
     "$@"
   fi
 }
@@ -230,18 +237,29 @@ verify_safe_diff() {
   [ "${#changed[@]}" -gt 0 ] || return 0   # clean tree: nothing to gate (avoids empty-array nounset)
   for f in "${changed[@]}"; do
     case "$f" in
-      # npm scripts can run anything; make recipes; python build/test config and
-      # pytest-autoloaded conftest; rust build hooks; go module/tests; CI & hooks;
-      # and the test sources the test runners EXECUTE.
+      # security-sweep H5 (2026-07-07): a verify command runs the WHOLE tree's code, not only a fixed
+      # allowlist of config files — so ANY source file the implementer touched is executed by
+      # `npm test`/`pytest`/`cargo test`/`go test`. The old narrow list missed framework configs
+      # (jest/vite/webpack/rollup/babel/eslint/nyc), other-ecosystem manifests (gradle/maven/gem/
+      # cmake/nox/rake/invoke), AND all executable SOURCE. Treat every code/config file as
+      # verify-executable so, with no sandbox, implementer-authored code is NEVER auto-run (fail
+      # closed; a human reviews). Only docs/data-only diffs verify unsandboxed.
       package.json|*/package.json|\
       Makefile|makefile|GNUmakefile|*/Makefile|*/makefile|*/GNUmakefile|*.mk|\
       pyproject.toml|*/pyproject.toml|setup.py|*/setup.py|setup.cfg|*/setup.cfg|\
-      tox.ini|*/tox.ini|conftest.py|*/conftest.py|\
+      tox.ini|*/tox.ini|conftest.py|*/conftest.py|noxfile.py|*/noxfile.py|tasks.py|*/tasks.py|\
       Cargo.toml|*/Cargo.toml|build.rs|*/build.rs|\
       go.mod|*/go.mod|\
-      test_*.py|*/test_*.py|*_test.py|*/*_test.py|\
-      *_test.go|*/*_test.go|\
-      .github/workflows/*|.gitlab-ci.yml|*/.gitlab-ci.yml|.git/hooks/*|*/.git/hooks/*)
+      *.gradle|*/*.gradle|pom.xml|*/pom.xml|build.xml|*/build.xml|\
+      Gemfile|*/Gemfile|*.gemspec|*/*.gemspec|Rakefile|*/Rakefile|\
+      CMakeLists.txt|*/CMakeLists.txt|*.cmake|*/*.cmake|\
+      jest.config.*|*/jest.config.*|vitest.config.*|*/vitest.config.*|\
+      vite.config.*|*/vite.config.*|webpack.config.*|*/webpack.config.*|\
+      rollup.config.*|*/rollup.config.*|babel.config.*|*/babel.config.*|\
+      .babelrc*|*/.babelrc*|.eslintrc.js|*/.eslintrc.js|.eslintrc.cjs|*/.eslintrc.cjs|\
+      .mocharc.js|*/.mocharc.js|.nycrc*|*/.nycrc*|karma.conf.*|*/karma.conf.*|\
+      .github/workflows/*|.gitlab-ci.yml|*/.gitlab-ci.yml|.git/hooks/*|*/.git/hooks/*|\
+      *.js|*.cjs|*.mjs|*.jsx|*.ts|*.tsx|*.py|*.rb|*.go|*.rs|*.sh|*.bash|*.pl|*.php)
         hits+=("$f") ;;
     esac
   done
@@ -318,6 +336,26 @@ je_verify_sandbox_exec() {
   (literal (param "JE_NPMRC"))
   (literal (param "JE_PYPIRC"))
   (literal (param "JE_NETRC"))
+  (literal (param "JE_GIT_CREDS")))
+; security-sweep M8 (2026-07-07): (allow default) also permitted arbitrary filesystem WRITES, so a
+; sandboxed-but-malicious verify command could WRITE ~/.ssh/authorized_keys, tamper shell rc files
+; for persistence, or overwrite credential files it could not read. Deny WRITES to the same
+; credential dirs (and shell startup files) — toolchains write to build/cache/tmp dirs, not these.
+(deny file-write*
+  (subpath (param "JE_SSH_DIR"))
+  (subpath (param "JE_AWS_DIR"))
+  (subpath (param "JE_AZURE_DIR"))
+  (subpath (param "JE_GCLOUD_DIR"))
+  (subpath (param "JE_GH_DIR"))
+  (subpath (param "JE_DOCKER_DIR"))
+  (subpath (param "JE_KUBE_DIR"))
+  (subpath (param "JE_CODEX_DIR"))
+  (subpath (param "JE_CLAUDE_DIR"))
+  (subpath (param "JE_GROK_DIR"))
+  (subpath (param "JE_KEYCHAINS_DIR"))
+  (literal (param "JE_NPMRC"))
+  (literal (param "JE_PYPIRC"))
+  (literal (param "JE_NETRC"))
   (literal (param "JE_GIT_CREDS")))'
 
   "$sandbox_bin" \
@@ -369,9 +407,15 @@ je_run_with_timeout() {
   [ "${1:-}" = "--" ] && shift
   [ "$#" -gt 0 ] || { echo "JE-TIMEOUT: no command given" >&2; return 2; }
 
-  # Run the verify command in the background.
+  # security-sweep M22 (2026-07-07): launch the verify command as its OWN process-group leader
+  # (`set -m` before backgrounding) so a timeout can group-kill its entire subtree. The old
+  # single-pid `kill -TERM "$cmd_pid"` left backgrounded grandchildren alive after verify returned —
+  # still holding inherited creds / mutating files. Restore the caller's monitor mode right after.
+  local had_m0=0; case "$-" in *m*) had_m0=1 ;; esac
+  set -m
   "$@" &
   local cmd_pid=$!
+  [ "$had_m0" -eq 1 ] || set +m
 
   # Watchdog: spawned under `set -m` so the subshell LEADS ITS OWN PROCESS GROUP
   # (its sleep joins it via the inner `set +m`). Teardown then group-kills
@@ -390,10 +434,11 @@ je_run_with_timeout() {
     sleep "$secs" &
     sleep_pid=$!
     wait "$sleep_pid" 2>/dev/null
-    # Timeout fired: escalate TERM -> (grace) -> KILL on the command.
-    kill -TERM "$cmd_pid" 2>/dev/null
+    # Timeout fired: escalate TERM -> (grace) -> KILL on the command's PROCESS GROUP (M22: reaps
+    # backgrounded children), with a single-pid fallback if the group signal is refused.
+    kill -TERM -"$cmd_pid" 2>/dev/null || kill -TERM "$cmd_pid" 2>/dev/null
     sleep "$JE_VERIFY_KILL_GRACE"
-    kill -KILL "$cmd_pid" 2>/dev/null ) >/dev/null 2>&1 &
+    kill -KILL -"$cmd_pid" 2>/dev/null || kill -KILL "$cmd_pid" 2>/dev/null ) >/dev/null 2>&1 &
   # #46: the watchdog subshell (and the `sleep` it backgrounds) is detached from the caller's
   # stdout/stderr (`>/dev/null 2>&1`). The watchdog never writes output, but it would otherwise
   # INHERIT fd 1 — and when je_run_with_timeout (or run_verify) is invoked inside command
@@ -502,6 +547,13 @@ run_verify() {
     words=()
     read -r -a words <<< "$c"
     [ "${#words[@]}" -gt 0 ] || continue
+    # security-sweep H20 (2026-07-07): assessed MITIGATED-BY-DESIGN, no brittle head-allowlist.
+    # The frozen set is authenticated by PROVENANCE: the skill freezes it from `detect_verify` output
+    # (engine shell) into _verify_cmds.txt and pipes THAT in — it is never model-relayed. Containment
+    # for whatever it runs is the H3/H4 sandbox-fail-closed routing + the verify_safe_diff gate +
+    # the env/on-disk-credential protections. An allowlist of command heads would both miss custom
+    # legitimate runners (./scripts/test.sh, task, just, mise) and give false assurance; argv-exec
+    # (no eval, below) already neutralises shell metacharacters in a frozen line.
     # Direct rc capture; break on first failure so a later success cannot mask it.
     # Per-command wall-clock watchdog (macOS has no `timeout`) stays OUTSIDE; the sandbox
     # decision is at the LEAF via je_verify_exec. A 124 (timed out) or 125 (sandbox
