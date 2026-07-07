@@ -1,6 +1,6 @@
 {
   "name": "joust-engine",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Tooling and test harness for the Joust Engine Claude Code plugin. The plugin itself is defined in .claude-plugin/; this manifest exists only to pin the toolchain and provide a single entry point for the deterministic test suite (Layer A). It is not published to npm.",
   "private": true,
   "type": "module",

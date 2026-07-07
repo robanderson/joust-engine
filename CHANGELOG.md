@@ -4,6 +4,10 @@ All notable changes to the **joust-engine** plugin are documented here.
 
 ## Unreleased
 
+## v0.1.0 — 2026-07-08
+
+First substantial release: the design-briefs / judging-v3 / Fable-Engine engine arc plus a repo-wide security sweep (~50 findings across every module, each fixed with a regression test — secret hygiene, verify RCE gate fail-closed, blind-judging/relay integrity, public-repo issue scrub). Graduates the plugin from `0.0.1` scaffolding.
+
 ### Added
 
 - **Run-state heartbeat + abort stamping + resume (engine #10, tournament-adopted).** A
