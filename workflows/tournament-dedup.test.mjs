@@ -254,3 +254,15 @@ test('a verified rebuild returns the grouped (collapsed) set unchanged — the h
   const ret = SRC.indexOf('return grouped', ok)
   assert.ok(ok > 0 && ret > ok, 'grouped is returned only after verification')
 })
+
+// ---- security-sweep H8 (2026-07-07): candidate content cannot forge a blind pool section marker ----
+test('H8: every pool writer defangs a candidate-forged ^===== line (engine markers stay column 0)', () => {
+  // all candidate-content cats (xargs -0 cat and cat candidate.diff) pipe through the ^===== defang
+  const defangs = SRC.split(`sed 's/^=====/ =====/'`).length - 1
+  assert.ok(defangs >= 5, `expected the ^===== defang on every candidate-content cat (found ${defangs})`)
+  // the engine's own section header is still echoed unescaped at column 0
+  assert.ok(SRC.includes('echo "===== Candidate ${c.blind} ====="'), 'engine section header unchanged')
+  // a raw (undefanged) `xargs -0 cat` of candidate files must not remain on a pooling path
+  assert.ok(!/xargs -0 cat 2>\/dev\/null;/.test(SRC.replace(/xargs -0 cat 2>\/dev\/null \| sed[^\n;]*/g, '')),
+    'no candidate-content cat is left undefanged on a pool path')
+})

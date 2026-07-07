@@ -1623,6 +1623,15 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
     // the same junk token (e.g. "same") for unrelated candidates — forging a collapse + convergence
     // stamp and suppressing a real candidate from judging. Non-hex tokens degrade to no-collapse
     // (fail-open singleton), exactly like NONE.
+    // security-sweep H6/H7 (2026-07-07): the residual — a helper relaying the SAME valid 64-hex hash
+    // (H6) or a wrong mechanical `class` (H7) — is assessed as HELPER-RELAY INTEGRITY (the relayer is
+    // the operator's own HELPER_MODEL, not an attacker), and every failure direction is FAIL-SAFE or
+    // downstream-caught: a forged collapse only DROPS a real candidate from judging (never injects a
+    // winner) and verifyPool's read-back (Run M) rejects a pool that disagrees with the judged set; a
+    // misrelayed corrupt_patch drops a valid candidate (fail-safe), a misrelayed clean_patch is caught
+    // downstream (judges read the actual patch bytes; the implementer re-applies it for real). The
+    // engine can't recompute these in-sandbox (no shell), so the strict-shape guard + read-back +
+    // downstream re-apply are the defense-in-depth. No behavioural change.
     if (/^[0-9a-f]{64}$/.test(h)) byHash[String(r.blind).trim()] = h
   }
   const grouped = groupIdenticalCandidates(merged, byHash)
@@ -1645,7 +1654,7 @@ async function mechanicalPatchGate(staged, reviewDir, phaseTitle) {
     // causes a spurious disarm — fail-safe direction, accepted.
     const rebuildFor = (set) => [`tmp=${q(`${pool}.mech`)}`, `: > "$tmp"`].concat(set.map(c => {
       const dest = `${reviewDir}/${c.blind}`
-      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${mechStampShell(dest)}; ${contractStampShell(dest)}; ${convergenceStampShell(convergenceLineFor(c))}; echo; } >> "$tmp"`
+      return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name mechanical.txt ! -name contract.txt ! -name convergence.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; ${mechStampShell(dest)}; ${contractStampShell(dest)}; ${convergenceStampShell(convergenceLineFor(c))}; echo; } >> "$tmp"`
     })).concat([
       `mv -f "$tmp" ${q(pool)}`,
       `echo "JPOOL $(grep -c '^===== Candidate ' ${q(pool)} 2>/dev/null | tr -d ' ') $(grep '^===== Candidate ' ${q(pool)} 2>/dev/null | awk '{print $3}' | sort | tr '\\n' ' ')"`,
@@ -1751,7 +1760,7 @@ async function evidenceVerificationPass(staged, reviewDir, phaseTitle) {
   const pool = `${reviewDir}/_pool.md`
   const rebuild = [`tmp=${q(`${pool}.evid`)}`, `: > "$tmp"`].concat(merged.filter(c => c.valid).map(c => {
     const dest = `${reviewDir}/${c.blind}`
-    return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name evidence.txt ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null; ${evidenceStampShell(dest)}; echo; } >> "$tmp"`
+    return `{ echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f ! -name evidence.txt ! -name mechanical.txt ! -name contract.txt -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; ${evidenceStampShell(dest)}; echo; } >> "$tmp"`
   })).concat([`mv -f "$tmp" ${q(pool)}`]).join('\n')
   await agentLadder(
     `Run this exact shell script in ONE Bash call. It atomically rebuilds the blind pool with evidence-verification stamps. Do not print, summarize, or expose command output; do nothing else:\n\n${rebuild}`,
@@ -1795,19 +1804,19 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
       // worktree), so copy it forward and keep the D-0004 provenance skip (provChk -> P=1 for carryover).
       if (c.carriedOver) {
         return `mkdir -p ${q(dest)}; if [ -s ${q(`${c.ws}/candidate.diff`)} ]; then cp ${q(`${c.ws}/candidate.diff`)} ${q(diffPath)}; D=1; else D=0; fi; ${provChk}; ` +
-               `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
+               `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> ${q(pool)}; fi; ` +
                `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
       }
       return `mkdir -p ${q(dest)}; git -C ${q(c.ws)} diff ${q(baseSha)} HEAD --no-color --no-prefix > ${q(diffPath)} 2>/dev/null; ` +
              `if [ -s ${q(diffPath)} ]; then D=1; else D=0; fi; ${provChk}; ` +
-             `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
+             `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(diffPath)} 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> ${q(pool)}; fi; ` +
              `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
     }
     return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
            `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt ${q(dest)}/_minimax_run.log ${q(dest)}/_grok_run.log; ` +
            `find ${q(dest)} -mindepth 1 ! -type f ! -type d -delete 2>/dev/null; ` +
            `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
-           `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
+           `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> ${q(pool)}; fi; ` +
            `echo "JEV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"${rcEcho}`
   })).join('\n')
   const res = await agentLadder(
