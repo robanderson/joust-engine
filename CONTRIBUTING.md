@@ -49,13 +49,17 @@ Full convention: [`DOGFOOD.md`](DOGFOOD.md) and [`skills/joust-engine/references
 
 ## Release checklist
 
-The plugin version is the single source of truth and must stay in lockstep across all four places (currently **0.0.1**):
+`.claude-plugin/plugin.json`'s `version` is the source of truth; the same value must appear in the two other manifests, a dated CHANGELOG entry, and a matching git tag:
 
 1. [ ] Bump `version` in `.claude-plugin/plugin.json`.
-2. [ ] Bump `version` in `.claude-plugin/marketplace.json` to the **same** value.
+2. [ ] Set the **same** value in `.claude-plugin/marketplace.json` and `package.json`.
 3. [ ] Add a dated entry to [`CHANGELOG.md`](CHANGELOG.md).
 4. [ ] Tag the release commit (`git tag vX.Y.Z`) and push the tag.
 5. [ ] Confirm `npm run ci` is green on the release commit.
+
+The `@@DE` dev-marketplace version is **derived automatically** — no manual bump. `bin/rebrand.mjs`
+publishes `X.Y.(Z+1)-dev.<N>` (a prerelease of the next patch of the release above; `N` = commits
+since the latest tag, so it resets each release), keeping the dev and prod channels in lockstep.
 
 ## Reporting security issues
 
