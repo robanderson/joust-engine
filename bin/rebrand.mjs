@@ -21,6 +21,7 @@
 // This is a normal Node script (NOT a workflow script), so Date.now()/git are fine.
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
@@ -43,18 +44,28 @@ const OUT = path.resolve(ROOT, getFlag('--out') ?? '.dev-engine')
 if (!fs.existsSync(path.join(ROOT, '.claude-plugin', 'plugin.json'))) {
   console.error(`rebrand: ${ROOT} is not a plugin root (no .claude-plugin/plugin.json)`) ; process.exit(2)
 }
-// security-sweep H14 (2026-07-07): the wipe below is `fs.rmSync(OUT, {recursive,force})`. The old
-// guard only blocked OUT===ROOT, so `--out ..` (an ANCESTOR of the repo), `--out /tmp/x`, or a
-// symlinked OUT would force-delete an arbitrary tree. Refuse: OUT must be a NON-symlink path that is
-// strictly UNDER the repo root and is NOT an ancestor of it (belt: also reject the fs root).
+// security-sweep H14 (2026-07-07; relaxed 2026-07-10): the wipe below is `fs.rmSync(OUT, {recursive,
+// force})`, so OUT must be a SAFE, disposable scratch location — never the repo, an ANCESTOR of it,
+// the fs root, an arbitrary tree (`$HOME`, `/etc`, `..`), or a symlink we'd follow out of. ALLOWED
+// roots: strictly UNDER the repo root (default .dev-engine) OR under a system temp dir. H14 first
+// permitted ONLY under-repo, which broke the .gitea publish/rebrand-check workflows that legitimately
+// build into /tmp (rebrand exited 2 before doing any work — the dev marketplace stopped publishing);
+// this restores the temp-dir path while keeping every dangerous target refused.
 {
   const outReal = path.resolve(OUT)
   const rootReal = path.resolve(ROOT)
-  const rel = path.relative(rootReal, outReal)
-  const outIsUnderRoot = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  const isUnder = (parent, child) => {
+    const rel = path.relative(parent, child)
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  }
+  // Known system temp roots, plus their realpaths (macOS /tmp -> /private/tmp; honours $TMPDIR).
+  const tmpRoots = [...new Set(['/tmp', '/private/tmp', '/var/tmp', os.tmpdir()].flatMap(p => {
+    try { return [path.resolve(p), fs.realpathSync(p)] } catch { return [path.resolve(p)] }
+  }))]
+  const inSafeRoot = isUnder(rootReal, outReal) || tmpRoots.some(t => isUnder(t, outReal))
   const rootIsUnderOut = (() => { const r = path.relative(outReal, rootReal); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)) })()
-  if (!outIsUnderRoot || rootIsUnderOut || outReal === path.parse(outReal).root) {
-    console.error(`rebrand: --out must be a path strictly UNDER the repo root (got "${OUT}" → ${outReal}); refusing to rm -rf outside the tree`); process.exit(2)
+  if (!inSafeRoot || rootIsUnderOut || outReal === path.parse(outReal).root) {
+    console.error(`rebrand: --out must be strictly UNDER the repo root or a system temp dir (got "${OUT}" → ${outReal}); refusing to rm -rf an arbitrary tree`); process.exit(2)
   }
   try { if (fs.lstatSync(outReal).isSymbolicLink()) { console.error(`rebrand: --out is a symlink (${outReal}); refusing`); process.exit(2) } } catch { /* not existing yet = fine */ }
 }
