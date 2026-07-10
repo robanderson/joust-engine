@@ -139,12 +139,11 @@ const walk = (absDir) => {
 walk(ROOT)
 
 // ---- stamp a unique version (defeat the version-keyed plugin cache) ------
-// SEQUENTIAL build number: in CI the publish workflow provides DEV_BUILD_NUMBER (=
-// GITHUB_RUN_NUMBER, which Gitea/GitHub Actions increment monotonically per run), so the
-// published dev-marketplace version is human-checkable and ordered — you can confirm
-// `/reload-plugins` pulled the newest build by eye (0.0.1-dev.7 > 0.0.1-dev.6). A local
-// `node bin/rebrand.mjs` (no CI env) falls back to a `local.<timestamp>` tag: still unique
-// (so a same-path regen busts the cache) and clearly distinguished from a CI build.
+// The published @@DE dev version is <next-JE-patch>-dev.<build> — human-checkable and ordered, so you
+// can confirm `/reload-plugins` pulled the newest build by eye (e.g. 0.1.1-dev.7 > 0.1.1-dev.6). The
+// base bump (devVersionBase) and the resetting build counter (devBuildNumber) are each documented at
+// their function below. A local `node bin/rebrand.mjs` with no reachable tag / CI env falls back to a
+// `local.<timestamp>` tag: still unique (a same-path regen busts the cache), clearly non-CI.
 const baseVer = JSON.parse(
   fs.readFileSync(path.join(ROOT, cfg.versionBaseFrom || '.claude-plugin/plugin.json'), 'utf8')
 ).version || '0.0.0'
