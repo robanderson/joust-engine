@@ -4,13 +4,18 @@
 // suffix (unique => busts the version-keyed plugin cache).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, resolve, join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = readFileSync(resolve(HERE, 'rebrand.mjs'), 'utf8')
 const CFG = JSON.parse(readFileSync(resolve(HERE, '..', 'rebrand.config.json'), 'utf8'))
+const RUNNER = resolve(HERE, 'rebrand.mjs')
+const runRebrand = (outArg) => spawnSync('node', [RUNNER, '--out', outArg, '--no-test'],
+  { encoding: 'utf8', cwd: resolve(HERE, '..') })
 
 // slice the PURE devVersionBase() out of the script and eval it in isolation
 const i = SRC.indexOf('function devVersionBase(')
@@ -37,6 +42,28 @@ test('devVersionBase: malformed (non X.Y.Z) falls back to verbatim, never crashe
   assert.equal(devVersionBase('weird', true), 'weird')
   assert.equal(devVersionBase('', true), '')
   assert.equal(devVersionBase(null, true), null)
+})
+
+// H14 out-dir guard (relaxed 2026-07-10). The .gitea publish/rebrand-check workflows build into
+// /tmp; the original H14 guard refused any non-under-repo --out, which silently broke every dev
+// publish (rebrand exited 2 before doing work). The guard must ALLOW a system temp dir while still
+// refusing the repo/ancestors/fs-root/symlinks.
+test('H14 guard ALLOWS a system temp dir (the .gitea workflows publish to /tmp)', () => {
+  const out = join(tmpdir(), `rebrand-guard-test-${process.pid}`)
+  const r = runRebrand(out)
+  assert.notEqual(r.status, 2, `temp dir must not be rejected (stderr: ${r.stderr})`)
+  assert.doesNotMatch(r.stderr || '', /must be strictly UNDER the repo root or a system temp dir/,
+    'no guard rejection for a temp dir')
+  rmSync(out, { recursive: true, force: true })
+})
+
+test('H14 guard still REFUSES the repo parent, an arbitrary abs path, and the fs root', () => {
+  for (const bad of ['..', resolve(HERE, '..', '..', 'rebrand-danger-xyz'), '/']) {
+    const r = runRebrand(bad)
+    assert.equal(r.status, 2, `must refuse ${bad}`)
+    assert.match(r.stderr || '', /must be strictly UNDER the repo root or a system temp dir|refusing to rm -rf/,
+      `guard message for ${bad}`)
+  }
 })
 
 test('the dev config opts INTO the patch bump + commits-based reset (channels stay in lockstep)', () => {
