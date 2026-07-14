@@ -233,7 +233,7 @@ Attempts can run on six providers. The **judge panel is held fixed** (the 6-seat
 | **Anthropic** | `opus` · `sonnet` · `haiku` | Task tool, native in-process | the session's own Claude auth (no extra key) |
 | **GLM (z.ai)** | `glm-5.2` · `glm-5.1` · `glm-4.7` · `glm-4.5-air` | `claude` pointed at z.ai via `bin/glm-run.sh` | `ZAI_API_KEY` |
 | **Local MLX** | dynamic on-device list (via the `omlx` server) | `claude` pointed at `http://127.0.0.1:8000` via `bin/local-run.sh` | `OMLX_AUTH_TOKEN` |
-| **Codex (OpenAI)** | `gpt-5.5`, axis = reasoning effort: `codex-low/medium/high/xhigh` | `codex exec` via `bin/codex-run.sh` | `~/.codex/auth.json` (no env var) |
+| **Codex (OpenAI)** | `gpt-5.5` (axis = reasoning effort: `codex-low/medium/high/xhigh`) · `gpt-5.6` family (`gpt-5.6` base + variants `codex-sol/terra/luna`, effort pinned high) | `codex exec` via `bin/codex-run.sh` | `~/.codex/auth.json` (no env var) |
 | **MiniMax** | `MiniMax-M3` (the only model) | `claude` pointed at the MiniMax endpoint via `bin/minimax-run.sh` | `MINIMAX_API_KEY` |
 
 A few provider specifics worth knowing:
@@ -241,7 +241,7 @@ A few provider specifics worth knowing:
 - **Anthropic** model aliases map to API strings `claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5`.
 - **GLM** is the `claude` CLI pointed at z.ai's Anthropic-compatible endpoint. The selection maps through `glm`'s `--model` flag, which is **not** the GLM name: `glm-5.2 → --model opus`, `glm-5.1 → --model glm-5.1`, `glm-4.7 → --model sonnet`, `glm-4.5-air → --model haiku`. (Those aliases resolve to GLM models because the wrapper sets `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`.) GLM bills the z.ai plan and is the slow one on large multi-file tasks — give it a generous `glmTimeoutSecs`.
 - **Local MLX** has a **dynamic** catalogue: fetch it live with `omlx-models` (or `curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_AUTH_TOKEN" | jq -r '.data[].id'`). Ids pass straight through as `--model <exact-id>`. Local models are **free** (on-device) but slower, and small ones can be unreliable at saving a deliverable; prefer hosted providers for heavy writing tasks.
-- **Codex** is **pinned to `gpt-5.5`** — the only model the local ChatGPT-account auth serves (other ids return HTTP 400 unless you set `OPENAI_API_KEY` for API-key billing). So the lever is **reasoning effort**: `low | medium | high | xhigh` ("Extra high"; `minimal` is rejected). Codex has **no turn cap**, so its only per-attempt backstop is the wall clock (`codexTimeoutSecs`, default 600s). It bills your OpenAI/ChatGPT plan.
+- **Codex** serves **two model families**. On `gpt-5.5` the lever is **reasoning effort**: `low | medium | high | xhigh` ("Extra high"; `minimal` is rejected) — these tiers remain fully selectable, and the engine's default pools and judge seats stay pinned to `codex-xhigh`/`codex-high`. The **`gpt-5.6` family** (2026-07-14) adds the base `gpt-5.6` plus the named variants `codex-sol`/`codex-terra`/`codex-luna` (real CLI ids `gpt-5.6-sol` etc., verified on codex-cli 0.144.1), each pinned to effort `high`; a bare `codex` in a prose spec now means `codex-sol`. Codex has **no turn cap**, so its only per-attempt backstop is the wall clock (`codexTimeoutSecs`, default 600s). It bills your OpenAI/ChatGPT plan.
 - **MiniMax** exposes one model, `MiniMax-M3` (512K context), pinned via `ANTHROPIC_MODEL=MiniMax-M3` (so there's no `--model` flag). It bills your MiniMax plan; M3 was fast and clean on a heavy multi-file build in testing.
 
 **Every runner reads its key from the environment** — never by sourcing or grepping rc files — so the providers stay uniform. A provider whose key is unset produces an honest failure, not a fake fallback.
@@ -364,7 +364,7 @@ After install + reload, the `joust-engine` and `joust-bench` skills and the `@@J
 | Anthropic | nothing extra | session auth |
 | GLM (z.ai) | the `glm` CLI + `ZAI_API_KEY` | export `ZAI_API_KEY` in your shell profile |
 | Local MLX | the `omlx` server running on `127.0.0.1:8000` + `OMLX_AUTH_TOKEN` | start `omlx`; export `OMLX_AUTH_TOKEN` |
-| Codex (OpenAI) | the `codex` CLI, signed in (`~/.codex/auth.json`) | `codex` login; optional `OPENAI_API_KEY` for non-`gpt-5.5` ids |
+| Codex (OpenAI) | the `codex` CLI, signed in (`~/.codex/auth.json`) | `codex` login; optional `OPENAI_API_KEY` for ids outside the `gpt-5.5`/`gpt-5.6` families |
 | MiniMax | the `claude` CLI + `MINIMAX_API_KEY` | export `MINIMAX_API_KEY` in your shell profile |
 
 Every runner reads its key **from the environment** (exported in your shell profile and inherited into the session at launch), exactly the same way for every provider. The skill probes liveness before spending a round where it can — e.g. a one-line Codex probe, an `omlx-models` fetch — and offers another tier if a provider is down or its CLI is stale (e.g. `brew upgrade codex`).

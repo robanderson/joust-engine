@@ -279,16 +279,25 @@ const GLM_FLAG = {
   'glm-4.7': '--model sonnet',
   'glm-4.5-air': '--model haiku',
 }
-// Codex display model -> the `codex exec` flags selecting it. Codex is pinned to gpt-5.5 (the only
-// model the local ChatGPT-account auth serves; other ids need an OPENAI_API_KEY). The selectable axis
-// is the REASONING EFFORT — codex's real quality lever — set via the model_reasoning_effort config
-// override. Verified-accepted tokens on gpt-5.5: low|medium|high|xhigh ("xhigh" == the UI's "Extra
-// high"; "minimal" is rejected). The runner pins -m so it never falls back to config.toml's default.
+// Codex display model -> the `codex exec` flags selecting it. TWO codex families:
+//   gpt-5.5 — the selectable axis is the REASONING EFFORT (codex's real quality lever on 5.5),
+//     set via the model_reasoning_effort config override. Verified-accepted tokens on gpt-5.5:
+//     low|medium|high|xhigh ("xhigh" == the UI's "Extra high"; "minimal" is rejected). The
+//     engine pools and judge seats stay pinned to these tiers (codex-xhigh / codex-high).
+//   gpt-5.6 (2026-07-14) — base 'gpt-5.6' plus the named variants codex-sol/terra/luna; the real
+//     CLI ids are gpt-5.6 / gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna (verified on codex-cli
+//     0.144.1; model_reasoning_effort still applies). Default effort for the 5.6 family is HIGH,
+//     pinned in the flags. Bare 'codex' in a prose spec now parses to codex-sol (je-parse.mjs).
+// The runner pins -m so it never falls back to config.toml's default.
 const CODEX_FLAG = {
   'codex-low': '-m gpt-5.5 -c model_reasoning_effort=low',
   'codex-medium': '-m gpt-5.5 -c model_reasoning_effort=medium',
   'codex-high': '-m gpt-5.5 -c model_reasoning_effort=high',
   'codex-xhigh': '-m gpt-5.5 -c model_reasoning_effort=xhigh',
+  'gpt-5.6': '-m gpt-5.6 -c model_reasoning_effort=high',
+  'codex-sol': '-m gpt-5.6-sol -c model_reasoning_effort=high',
+  'codex-terra': '-m gpt-5.6-terra -c model_reasoning_effort=high',
+  'codex-luna': '-m gpt-5.6-luna -c model_reasoning_effort=high',
 }
 // Grok display model -> the `grok` -m flag that selects it. The two operator-requested variants are a
 // MODEL axis (analogous to codex's reasoning-effort axis): grok-build is xAI's agentic-coding model
@@ -1228,7 +1237,7 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
     prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b, localMaxTurns), ws, '_local_run.log')
   } else if (a.dispatch === 'codex') {
     opts.agentType = nsAgent(a.agentType) // joust-codex (one generic agent for every codex effort)
-    const flag = CODEX_FLAG[a.displayModel] || `-m ${a.model}` // gpt-5.5 + reasoning-effort flags -> codex exec
+    const flag = CODEX_FLAG[a.displayModel] || `-m ${a.model}` // model + reasoning-effort flags (gpt-5.5 tiers / gpt-5.6 variants) -> codex exec
     prompt = RUNVERBATIM(codexRunnerCmd(codexRunner, flag, ws, b), ws, '_codex_run.log')
   } else if (a.dispatch === 'minimax') {
     opts.agentType = nsAgent(a.agentType) // joust-minimax (one generic agent; MiniMax exposes only MiniMax-M3)
