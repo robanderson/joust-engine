@@ -89,16 +89,41 @@ const NORMALISER = {
   'glm 4.5-air': { model: 'glm-4.5-air', dispatch: 'glm' },
   'air':         { model: 'glm-4.5-air', dispatch: 'glm' },
 
-  // Codex (OpenAI, pinned gpt-5.5; the axis is reasoning effort).
-  // Bare 'codex' defaults to codex-xhigh (2026-07-05: xhigh is the regular tier for all
-  // engine use — pools, presets, judge seats). Explicit low/medium/high still selectable.
-  'codex':            { model: 'codex-xhigh', dispatch: 'codex' },
+  // Codex (OpenAI). TWO families:
+  //   gpt-5.5 — the effort tiers codex-low/medium/high/xhigh (axis = reasoning effort).
+  //     These remain available and unchanged as explicit spellings; the engine pools
+  //     and judge seats stay pinned to codex-xhigh / codex-high.
+  //   gpt-5.6 — base 'gpt-5.6' plus the named variants codex-sol/terra/luna
+  //     (real CLI ids gpt-5.6, gpt-5.6-sol/-terra/-luna; default effort high).
+  // Bare 'codex' defaults to codex-sol (decision 2026-07-14; was codex-xhigh from
+  // 2026-07-05). Explicit effort tiers and 5.6 variants are always selectable.
+  'codex':            { model: 'codex-sol',    dispatch: 'codex' },
   'codex low':        { model: 'codex-low',    dispatch: 'codex' },
   'codex medium':     { model: 'codex-medium', dispatch: 'codex' },
   'codex high':       { model: 'codex-high',   dispatch: 'codex' },
   'codex xhigh':      { model: 'codex-xhigh',  dispatch: 'codex' },
   'codex x-high':     { model: 'codex-xhigh',  dispatch: 'codex' },
   'codex extra high': { model: 'codex-xhigh',  dispatch: 'codex' },
+  // gpt-5.6 family (2026-07-14). Short aliases 'sol'/'terra'/'luna' follow the
+  // 'air'/'m3'/'composer' precedent.
+  'codex sol':   { model: 'codex-sol',   dispatch: 'codex' },
+  'codex-sol':   { model: 'codex-sol',   dispatch: 'codex' },
+  'sol':         { model: 'codex-sol',   dispatch: 'codex' },
+  'codex terra': { model: 'codex-terra', dispatch: 'codex' },
+  'codex-terra': { model: 'codex-terra', dispatch: 'codex' },
+  'terra':       { model: 'codex-terra', dispatch: 'codex' },
+  'codex luna':  { model: 'codex-luna',  dispatch: 'codex' },
+  'codex-luna':  { model: 'codex-luna',  dispatch: 'codex' },
+  'luna':        { model: 'codex-luna',  dispatch: 'codex' },
+  'gpt 5.6':     { model: 'gpt-5.6',     dispatch: 'codex' },
+  'gpt-5.6':     { model: 'gpt-5.6',     dispatch: 'codex' },
+  'gpt5.6':      { model: 'gpt-5.6',     dispatch: 'codex' },
+  // Bare 'gpt' must normalise for the SPACE spelling 'gpt 5.6' to survive the
+  // connector-licensed unknown scan (locateUnknownNearConnector captures only the
+  // FIRST word of an item; every multi-word token's head word is a valid alias —
+  // cf. 'glm', 'codex', 'minimax', 'composer'). Maps to the 5.6 base, like bare
+  // 'glm' -> glm-5.2.
+  'gpt':         { model: 'gpt-5.6',     dispatch: 'codex' },
 
   // MiniMax (new provider since the design doc). Like any single-model provider.
   'minimax':    { model: 'minimax-m3', dispatch: 'minimax' },
@@ -160,7 +185,12 @@ const FE_DEFAULT_POOL = [
 // token (e.g. 'codex high' not just 'codex').
 const MODEL_TOKEN_RX =
   '(?:' +
-    'codex(?:\\s*-?\\s*(?:low|medium|high|xhigh|x-?high|extra\\s*high))?' +
+    // codex: gpt-5.5 effort tiers AND the gpt-5.6 variants (sol/terra/luna). The
+    // variant names are word-bounded so 'codex solution' never reads as 'codex sol'.
+    'codex(?:\\s*-?\\s*(?:low|medium|high|xhigh|x-?high|extra\\s*high|sol\\b|terra\\b|luna\\b))?' +
+    // gpt-5.6 base model: 'gpt 5.6' / 'gpt-5.6' / 'gpt5.6' (no trailing digit, so
+    // 'gpt-5.61' is not silently truncated to a valid token)
+    '|gpt\\s*-?\\s*5\\.6(?!\\d)' +
     // grok: 'grok', 'grok build', 'grok-code', 'grok composer 2.5 fast', etc. (more-specific before bare 'grok')
     '|grok(?:\\s*-?\\s*(?:build|code|composer(?:\\s*-?\\s*2\\.5(?:\\s*-?\\s*fast)?)?))?' +
     // bare 'composer 2.5 fast' (no 'grok' prefix) — the operator's Composer name on its own
@@ -168,6 +198,9 @@ const MODEL_TOKEN_RX =
     '|glm(?:\\s*-?\\s*[0-9](?:\\.[0-9])?)?(?:\\s*-?\\s*air)?' +
     '|opus|sonnet|haiku' +
     '|minimax(?:\\s*-?\\s*m3)?|m3' +
+    // bare gpt-5.6 variant names (short aliases, like 'm3'/'composer'). Word-bounded
+    // so ordinary task words ('2 solvers', 'lunar') are never read as a spec item.
+    '|sol\\b|terra\\b|luna\\b' +
   ')';
 
 // Connectors that license capturing an *arbitrary* (possibly unknown) token as
@@ -1069,8 +1102,8 @@ function parse(rawInput) {
     if (allUnknowns.length) {
       errors.push(
         'Unrecognised model token(s) in spec: ' + allUnknowns.map(u => '"' + u + '"').join(', ') +
-        '. Known: opus, sonnet, haiku, glm[-5.2/5.1/4.7/4.5-air], codex[-low/medium/high/xhigh], ' +
-        'minimax-m3, grok[-build]/grok-composer-2.5-fast, or a live local id. Re-state the spec (a dropped token would silently change N).'
+        '. Known: opus, sonnet, haiku, glm[-5.2/5.1/4.7/4.5-air], codex[-low/medium/high/xhigh/-sol/terra/luna], ' +
+        'gpt-5.6, minimax-m3, grok[-build]/grok-composer-2.5-fast, or a live local id. Re-state the spec (a dropped token would silently change N).'
       );
       assignment = null;
       nSpec = null;

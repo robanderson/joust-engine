@@ -5,7 +5,7 @@
 # Timeout from JE_TIMEOUT_SECS (default 600). codex exec has NO --max-turns, so the wall clock (plus the
 # new stall watchdog) is the ONLY backstop; JE_MAX_TURNS is intentionally ignored.
 set -uo pipefail
-FLAG="${*:--m gpt-5.5 -c model_reasoning_effort=medium}"
+FLAG="${*:--m gpt-5.6-sol -c model_reasoning_effort=high}"
 LOG=_codex_run.log
 LAST=_codex_last.txt
 PROV=CODEX

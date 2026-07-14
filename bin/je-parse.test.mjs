@@ -150,8 +150,28 @@ parseCase('prose marker upper', 'refactor this JOUST:5',
 // --- prose model spec (Feature 2) ---
 parseCase('spec headline', 'build a parser with 2 opus, 2 glm 5.2, 1 codex high @@JE',
   { n: 5, mode: 1, z: 1, assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
-parseCase('spec bare codex -> xhigh (2026-07-05 tier policy)', 'do abc, 1 opus and 1 sonnet and 1 codex joust:3',
-  { n: 3, mode: 1, z: 1, assignment: ['opus', 'sonnet', 'codex-xhigh'] }, { noErrors: true });
+parseCase('spec bare codex -> codex-sol (2026-07-14 gpt-5.6 default; was xhigh)', 'do abc, 1 opus and 1 sonnet and 1 codex joust:3',
+  { n: 3, mode: 1, z: 1, assignment: ['opus', 'sonnet', 'codex-sol'] }, { noErrors: true });
+
+// --- Codex gpt-5.6 family (2026-07-14): base gpt-5.6 + codex-sol/terra/luna. ---
+// Bare 'codex' now defaults to codex-sol; the gpt-5.5 effort tiers stay available
+// as explicit spellings (asserted further below and in the existing cases).
+parseCase('spec 5.6 family headline: 2 codex sol, 1 terra, 1 gpt-5.6',
+  'build a parser with 2 codex sol, 1 terra, 1 gpt-5.6 @@JE',
+  { n: 4, mode: 1, z: 1, assignment: ['codex-sol', 'codex-sol', 'codex-terra', 'gpt-5.6'],
+    task: 'build a parser' }, { noErrors: true });
+parseCase('spec 5.6 hyphen + short-alias spellings', 'do x with 1 codex-sol, 1 codex-terra, 1 luna @@JE',
+  { n: 3, z: 1, assignment: ['codex-sol', 'codex-terra', 'codex-luna'] }, { noErrors: true });
+parseCase('spec codex luna (space form) + sol short alias', 'do x with 1 codex luna and 1 sol @@JE',
+  { n: 2, z: 1, assignment: ['codex-luna', 'codex-sol'] }, { noErrors: true });
+parseCase('spec gpt 5.6 / gpt5.6 spellings', 'do x with 1 gpt 5.6, 1 gpt5.6 @@JE',
+  { n: 2, z: 1, assignment: ['gpt-5.6', 'gpt-5.6'] }, { noErrors: true });
+parseCase('explicit gpt-5.5 effort tiers unchanged next to 5.6 variants',
+  'do x with 1 codex high, 1 codex xhigh, 1 codex sol @@JE',
+  { n: 3, z: 1, assignment: ['codex-high', 'codex-xhigh', 'codex-sol'] }, { noErrors: true });
+parseCase('variant names are word-bounded: "2 solver bugs" is task text, not a spec',
+  'fix 2 solver bugs @@JE:4',
+  { n: 4, z: 1, assignment: null, task: 'fix 2 solver bugs' }, { noErrors: true });
 parseCase('spec bare glm -> 5.2', 'do x with 3 glm @@JE',
   { n: 3, z: 1, assignment: ['glm-5.2', 'glm-5.2', 'glm-5.2'] }, { noErrors: true });
 parseCase('spec minimax', 'do y with 2 minimax @@JE',
@@ -300,7 +320,7 @@ parseCase('Nx chained spec', 'build a parser with 2x opus and 1x codex high @@JE
   { task: 'build a parser', n: 3, z: 1, assignment: ['opus', 'opus', 'codex-high'] }, { noErrors: true });
 parseCase('Nx chained four with M=2', 'build x with 2x opus, 2x sonnet, 2x codex, 2x minimax @@JE:8:2',
   { n: 8, mode: 2, z: 1,
-    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-xhigh', 'codex-xhigh', 'minimax-m3', 'minimax-m3'] },
+    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-sol', 'codex-sol', 'minimax-m3', 'minimax-m3'] },
   { noErrors: true });
 // 'Nx' agrees with an explicit marker N -> no conflict.
 parseCase('Nx agrees with marker N', 'do x with 2x opus and 1x sonnet @@JE:3',
@@ -770,11 +790,11 @@ parseCase('non-adjacent depth word stays task text (same rule as size words)',
 // ===========================================================================
 parseCase('whitespace-joined spec: 2 opus 2 codex => N=4, nothing dropped',
   '@@JE 2 opus 2 codex, a cli hangman game in python',
-  { n: 4, assignment: ['opus', 'opus', 'codex-xhigh', 'codex-xhigh'], task: 'a cli hangman game in python' },
+  { n: 4, assignment: ['opus', 'opus', 'codex-sol', 'codex-sol'], task: 'a cli hangman game in python' },
   { noErrors: true });
 parseCase('comma form still parses identically',
   '@@JE 2 opus, 2 codex, task x',
-  { n: 4, assignment: ['opus', 'opus', 'codex-xhigh', 'codex-xhigh'] }, { noErrors: true });
+  { n: 4, assignment: ['opus', 'opus', 'codex-sol', 'codex-sol'] }, { noErrors: true });
 parseCase('mixed joiners: comma + and + whitespace-multiword tokens',
   '@@JE 2 opus, 2 codex high and 1 sonnet, task x',
   { n: 5, assignment: ['opus', 'opus', 'codex-high', 'codex-high', 'sonnet'] }, { noErrors: true });

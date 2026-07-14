@@ -28,7 +28,7 @@
 
     {"query": "do abc @@JE", "should_trigger": true, "mode": "single", "z": 1, "n": null, "needsGate": true, "comment": "bare @@JE -> interactive gate"},
     {"query": "build a parser with 2 opus, 2 glm 5.2, 1 codex high @@JE", "should_trigger": true, "mode": "single", "z": 1, "n": 5, "assignment": ["opus","opus","glm-5.2","glm-5.2","codex-high"], "comment": "headline prose spec"},
-    {"query": "do abc, 1 opus and 1 sonnet and 1 codex joust:3", "should_trigger": true, "mode": "single", "z": 1, "n": 3, "assignment": ["opus","sonnet","codex-medium"], "comment": "bare codex -> medium default"},
+    {"query": "do abc, 1 opus and 1 sonnet and 1 codex joust:3", "should_trigger": true, "mode": "single", "z": 1, "n": 3, "assignment": ["opus","sonnet","codex-sol"], "comment": "bare codex -> codex-sol default (2026-07-14; gpt-5.6 family)"},
     {"query": "do x with 3 glm @@JE", "should_trigger": true, "mode": "single", "z": 1, "n": 3, "assignment": ["glm-5.2","glm-5.2","glm-5.2"], "comment": "bare glm -> glm-5.2 default"},
     {"query": "do y with 2 minimax @@JE", "should_trigger": true, "mode": "single", "z": 1, "n": 2, "assignment": ["minimax-m3","minimax-m3"], "comment": "minimax provider token"},
     {"query": "do abc top mixed @@JE:6", "should_trigger": true, "mode": "single", "z": 1, "n": 6, "preset": "top-mixed", "assignment": ["opus","opus","glm-5.2","glm-5.2","codex-high","codex-high"], "comment": "Top Mixed N=6 -> 2/2/2"},
