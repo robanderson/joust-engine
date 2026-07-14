@@ -12,6 +12,11 @@ __pycache__/
 # notes (.claude/scratch-pad/) that must never reach this public repo
 .claude/
 
+# Codex CLI local working notes (.Codex/scratch-pad/) and the private project
+# instructions that point at them — same red line as .claude/ above
+.Codex/
+AGENTS.md
+
 # Joust Engine run scratch — NEVER committed (the dogfood inbox is the durable path)
 .runs/
 **/.runs/
