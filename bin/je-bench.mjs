@@ -477,10 +477,14 @@ function perlAlarmArgv(timeoutSecs, cmdArgv) {
   const PERL = `
     my $t = shift @ARGV;
     my $p = fork; if (!defined $p) { exit 127 }
-    if ($p == 0) { exec @ARGV; exit 127 }
-    $SIG{ALRM} = sub { kill "TERM", $p; sleep 3; kill "KILL", $p; exit 124 };
+    if ($p == 0) { setpgrp(0, 0); exec @ARGV; exit 127 }
+    $SIG{ALRM} = sub { kill "TERM", -$p; sleep 3; kill "KILL", -$p; exit 124 };
     alarm $t; waitpid($p, 0); exit($? >> 8);
   `
+  // setpgrp + negative-pid kill: signal the child's whole PROCESS GROUP, not just the
+  // direct child. Claude-CLI benches spawn grandchildren that otherwise survive the
+  // timeout and keep calling the API (observed live 2026-07-15: a timed-out claudex
+  // heavy cell kept billing for ~25 min after its 124).
   return ['-e', PERL, String(timeoutSecs), ...cmdArgv]
 }
 
