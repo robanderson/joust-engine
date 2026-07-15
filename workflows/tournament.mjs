@@ -4173,6 +4173,20 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
     const rjCounts = new Map([...String((rjStageRes && rjStageRes.raw) || '').matchAll(/JRJ\s+([A-Z])\s+(\d+)/g)].map(m => [m[1], Number(m[2])]))
     rjStaged = rjStaged.map(c => (rjCounts.get(c.blind) > 0) ? c
       : { ...c, valid: false, failReason: rjCounts.has(c.blind) ? 'empty-staging' : 'stage-verify-failed' })
+    // The gate's tail normally REBUILDS _pool.md — bypassing it must not skip the pool build
+    // (live 2026-07-16: codex judge seats hard-require the pool file; 3 seats fell back to Opus
+    // when it was missing). Build the blind plan pool from the VALID staged dirs, first stripping
+    // underscore-prefixed engine artifacts (_brief.txt, _*_run.log, _*_last.txt) that source
+    // workspaces may carry — they name providers and would unblind a dir-browsing judge.
+    const rjPool = `${reviewDir}/_pool.md`
+    const rjPoolScript = [`tmp=${q(`${rjPool}.tmp`)}`, `: > "$tmp"`].concat(rjStaged.filter(c => c.valid).map(c => {
+      const dest = `${reviewDir}/${c.blind}`
+      return `rm -f ${q(dest)}/_* 2>/dev/null; { echo "===== Candidate ${c.blind} ====="; find ${q(dest)} -type f -print0 2>/dev/null | xargs -0 cat 2>/dev/null | sed 's/^=====/ =====/'; echo; } >> "$tmp"`
+    })).concat([`mv -f "$tmp" ${q(rjPool)}`]).join('\n')
+    await agentLadder(
+      `Run this exact shell script in ONE Bash call. It atomically builds the blind plan pool for re-judging. Do not print, summarize, or expose command output; do nothing else:\n\n${rjPoolScript}`,
+      { model: HELPER_MODEL, phase: 'Rejudge', label: 'rejudge-plan-pool' }
+    ).catch(() => null)
   } else {
     rjStaged = await mechanicalPatchGate(rjStaged, reviewDir, 'Rejudge')
   }

@@ -92,6 +92,14 @@ test('rejudgeKind=plan selects the PLAN council and briefing; code kind (and def
   assert.ok(BLOCK.includes("rjKind === 'plan' ? PLAN_LENSES : LENSES"), 'plan lens profile swap')
 })
 
+test('plan kind BUILDS the blind pool itself (the gate tail normally does it) and strips unblinding engine artifacts', () => {
+  assert.ok(BLOCK.includes("label: 'rejudge-plan-pool'"), 'plan pool build step exists')
+  const planBranch = BLOCK.slice(BLOCK.indexOf("if (rjKind === 'plan')"), BLOCK.indexOf('} else {'))
+  assert.ok(planBranch.includes('_pool.md'), 'plan branch writes the pool file codex judge seats require')
+  assert.ok(planBranch.includes('rm -f ${q(dest)}/_*'), 'underscore-prefixed provider artifacts stripped before pooling (blindness)')
+  assert.ok(planBranch.includes('.filter(c => c.valid)'), 'only valid candidates enter the pool')
+})
+
 test('plan kind BYPASSES the mechanical patch gate with a fail-closed staging validity check', () => {
   assert.match(BLOCK, /if \(rjKind === 'plan'\) \{[\s\S]*?\} else \{[\s\S]*?mechanicalPatchGate\(rjStaged, reviewDir, 'Rejudge'\)/,
     'gate is the else-branch of the kind switch — code path unchanged')
