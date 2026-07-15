@@ -1,6 +1,6 @@
 ---
 name: joust-bench
-description: Benchmark generation throughput (cold vs hot tok/s) for every model the joust-engine system can call (Anthropic / GLM / local MLX / codex / MiniMax). Two workload profiles — light (tiny paragraph) and heavy (>5k-token input context + long >5k-token output, representative of coding/agentic work). Thin wrapper over bin/je-bench.mjs. Use when the user asks to benchmark model speed, measure tokens/second, compare cold vs hot throughput across providers, or run /je-bench.
+description: Benchmark generation throughput (cold vs hot tok/s) for every model the joust-engine system can call (Anthropic / GLM / local MLX / codex / MiniMax / claudex via a local CLIProxyAPI proxy). Two workload profiles — light (tiny paragraph) and heavy (>5k-token input context + long >5k-token output, representative of coding/agentic work). Thin wrapper over bin/je-bench.mjs. Use when the user asks to benchmark model speed, measure tokens/second, compare cold vs hot throughput across providers, or run /je-bench.
 ---
 
 # je-bench — model throughput benchmark
@@ -21,9 +21,9 @@ node "<plugin-root>/bin/je-bench.mjs" --models <selection> [--profile light|heav
 
 `<selection>` (comma-separated, de-duped):
 - `all` — every callable model (local MLX list discovered live). **Default.**
-- a provider: `anthropic` | `glm` | `local` | `codex` | `minimax`
-- `<provider>:<id>` — e.g. `glm:glm-5.1`, `codex:codex-high`, `anthropic:opus`, `local:<omlx-id>`
-- a bare id — `opus`, `glm-5.2`, `minimax-m3`, `codex-high`, a local id
+- a provider: `anthropic` | `glm` | `local` | `codex` | `minimax` | `claudex`
+- `<provider>:<id>` — e.g. `glm:glm-5.1`, `codex:codex-high`, `anthropic:opus`, `local:<omlx-id>`, `claudex:gpt-5.6-sol`
+- a bare id — `opus`, `glm-5.2`, `minimax-m3`, `codex-high`, `gpt-5.6-sol`, a local id
 
 **Profiles** (`--profile`, default `light`; shorthand `--heavy` / `--light`):
 - `light` — a ~200-word paragraph; fast/cheap throughput smoke (output cap 2048).
@@ -43,7 +43,10 @@ model calls — cheap way to confirm the selection before spending),
   and show the user the plan before the real (paid) sweep.
 - The script handles auth from the environment exactly as the runners do
   (`ZAI_API_KEY`, `MINIMAX_API_KEY`, `OMLX_AUTH_TOKEN`; Anthropic uses the
-  session's own auth; codex uses `~/.codex/auth.json`). A provider whose key is
+  session's own auth; codex uses `~/.codex/auth.json`; claudex reads a
+  client-token file — `JE_CLAUDEX_TOKEN_FILE`, default
+  `~/.config/cliproxyapi/client-token` — against a local CLIProxyAPI proxy at
+  `JE_CLAUDEX_BASE_URL`, default `http://127.0.0.1:8317`). A provider whose key is
   unset is recorded as a failed row and the sweep continues — surface those rows.
 - Results accumulate across runs in the append-only JSONL; point the user at
   `<plugin>/.bench/results.jsonl` for history.

@@ -5,7 +5,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FAIL=0
-for f in glm-run.sh local-run.sh codex-run.sh minimax-run.sh grok-run.sh; do
+for f in glm-run.sh local-run.sh codex-run.sh minimax-run.sh grok-run.sh claudex-run.sh; do
   if grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+"?\$HERE/_je-run-lib\.sh' "$HERE/$f"; then
     echo "  ok   $f sources _je-run-lib.sh"
   else

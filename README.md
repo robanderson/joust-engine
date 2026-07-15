@@ -145,7 +145,7 @@ You can **override** the estimate by listing one of `short` / `medium` / `long` 
 tidy up the imports long @@JE:4
 ```
 
-The size word is recognised **only adjacent to the marker** and is stripped from the task (the after-marker form needs a comma/semicolon/end right after it), so an ordinary size word in the task body — `build a short-circuit evaluator`, `long division solver` — is left untouched. The numbers live in one place: `SIZE_PROFILES` in `bin/je-parse.mjs` (printable with `node bin/je-parse.mjs --size <label>`). They flow to the runner-based providers (GLM / local / codex / MiniMax / grok) as `JE_MAX_TURNS` / `JE_TIMEOUT_SECS`; native Anthropic attempts are uncapped.
+The size word is recognised **only adjacent to the marker** and is stripped from the task (the after-marker form needs a comma/semicolon/end right after it), so an ordinary size word in the task body — `build a short-circuit evaluator`, `long division solver` — is left untouched. The numbers live in one place: `SIZE_PROFILES` in `bin/je-parse.mjs` (printable with `node bin/je-parse.mjs --size <label>`). They flow to the runner-based providers (GLM / local / codex / MiniMax / grok / claudex) as `JE_MAX_TURNS` / `JE_TIMEOUT_SECS`; native Anthropic attempts are uncapped.
 
 ### Prose model spec
 
@@ -226,7 +226,7 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 
 ## Model providers
 
-Attempts can run on six providers. The **judge panel is held fixed** (the 6-seat council anchored on Anthropic Opus — the security veto and verification-heavy lenses are always Opus, three seats run codex-xhigh — or the `judges:1` single Opus judge) so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
+Attempts can run on seven providers. The **judge panel is held fixed** (the 6-seat council anchored on Anthropic Opus — the security veto and verification-heavy lenses are always Opus, three seats run codex-xhigh — or the `judges:1` single Opus judge) so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
 
 | Provider | Models (selectable axis) | Dispatch | Auth (from the **environment**) |
 |---|---|---|---|
@@ -235,6 +235,7 @@ Attempts can run on six providers. The **judge panel is held fixed** (the 6-seat
 | **Local MLX** | dynamic on-device list (via the `omlx` server) | `claude` pointed at `http://127.0.0.1:8000` via `bin/local-run.sh` | `OMLX_AUTH_TOKEN` |
 | **Codex (OpenAI)** | `gpt-5.5`, axis = reasoning effort: `codex-low/medium/high/xhigh` | `codex exec` via `bin/codex-run.sh` | `~/.codex/auth.json` (no env var) |
 | **MiniMax** | `MiniMax-M3` (the only model) | `claude` pointed at the MiniMax endpoint via `bin/minimax-run.sh` | `MINIMAX_API_KEY` |
+| **Claudex (CLIProxyAPI)** | `gpt-5.6-sol` · `gpt-5.6-terra` · `gpt-5.6-luna` | `claude` pointed at a **local CLIProxyAPI proxy** via `bin/claudex-run.sh` | client-token **file** (`JE_CLAUDEX_TOKEN_FILE`, default `~/.config/cliproxyapi/client-token`); endpoint `JE_CLAUDEX_BASE_URL` (default `http://127.0.0.1:8317`) |
 
 A few provider specifics worth knowing:
 
@@ -246,7 +247,7 @@ A few provider specifics worth knowing:
 
 **Every runner reads its key from the environment** — never by sourcing or grepping rc files — so the providers stay uniform. A provider whose key is unset produces an honest failure, not a fake fallback.
 
-**Provenance check (the anti-spoofing guard).** Every non-Anthropic attempt writes a marker into its run log proving it actually hit the intended endpoint — `JOUST-GLM-PROVENANCE endpoint=api.z.ai`, `JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000`, `JOUST-CODEX-PROVENANCE endpoint=api.openai.com`, `JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io` — plus a `DONE exit=0` with no `TIMEOUT`/`ERROR`. The validator is **line-anchored and provider-specific** (`^JOUST-<PROV>-…`), so an attempt whose own deliverable merely *mentions* a marker token can't false-fail. A candidate with no marker or no saved file is treated as a failed attempt and excluded; the round proceeds over the survivors.
+**Provenance check (the anti-spoofing guard).** Every non-Anthropic attempt writes a marker into its run log proving it actually hit the intended endpoint — `JOUST-GLM-PROVENANCE endpoint=api.z.ai`, `JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000`, `JOUST-CODEX-PROVENANCE endpoint=api.openai.com`, `JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io`, `JOUST-CLAUDEX-PROVENANCE endpoint=127.0.0.1:8317` — plus a `DONE exit=0` with no `TIMEOUT`/`ERROR`. The validator is **line-anchored and provider-specific** (`^JOUST-<PROV>-…`), so an attempt whose own deliverable merely *mentions* a marker token can't false-fail. A candidate with no marker or no saved file is treated as a failed attempt and excluded; the round proceeds over the survivors.
 
 ---
 
@@ -452,6 +453,7 @@ joust-engine/
 │   ├── codex-run.sh
 │   ├── minimax-run.sh
 │   ├── grok-run.sh
+│   ├── claudex-run.sh                  #   (claudex = claude on gpt-5.6-* via a local CLIProxyAPI proxy)
 │   ├── je-bench.mjs                    # the throughput benchmark
 │   └── README.je-bench.md              # je-bench usage + results-format reference
 ├── docs/
