@@ -37,9 +37,9 @@ It is invoked like the other `bin/` tools (a plain script run with `node` /
 | Token            | Meaning                                                            |
 |------------------|-------------------------------------------------------------------|
 | `all`            | every callable model across every provider (default)              |
-| `<provider>`     | every model of a provider: `anthropic` `glm` `local` `codex` `minimax` `grok` |
-| `<provider>:<id>`| one model, e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`, `anthropic:opus` |
-| `<id>`           | a bare id matched against the catalogue (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, `grok-build`, a local id) |
+| `<provider>`     | every model of a provider: `anthropic` `glm` `local` `codex` `minimax` `grok` `claudex` |
+| `<provider>:<id>`| one model, e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`, `anthropic:opus`, `claudex:gpt-5.6-sol` |
+| `<id>`           | a bare id matched against the catalogue (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, `grok-build`, `gpt-5.6-sol`, a local id) |
 
 Other flags: `--profile light|heavy` (`--heavy`/`--light` shorthand; default
 `light`), `--list` (dry-run), `--timeout <secs>` (per-call backstop), `--help`.
@@ -72,6 +72,12 @@ all-models sweep (dogfood **D-0005**). The profile name is recorded on every row
 - **Grok (xAI)** — `grok-build` / `grok-composer-2.5-fast` on a `-m` model axis via the
   `grok` headless CLI; auth from a `grok.com` OAuth session (`~/.grok/auth.json`) or
   `XAI_API_KEY` (no env key injected, mirroring codex's `~/.codex/auth.json`).
+- **Claudex (CLIProxyAPI)** — `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` via `claude`
+  pointed at a **local CLIProxyAPI proxy** that exposes the Anthropic API at its root
+  (`JE_CLAUDEX_BASE_URL`, default `http://127.0.0.1:8317`); **Bearer** token read from a
+  client-token **file** (`JE_CLAUDEX_TOKEN_FILE`, default `~/.config/cliproxyapi/client-token`),
+  never from the ambient environment. Mirrors `bin/claudex-run.sh`. A missing token file or a
+  down proxy is recorded as a failed row and the sweep continues.
 
 All keys come from the **environment** (never sourcing rc files), exactly as the
 runners do. A provider whose key is unset is recorded as a failed entry and the

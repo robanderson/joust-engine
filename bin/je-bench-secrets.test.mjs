@@ -11,7 +11,8 @@ const SRC = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), 'je-be
 test('scrubbedEnv strips every known secret name (incl. all provider keys + forge/cloud)', () => {
   assert.ok(SRC.includes('function scrubbedEnv()'), 'helper exists')
   for (const k of ['ZAI_API_KEY', 'MINIMAX_API_KEY', 'OMLX_AUTH_TOKEN', 'OPENAI_API_KEY', 'XAI_API_KEY',
-                   'ANTHROPIC_API_KEY', 'GH_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'GOOGLE_APPLICATION_CREDENTIALS',
+                   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+                   'GH_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'GOOGLE_APPLICATION_CREDENTIALS',
                    'NPM_TOKEN', 'SSH_AUTH_SOCK'])
     assert.ok(SRC.includes(`'${k}'`), `BENCH_SECRET_KEYS covers ${k}`)
 })

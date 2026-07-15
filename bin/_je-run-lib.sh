@@ -28,9 +28,14 @@ je_unlink_symlink "$LOG"
 # readable as ANTHROPIC_AUTH_TOKEN (the CLI needs it in-env) — a full fix needs an out-of-env
 # credential broker, out of scope; this closes the CROSS-provider + forge + cloud exfil surface,
 # which is the real multi-credential exposure. Internal name (no JE_ prefix) so rebrand won't touch it.
+# ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL are in the list too (issue #7): an operator following the
+# claudex recipe interactively may have the CLIProxyAPI client token EXPORTED in their shell, and no
+# other provider's child may ever see it. Safe to strip globally: every runner that needs these vars
+# sets them COMMAND-SCOPED inside its own run_try, AFTER this scrub runs.
 je_scrub_child_secrets() {
   local v
   for v in ZAI_API_KEY MINIMAX_API_KEY OMLX_AUTH_TOKEN OPENAI_API_KEY XAI_API_KEY ANTHROPIC_API_KEY \
+           ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
            GH_TOKEN GITHUB_TOKEN GITHUB_PAT GH_ENTERPRISE_TOKEN \
            AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
            GOOGLE_APPLICATION_CREDENTIALS GCP_SA_KEY GCLOUD_SERVICE_KEY \

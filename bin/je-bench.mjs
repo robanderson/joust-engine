@@ -43,7 +43,7 @@
 // =============================================================================
 
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, appendFileSync, existsSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs'
+import { mkdirSync, appendFileSync, existsSync, writeFileSync, unlinkSync, mkdtempSync, readFileSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir, tmpdir } from 'node:os'
@@ -179,7 +179,7 @@ const LOCAL_TIMEOUT_SECS = PROFILES.light.localTimeoutSecs   // a cold MLX weigh
 // SELECTION GRAMMAR (comma-separated; whitespace ignored; de-duped):
 //   all                          -> every callable model across every provider
 //   <provider>                   -> every model of that provider
-//                                   providers: anthropic | glm | local | codex | minimax
+//                                   providers: anthropic | glm | local | codex | minimax | grok | claudex
 //   <provider>:<id>              -> one specific model, e.g. glm:glm-5.1, codex:codex-high,
 //                                   local:gemma-4-26b-a4b-it-8bit, anthropic:opus
 //   <id>                         -> a bare id resolved against the known/discovered catalogue
@@ -227,7 +227,7 @@ Options:
 
 Selection grammar (comma-separated, de-duped):
   all                      every callable model (local list discovered live)
-  <provider>               anthropic | glm | local | codex | minimax
+  <provider>               anthropic | glm | local | codex | minimax | grok | claudex
   <provider>:<id>          e.g. glm:glm-5.1, codex:codex-high, local:<omlx-id>, anthropic:opus
   <id>                     a bare id resolved against the catalogue (opus, glm-5.2, minimax-m3, codex-high, ...)
 
@@ -264,6 +264,9 @@ const CODEX_MODELS = [
   { provider: 'codex', id: 'codex-medium', effort: 'medium' },
   { provider: 'codex', id: 'codex-high', effort: 'high' },
   { provider: 'codex', id: 'codex-xhigh', effort: 'xhigh' },
+  // gpt-5.6 family (2026-07-15, issue #7 Arm A): model overrides the gpt-5.5 default; sol-high
+  // is the engine's default codex seat (bare codex -> codex-sol, effort pinned high).
+  { provider: 'codex', id: 'codex-sol', effort: 'high', model: 'gpt-5.6-sol' },
 ]
 
 // MiniMax — one model, no --model flag (ANTHROPIC_MODEL pins MiniMax-M3). Bearer
@@ -277,6 +280,17 @@ const MINIMAX_MODELS = [
 const GROK_MODELS = [
   { provider: 'grok', id: 'grok-build', model: 'grok-build' },
   { provider: 'grok', id: 'grok-composer-2.5-fast', model: 'grok-composer-2.5-fast' },
+]
+
+// Claudex — `claude` pointed at a LOCAL CLIProxyAPI instance exposing the Anthropic API (/v1/messages)
+// at its ROOT, serving OpenAI-family gpt-5.6 models (benchmark Arm B: Claude Code as the harness,
+// gpt-5.6-* as the model; mirrors bin/claudex-run.sh). Bearer auth via the contents of a client-token
+// FILE (JE_CLAUDEX_TOKEN_FILE, default ~/.config/cliproxyapi/client-token) — the token never lives in
+// the ambient environment. Base url from JE_CLAUDEX_BASE_URL (default http://127.0.0.1:8317).
+const CLAUDEX_MODELS = [
+  { provider: 'claudex', id: 'gpt-5.6-sol', flag: 'gpt-5.6-sol' },
+  { provider: 'claudex', id: 'gpt-5.6-terra', flag: 'gpt-5.6-terra' },
+  { provider: 'claudex', id: 'gpt-5.6-luna', flag: 'gpt-5.6-luna' },
 ]
 
 // ----------------------------------------------------------------------------
@@ -310,7 +324,7 @@ function discoverLocalModels() {
 // ============================================================================
 // Catalogue assembly + selection resolution.
 // ============================================================================
-const PROVIDERS = ['anthropic', 'glm', 'local', 'codex', 'minimax', 'grok']
+const PROVIDERS = ['anthropic', 'glm', 'local', 'codex', 'minimax', 'grok', 'claudex']
 
 function buildCatalogue() {
   const local = discoverLocalModels()
@@ -321,6 +335,7 @@ function buildCatalogue() {
     ...CODEX_MODELS,
     ...MINIMAX_MODELS,
     ...GROK_MODELS,
+    ...CLAUDEX_MODELS,
   ]
   return { all, localNote: local.note }
 }
@@ -462,10 +477,14 @@ function perlAlarmArgv(timeoutSecs, cmdArgv) {
   const PERL = `
     my $t = shift @ARGV;
     my $p = fork; if (!defined $p) { exit 127 }
-    if ($p == 0) { exec @ARGV; exit 127 }
-    $SIG{ALRM} = sub { kill "TERM", $p; sleep 3; kill "KILL", $p; exit 124 };
+    if ($p == 0) { setpgrp(0, 0); exec @ARGV; exit 127 }
+    $SIG{ALRM} = sub { kill "TERM", -$p; sleep 3; kill "KILL", -$p; exit 124 };
     alarm $t; waitpid($p, 0); exit($? >> 8);
   `
+  // setpgrp + negative-pid kill: signal the child's whole PROCESS GROUP, not just the
+  // direct child. Claude-CLI benches spawn grandchildren that otherwise survive the
+  // timeout and keep calling the API (observed live 2026-07-15: a timed-out claudex
+  // heavy cell kept billing for ~25 min after its 124).
   return ['-e', PERL, String(timeoutSecs), ...cmdArgv]
 }
 
@@ -476,6 +495,11 @@ function perlAlarmArgv(timeoutSecs, cmdArgv) {
 // back ONLY the one auth var it needs.
 const BENCH_SECRET_KEYS = [
   'ZAI_API_KEY', 'MINIMAX_API_KEY', 'OMLX_AUTH_TOKEN', 'OPENAI_API_KEY', 'XAI_API_KEY', 'ANTHROPIC_API_KEY',
+  // issue #7: an operator following the claudex recipe interactively may have the CLIProxyAPI client
+  // token exported as ANTHROPIC_AUTH_TOKEN (+ ANTHROPIC_BASE_URL) — no bench child may inherit it.
+  // The providers that need these vars (glm/minimax/claudex) re-add them explicitly per dispatch;
+  // anthropic uses the session's own auth, never these env vars.
+  'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
   'GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_PAT', 'GH_ENTERPRISE_TOKEN',
   'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
   'GOOGLE_APPLICATION_CREDENTIALS', 'GCP_SA_KEY', 'GCLOUD_SERVICE_KEY',
@@ -538,6 +562,28 @@ function dispatchGlm(target, timeoutSecs, cfg) {
     ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air',
+  }
+  return runClaudeFamily({ env, flagArgv: ['--model', target.flag], timeoutSecs, cfg })
+}
+
+// Claudex — local CLIProxyAPI proxy, Bearer via the client-token FILE (never an env var), the model
+// mirrored into CLAUDE_CODE_SUBAGENT_MODEL + effort always enabled (mirrors bin/claudex-run.sh; the
+// proxy also honours effort-in-parens model names like "gpt-5.6-sol(high)"). The token is read at
+// dispatch time and injected ONLY into this child's env, never echoed or logged.
+function claudexTokenFile() {
+  return process.env.JE_CLAUDEX_TOKEN_FILE || join(homedir(), '.config', 'cliproxyapi', 'client-token')
+}
+function dispatchClaudex(target, timeoutSecs, cfg) {
+  let token = ''
+  try { token = readFileSync(claudexTokenFile(), 'utf8').trim() } catch { /* handled below */ }
+  if (!token) {
+    return { ok: false, secs: 0, tokens: 0, inputTokens: 0, estimated: false, error: `claudex client-token file missing/unreadable/empty: ${claudexTokenFile()} (set JE_CLAUDEX_TOKEN_FILE)` }
+  }
+  const env = {
+    ANTHROPIC_BASE_URL: process.env.JE_CLAUDEX_BASE_URL || 'http://127.0.0.1:8317',
+    ANTHROPIC_AUTH_TOKEN: token,                              // Bearer (the proxy's client token)
+    CLAUDE_CODE_SUBAGENT_MODEL: target.flag,                  // same model for any harness-spawned child
+    CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: '1',
   }
   return runClaudeFamily({ env, flagArgv: ['--model', target.flag], timeoutSecs, cfg })
 }
@@ -610,7 +656,7 @@ function dispatchCodex(target, timeoutSecs, cfg) {
     '-c', 'mcp_servers={}',
     '--json',                                // emit structured events (token usage if available)
     '-o', lastFile,
-    '-m', 'gpt-5.5',
+    '-m', target.model || 'gpt-5.5',        // gpt-5.6 entries carry their own model id
     '-c', `model_reasoning_effort=${target.effort}`,
     cfg.prompt,
   ]
@@ -744,6 +790,7 @@ const DISPATCH = {
   codex: dispatchCodex,
   minimax: dispatchMinimax,
   grok: dispatchGrok,
+  claudex: dispatchClaudex,
 }
 
 // ============================================================================
