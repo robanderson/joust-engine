@@ -38,7 +38,7 @@ test('fresh blind letters with rotation — cold re-judge, no letter alignment w
 test('reuses the SAME machinery as a live implement round: gate, inContention, code council, gate check', () => {
   assert.ok(BLOCK.includes('mechanicalPatchGate(rjStaged, reviewDir'), 'the real gate')
   assert.ok(BLOCK.includes('.filter(inContention)'), 'dedup contention filter')
-  assert.match(BLOCK, /judge\('code reviewer', rjBlind, false, `\$\{reviewDir\}\/_pool\.md`, RANK_SCHEMA, 'Rejudge', 'rejudge-review', LENSES, 'final'\)/, 'full code council, final style (steelman)')
+  assert.match(BLOCK, /judge\(rjKind === 'plan' \? 'plan reviewer' : 'code reviewer', rjBlind, false, `\$\{reviewDir\}\/_pool\.md`, RANK_SCHEMA, 'Rejudge', 'rejudge-review', rjKind === 'plan' \? PLAN_LENSES : LENSES, 'final'\)/, 'full council (kind-selected lens profile), final style (steelman)')
   assert.ok(BLOCK.includes('implGatePassed({ review: rjReview, blind: rjBlind })'), 'winner via the same gate predicate')
 })
 
@@ -83,4 +83,24 @@ test('M19: a hex-but-unresolvable rejudgeBaseSha FAILS the rejudge (fail-closed,
   assert.ok(BLOCK.includes('echo "JRPIN $(wc -c'), 'the pin reports resolved bytes')
   assert.ok(BLOCK.includes('if (!pinBytes) {'), 'zero bytes (unresolved) is a failure')
   assert.match(BLOCK, /did not resolve to a commit in this repo — refusing to gate against the wrong baseline/)
+})
+
+// ---- plan-pool rejudge (tracker #15, 2026-07-16) ----
+test('rejudgeKind=plan selects the PLAN council and briefing; code kind (and default) keep the code council', () => {
+  assert.match(BLOCK, /const rjKind = A\.rejudgeKind === 'plan' \? 'plan' : 'code'/, 'kind arg, code default')
+  assert.ok(BLOCK.includes("rjKind === 'plan' ? 'plan reviewer' : 'code reviewer'"), 'plan-reviewer briefing swap')
+  assert.ok(BLOCK.includes("rjKind === 'plan' ? PLAN_LENSES : LENSES"), 'plan lens profile swap')
+})
+
+test('plan kind BYPASSES the mechanical patch gate with a fail-closed staging validity check', () => {
+  assert.match(BLOCK, /if \(rjKind === 'plan'\) \{[\s\S]*?\} else \{[\s\S]*?mechanicalPatchGate\(rjStaged, reviewDir, 'Rejudge'\)/,
+    'gate is the else-branch of the kind switch — code path unchanged')
+  assert.ok(BLOCK.includes("'empty-staging'"), 'zero staged files marks the candidate invalid')
+  assert.ok(BLOCK.includes("'stage-verify-failed'"), 'a missing/failed JRJ relay line is fail-closed invalid')
+  assert.match(BLOCK, /JRJ\\s\+\(\[A-Z\]\)\\s\+\(\\d\+\)/, 'validity parses the staging relay JRJ lines')
+})
+
+test('rejudge_kind is stamped into mapping.json and the return value', () => {
+  const stamps = (BLOCK.match(/rejudge_kind: rjKind/g) || []).length
+  assert.ok(stamps >= 4, `rejudge_kind stamped at persist+return sites (got ${stamps})`)
 })
