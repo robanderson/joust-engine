@@ -75,6 +75,9 @@ const NORMALISER = {
   'opus':   { model: 'opus',   dispatch: 'anthropic' },
   'sonnet': { model: 'sonnet', dispatch: 'anthropic' },
   'haiku':  { model: 'haiku',  dispatch: 'anthropic' },
+  // fable (2026-07-15, tracker #12): the Fable/Mythos tier above opus; native Claude Code
+  // subagent model like the three above — the Agent tool accepts model:'fable' directly.
+  'fable':  { model: 'fable',  dispatch: 'anthropic' },
 
   // GLM (z.ai). Bare 'glm' defaults to glm-5.2 (documented strongest).
   'glm':         { model: 'glm-5.2',     dispatch: 'glm' },
@@ -196,7 +199,7 @@ const MODEL_TOKEN_RX =
     // bare 'composer 2.5 fast' (no 'grok' prefix) — the operator's Composer name on its own
     '|composer(?:\\s*-?\\s*2\\.5(?:\\s*-?\\s*fast)?)?' +
     '|glm(?:\\s*-?\\s*[0-9](?:\\.[0-9])?)?(?:\\s*-?\\s*air)?' +
-    '|opus|sonnet|haiku' +
+    '|opus|sonnet|haiku|fable' +
     '|minimax(?:\\s*-?\\s*m3)?|m3' +
     // bare gpt-5.6 variant names (short aliases, like 'm3'/'composer'). Word-bounded
     // so ordinary task words ('2 solvers', 'lunar') are never read as a spec item.
@@ -1102,7 +1105,7 @@ function parse(rawInput) {
     if (allUnknowns.length) {
       errors.push(
         'Unrecognised model token(s) in spec: ' + allUnknowns.map(u => '"' + u + '"').join(', ') +
-        '. Known: opus, sonnet, haiku, glm[-5.2/5.1/4.7/4.5-air], codex[-low/medium/high/xhigh/-sol/terra/luna], ' +
+        '. Known: opus, sonnet, haiku, fable, glm[-5.2/5.1/4.7/4.5-air], codex[-low/medium/high/xhigh/-sol/terra/luna], ' +
         'gpt-5.6, minimax-m3, grok[-build]/grok-composer-2.5-fast, or a live local id. Re-state the spec (a dropped token would silently change N).'
       );
       assignment = null;
