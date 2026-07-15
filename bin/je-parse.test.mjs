@@ -203,6 +203,15 @@ parseCase('conflict 4 vs 5', 'improve X @@JE:4 with 2 opus, 2 glm, 1 codex',
 parseCase('agree marker+spec', 'do x with 2 opus and 1 sonnet @@JE:3',
   { n: 3, z: 1, assignment: ['opus', 'opus', 'sonnet'] }, { noErrors: true });
 
+// fable (2026-07-15, tracker #12): Fable/Mythos-tier Anthropic seat.
+parseCase('fable seats in a mixed spec', 'improve x with 2 opus, 2 fable, 2 codex sol @@JE:6',
+  { n: 6, mode: 1, z: 1,
+    assignment: ['opus', 'opus', 'fable', 'fable', 'codex-sol', 'codex-sol'] }, { noErrors: true });
+parseCase('fable pairs with codex', 'do y with 1 fable and 1 codex joust:2',
+  { n: 2, z: 1, assignment: ['fable', 'codex-sol'] }, { noErrors: true });
+parseCase('fable word-boundary: "fabled" stays task text', 'restore the fabled parser with 2 opus @@JE:2',
+  { n: 2, z: 1, assignment: ['opus', 'opus'] }, { noErrors: true });
+
 // --- digit-noun guard ---
 // '3 bugs' / '5 tests' are task text, NOT a spec: n stays the explicit sigil N,
 // assignment stays null, needsGate stays false (SKILL gates off assignment===null).

@@ -109,7 +109,7 @@ This is the gate from the operating rule (run it when Phase 0 returned `needsGat
 > Which models do you want for the attempts? (N defaults to 6, passes to 2)
 > 1. Top Mixed — spread N across Opus, glm-5.2, codex-high (even split)
 > 2. Specify Mix — choose a model per attempt (custom)
-> 3. Opus — Anthropic, highest capability
+> 3. Opus — Anthropic, highest capability (a `fable` token is also spellable in prose specs when the Fable/Mythos tier is available to the session)
 > 4. Sonnet — Anthropic, balanced
 > 5. Haiku — Anthropic, fastest and cheapest
 > 6. GLM — z.ai models (I'll then ask which GLM model)
@@ -121,7 +121,7 @@ This is the gate from the operating rule (run it when Phase 0 returned `needsGat
 Handle the answer (if Phase 0 already produced an `assignment` — a prose spec or the Top Mixed keyword — skip this menu and use it directly):
 
 - **Option 1 (Top Mixed):** if N is not yet known, ask for it. Allocate N across `[opus, glm-5.2, codex-high]` as evenly as possible (remainder priority opus > glm-5.2 > codex-high; N=2 → `[opus, glm-5.2]`) — the same computation `je-parse.mjs` does for the `top mixed` keyword. Record it, e.g. N = 5 → `[opus, opus, glm-5.2, glm-5.2, codex-high]`.
-- **Option 2 (Specify Mix):** walk the attempts one at a time, attempt 1 to attempt N. For each, ask which concrete model to use, offering the three Anthropic models, the four GLM models, the live local model ids, the four codex effort levels, **minimax-m3, and the two grok variants (grok-build / grok-composer-2.5-fast)** — not the group names. Record each choice, e.g. `[opus, glm-5.2, codex-high, grok-build]`.
+- **Option 2 (Specify Mix):** walk the attempts one at a time, attempt 1 to attempt N. For each, ask which concrete model to use, offering the three Anthropic menu models (plus `fable` when available), the four GLM models, the live local model ids, the four codex effort levels, **minimax-m3, and the two grok variants (grok-build / grok-composer-2.5-fast)** — not the group names. Record each choice, e.g. `[opus, glm-5.2, codex-high, grok-build]`.
 - **Options 3, 4, or 5 (uniform Anthropic):** every attempt uses that single Anthropic model. Record the assignment, e.g. for N = 4 with Sonnet: `[sonnet, sonnet, sonnet, sonnet]`.
 - **Option 6 (GLM):** drill down with a second question, then stop again and wait. Every attempt uses the one chosen GLM model:
   > Which GLM model?
