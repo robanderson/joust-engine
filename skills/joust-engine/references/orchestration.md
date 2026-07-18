@@ -101,6 +101,21 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
                                          // from codexTimeoutSecs, the ATTEMPT wall-clock); engine
                                          // fallback 1500 (judging reads a whole blind pool + reasons at
                                          // xhigh effort, so it gets more headroom than an attempt).
+  runRepoBase: "git@<your-git-host>:<org>", // optional — the git RESULTS BUS (tracker #21 phase 2): a
+                                         // push-to-create remote base. Set => the engine seeds je-run-<runId>
+                                         // before Round 1, pushes each attempt's deliverables to a per-worker
+                                         // orphan branch under a NEUTRAL identity (worker-<label> <worker@je>)
+                                         // + its runner log to main (bounded push||pull-rebase retry), and
+                                         // publishes the UNMASKING artifacts (mapping/summaries/verdicts) to
+                                         // main strictly AFTER the terminal persist. ABSENT => feature off
+                                         // (bin/je-run-repo.sh exits with its distinct "disabled" code).
+                                         // Strictly fail-open: failures log JE-RUNREPO-FAIL and never fail the
+                                         // run; local .runs stays the source of truth. ALWAYS a generic
+                                         // placeholder in committed files — the real host AND the git-push/
+                                         // clone allowlist entries the worker pushes need belong in
+                                         // machine-local settings (settings.local.json), never committed.
+                                         // Env for direct bin/je-run-repo.sh use: JE_RUN_REMOTE_BASE (same
+                                         // value), JE_RUN_REPO_CACHE (local checkout cache root).
   issueRunner: "<plugin-root>/bin/je-issue.sh", // optional but recommended — enables auto-filing of
                                          // engine-fault RC classes (01/02 after retries, 04–09) as ONE
                                          // deduped, privacy-scrubbed `dogfood` issue per class per run.

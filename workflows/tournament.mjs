@@ -26,8 +26,16 @@ export const meta = {
 //   mode: 'single' | 'two',
 //   runDir: string,                       // absolute base dir for workspaces
 //   glmRunner / localRunner / codexRunner / minimaxRunner / grokRunner: string,  // bundled runner-script paths (per provider used)
+//   runRepoBase: string,                  // OPTIONAL git results bus (tracker #21 phase 2): a push-to-create
+//                                          // remote base (e.g. 'git@<your-git-host>:<org>' — NEVER a hardcoded
+//                                          // hostname; operators keep the real value + push allowlist in
+//                                          // machine-local settings). Set => the engine inits je-run-<runId>,
+//                                          // pushes each attempt's deliverables/log post-completion, and
+//                                          // publishes the unmasking artifacts POST-RUN. Absent => feature off.
+//                                          // Strictly fail-open: any bus failure logs JE-RUNREPO-FAIL and the
+//                                          // run continues (local .runs artifacts stay the source of truth).
 //   codexTimeoutSecs: number,             // optional wall-clock backstop for codex (default 600)
-//   grokTimeoutSecs: number,              // optional wall-clock backstop for grok (default 600); grok ALSO honours grokMaxTurns
+//   grokTimeoutSecs: number,             // optional wall-clock backstop for grok (default 600); grok ALSO honours grokMaxTurns
 //   grokWebSearch: boolean,               // optional — true enables grok's web search (default false = hermetic, like the other providers)
 //   quorumClose: boolean,                 // optional — false disables N-1 quorum close (default on where the runtime has timers+clock)
 //   quorumGraceSecs: number,              // optional — grace buffer added to 2x a seat's wall clock (default 90)
@@ -1267,7 +1275,12 @@ function dispatch(a, ws, guidance, phaseTitle, phaseKind = 'plan', seedPlanPath 
   // agentLadder: runner dispatches (opts.agentType) pass straight through; a NATIVE anthropic
   // attempt that is blocked (throw/null) gets ONE downgrade-retry rung (model fallback ladder).
   return agentLadder(prompt, opts)
-    .then(res => ({ label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws, res }))
+    .then(res => {
+      // Run-repo bus (#21 phase 2): the attempt's finish path — fire-and-forget push of its
+      // deliverables (+ runner log) as the seat resolves. Fail-open, never awaited here.
+      runRepoAttemptPush(a.label, a.dispatch || 'anthropic', ws, phaseTitle)
+      return { label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws, res }
+    })
     .catch(e => {
       const msg = String(e)
       if (opts.agentType && isUnregisteredAgentError(msg)) {
@@ -3784,6 +3797,68 @@ async function persist(pairs, phaseTitle) {
   } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`); return [] }
 }
 
+// ---- begin: run-repo results bus (tracker #21, phase 2) -----------------------------------------
+// OPTIONAL git "results bus": when args.runRepoBase is set (a push-to-create remote base like
+// 'git@<your-git-host>:<org>' — NEVER hardcoded anywhere in this repo), the engine mirrors run
+// artifacts into a per-run repo je-run-<runId> via bin/je-run-repo.sh (found through the same
+// runner-derived PLUGIN_BIN the structural persist uses): `init` seeds the repo before Round 1;
+// each attempt's completion fires a push of its deliverables to a per-worker orphan branch under
+// a NEUTRAL identity (worker-<label> <worker@je> — no model identity reaches the bus mid-run)
+// plus its runner log to main (the validated bounded push||pull-rebase retry loop); `publish`
+// pushes the UNMASKING artifacts (mapping.json, SUMMARY*, council verdicts) STRICTLY AFTER the
+// terminal persist — never mid-run, so no live blind seat can read identities off the bus.
+// STRICTLY fail-open: every op is shell-guarded with `|| echo JE-RUNREPO-FAIL <op>` and a failed
+// or absent push NEVER fails the run — the local .runs artifacts remain the source of truth this
+// phase. repoMode attempts are excluded from per-attempt pushes (their deliverable is already a
+// branch in the real repo; mirroring a whole worktree checkout is not a phase-2 concern).
+// LAZY by design (function declarations only, no top-level evaluation beyond the pending array):
+// several structural tests extract-and-eval source slices that may span this block, and a lazy
+// block is inert under eval regardless of which identifiers the slice sandbox provides.
+const runRepoPending = [] // fire-and-forget per-attempt pushes; settled before the final publish
+function runRepoBaseArg() { return typeof A.runRepoBase === 'string' ? A.runRepoBase.trim() : '' }
+function runRepoScriptPath() { return PLUGIN_BIN ? `${PLUGIN_BIN}/je-run-repo.sh` : null }
+function runRepoEnabled() { return !!(runRepoBaseArg() && runRepoScriptPath()) }
+function runRepoShell(op, extraArgs) {
+  return `JE_RUN_REMOTE_BASE=${q(runRepoBaseArg())} bash ${q(runRepoScriptPath())} ${op} ${q(safeRunId)}${extraArgs.map(a => ` ${q(a)}`).join('')} || echo "JE-RUNREPO-FAIL ${op}"`
+}
+async function runRepoRun(opLabel, cmd, phaseTitle) {
+  if (!runRepoEnabled()) return
+  const res = await agentLadder(
+    `Joust-engine run-repo step (an OPTIONAL results-bus mirror; a printed failure marker is expected behaviour, not an error to fix): run this exact shell command in ONE Bash call and return its ENTIRE stdout, verbatim, in the "raw" field. The command never exits non-zero (failures print a JE-RUNREPO-FAIL line instead). Do not retry, diagnose, or do anything else:\n\n${cmd}`,
+    { model: HELPER_MODEL, schema: POOL_VERIFY_SCHEMA, phase: phaseTitle, label: `run-repo-${opLabel}` }
+  ).catch(() => null)
+  const raw = res && typeof res.raw === 'string' ? res.raw : ''
+  if (!res || raw.includes('JE-RUNREPO-FAIL')) {
+    log(`JE-RUNREPO-FAIL ${opLabel} (${phaseTitle}) — continuing; the local .runs artifacts remain the source of truth.`)
+  }
+}
+// init: seeds je-run-<runId> (README + run metadata) via push-to-create, before Round 1 dispatch.
+async function runRepoInit() {
+  if (!runRepoEnabled()) return
+  await runRepoRun('init', runRepoShell('init', []), 'Round 1')
+}
+// Per-attempt push, fired from dispatch() as each attempt RESOLVES (the seat's existing finish
+// path): deliverables to the per-label orphan branch + the runner log (when the dispatch family
+// has one; native anthropic seats have no runner log) to main. Fire-and-forget — never awaited on
+// the round's critical path; pending promises are settled before publish.
+function runRepoAttemptPush(label, dispatchKind, ws, phaseTitle) {
+  if (!runRepoEnabled() || repoMode) return
+  const { logf } = dispatchRunner(dispatchKind)
+  const cmd = [runRepoShell('push_results', [label, ws])]
+    .concat(logf ? [runRepoShell('push_log', [label, `${ws}/${logf}`])] : [])
+    .join('; ')
+  runRepoPending.push(runRepoRun(`push-${label}`, cmd, phaseTitle).catch(() => null))
+}
+// publish: POST-RUN ONLY (the unmasking sequencing rule — mapping/summaries/verdicts reveal
+// candidate->model identities, so this must follow the TERMINAL persist of a run, never fire
+// mid-run). Settles any still-pending attempt pushes first.
+async function runRepoPublish(phaseTitle) {
+  if (!runRepoEnabled()) return
+  await Promise.allSettled(runRepoPending)
+  await runRepoRun('publish', runRepoShell('publish', [runDir]), phaseTitle)
+}
+// ---- end: run-repo results bus ------------------------------------------------------------------
+
 // Persist phase 2 (issue #33): the verdict.json entries for one review checkpoint. With a council
 // AND at least one verified per-seat file, the bulk never transits the model: a SMALL typed tally
 // skeleton (the result with $seat refs) lands first, then bin/je-assemble.mjs splices the
@@ -4213,6 +4288,7 @@ if (Array.isArray(A.rejudgeCandidates) && A.rejudgeCandidates.length) {
   const rjPick = !rjGate.pass && rjReview && rjReview.needs_orchestrator_pick ? rjReview.needs_orchestrator_pick : null
   await persist([{ path: `${runDir}/mapping.json`, content: json({ mode: 'rejudge', rejudge_kind: rjKind, n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), rc_summary: rcSummaryLive(), ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), candidates: rjMapping, winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}), no_consensus: !!(rjReview && rjReview.no_consensus) }) }], 'Rejudge')
   await maybeFileEngineIssues('Rejudge')
+  await runRepoPublish('Rejudge') // #21: post-terminal-persist (a rejudge run inits no run repo; publish push-to-creates it)
   return {
     mode: 'rejudge', rejudge_kind: rjKind, n: rjN, ...(LENS_VARIANT ? { lens_variant: LENS_VARIANT } : {}), mapping: rjMapping,
     winner: rjGate.winner, ...(rjWinnerEntry ? { winnerSource: rjWinnerEntry.source, winnerModel: rjWinnerEntry.model } : {}),
@@ -4667,6 +4743,7 @@ log(`▶ ${deriveSummary()}`) // issue #38: run-purpose summary as the first nar
 const __resumeErr = await resumeInit()
 if (__resumeErr) return __resumeErr
 await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
+await runRepoInit()  // run-repo bus (#21): seed je-run-<runId> via push-to-create — no-op unless args.runRepoBase; fail-open
 const r1Worktrees = attempts.map(a => ({ ...a, ws: repoMode ? worktreePath('round-1', a.label) : scratchPath('round-1', a.label) }))
 await buildWorktrees('round-1', r1Worktrees) // repoMode-only no-op otherwise
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
@@ -4723,6 +4800,7 @@ if (composeOnly) {
     { path: `${runDir}/SUMMARY.md`, content: summaryMd({ rcSummary: rcSummaryLive(), task, mode: 'composeOnly', n: N, unblind: true, r1mapping: evMapping, resume: resumeSummary() }) },
   ], 'Review')
   await maybeFileEngineIssues('Review')
+  await runRepoPublish('Review') // #21: terminal persist done — unmasking push is now allowed
   return {
     mode: 'composeOnly', ...(investigate ? { investigate: true } : {}), n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades,
     poolPath: `${runDir}/review-1/_pool.md`,
@@ -4821,10 +4899,12 @@ if (mode === 'single') {
       { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, planWinner: review.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human }) },
     ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
     await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+    await runRepoPublish(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3') // #21: post-terminal-persist
     await heartbeat('done', { phaseComplete: 'final' })
     return { mode, n: N, implement: true, plan: { round1: { mapping: r1mapping, review }, winner: review.winner }, implementPhase: impl, contributions, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades }
   }
   await maybeFileEngineIssues('Review')
+  await runRepoPublish('Review') // #21: post-terminal-persist
   await heartbeat('done', { phaseComplete: 'final' })
   return { mode, n: N, rc_summary: rcSummaryLive(), model_downgrades: modelDowngrades, round1: { mapping: r1mapping, review }, contributions }
 }
@@ -4981,6 +5061,10 @@ await persist([
 
 // Auto-file engine-fault issues AFTER durable persistence, so a filing hang can never lose artifacts.
 await maybeFileEngineIssues('Final rank')
+// #21 sequencing rule: in a plan-only run this IS the terminal persist, so the unmasking publish
+// may fire; an implement run is still mid-run here (blind implement councils follow) — publish
+// waits for the implement terminal below.
+if (!implement) await runRepoPublish('Final rank')
 if (!implement) await heartbeat('done', { phaseComplete: 'final' })
 
 // ===== IMPLEMENT PHASE hook — only with args.implement. =====================================
@@ -5052,6 +5136,7 @@ if (implement) {
     { path: `${runDir}/mapping.json`, content: json({ mode, n: N, rc_summary: rcSummaryLive(), implement: true, ...(dynamicMBucket ? { taskBucket: dynamicMBucket } : {}), round1: r1mapping, winner1: review.winner, final: finalMapping, planWinner: finalRank.winner, implementRounds: impl.rounds, implementWinner: impl.winner, implementWinnerRound: impl.winnerRound, needs_human: impl.needs_human, carriedOverWinner }) },
   ], impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
   await maybeFileEngineIssues(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3')
+  await runRepoPublish(impl.rounds === 4 ? 'Implement Round 4' : 'Implement Round 3') // #21: post-terminal-persist
   await heartbeat('done', { phaseComplete: 'final' })
   return {
     mode, n: N, implement: true,
