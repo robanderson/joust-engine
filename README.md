@@ -16,10 +16,15 @@ That one line triggers the loop: it asks which model(s) to run the 5 attempts on
 
 ## Contents
 
-- [The core idea](#the-core-idea)
-- [The rounds: plan, then implement](#the-rounds-plan-then-implement)
-- [The judging council](#the-judging-council)
-- [Invoking it: the sigil and prose forms](#invoking-it-the-sigil-and-prose-forms)
+- [The core bet](#the-core-bet)
+- [The shape of a run](#the-shape-of-a-run)
+  - [Plan rounds, then implement rounds](#plan-rounds-then-implement-rounds)
+  - [Diversity injection (Pool A / Pool B)](#diversity-injection-pool-a--pool-b)
+- [The decision pipeline](#the-decision-pipeline)
+  - [The council: six blind seats](#the-council-six-blind-seats)
+  - [How a verdict actually happens, stage by stage](#how-a-verdict-actually-happens-stage-by-stage)
+- [Where the cost and the variance live](#where-the-cost-and-the-variance-live)
+- [Using it](#using-it)
   - [The `@@JE` sigil](#the-je-sigil)
   - [Task size (dynamic limits)](#task-size-dynamic-limits)
   - [Prose model spec](#prose-model-spec)
@@ -27,30 +32,76 @@ That one line triggers the loop: it asks which model(s) to run the 5 attempts on
   - [Worked examples](#worked-examples)
   - [The slash-command form](#the-slash-command-form)
 - [Model providers](#model-providers)
-- [Diversity injection](#diversity-injection-pool-a--pool-b)
 - [Grand loops (`Z >= 2`)](#grand-loops-z--2)
-- [Run state: heartbeat, abort stamping, resume](#run-state-heartbeat-abort-stamping-resume)
-- [The dogfood backlog](#the-dogfood-backlog)
+- [Operations & audit](#operations--audit) — [run state & resume](#run-state-heartbeat-abort-stamping-resume) · [the artifact map](#what-a-run-leaves-behind) · [the dogfood backlog](#the-dogfood-backlog) · [`je-bench`](#the-benchmarking-system-je-bench)
 - [Installation & setup](#installation--setup)
-- [The benchmarking system (`je-bench`)](#the-benchmarking-system-je-bench)
 - [Repository layout](#repository-layout)
+- [Development](#development)
 - [Honest limitations](#honest-limitations)
 
 ---
 
-## The core idea
+## The core bet
 
 A single LLM attempt at a task is one sample from a noisy distribution. The Joust Engine spends tokens to do better than one sample, in two specific ways:
 
 1. **Generate, don't iterate.** Run **N attempts in parallel**, each a *single-pass exploration* — every attempt writes its solution **once and stops**. No attempt is told it's competing or being judged; none sees another's work. The refinement happens at the *tournament* level (many diverse one-shots → review), never inside a single attempt grinding "until it works." A rough or even failed attempt is useful signal, not a wasted slot.
 
-2. **Judge blind, with fixed strong judges.** A blind **judging council** (six seats; see below) receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. Each judge reads (and where feasible runs) each one, scores it through its lens, lists concrete pros and cons, ranks them, and casts a first-place vote; code tallies the majority. Because the judges never learn which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps (below) to keep that blindness real.
+2. **Judge blind, with fixed strong judges.** A blind **judging council** (six seats; see [the decision pipeline](#the-decision-pipeline)) receives the deliverables labelled `Candidate A`, `B`, `C`, … with **no model identities attached**. Each judge reads (and where feasible runs) each one, scores it through its lens, lists concrete pros and cons, ranks them, and casts a first-place vote; code tallies the majority. Because the judges never learn which model produced which candidate, a cheap model can win on merit — and the engine takes mechanical steps to keep that blindness real.
 
 The attempts are deliberately *diverse*: different model families, sampling stochasticity, and a per-attempt framing nudge ([diversity injection](#diversity-injection-pool-a--pool-b)) all push the N solutions apart so the review has genuinely different things to compare.
 
 ---
 
-## The rounds: plan, then implement
+## The shape of a run
+
+Everything else in this README is detail on one loop. Hold this picture:
+
+```text
+        you: "…task… @@JE:N[:M[:Z]]"
+                  │
+                  ▼
+   PARSE & GATE   bin/je-parse.mjs reads the raw message → N, passes, Z,
+                  task size, per-attempt model assignment (menu if needed)
+                  │
+                  ▼
+ ┌─ PLAN ROUND 1 ─────────────────────────────────────────────────┐
+ │  N isolated attempts in parallel (any provider mix): each gets │
+ │  ONE diversity nudge, writes ONE design brief, and hard-stops  │
+ │  — no iteration, no view of rivals or judges; wall-clock and   │
+ │  turn caps sized to the task                                   │
+ └────────────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+   STAGE BLIND    validate provenance fail-closed, exclude broken
+                  attempts, strip identities → Candidates A, B, C, …
+                  │
+                  ▼
+   DECISION       6 blind judges vote independently; CODE tallies.
+   PIPELINE       majority → winner; else steelman shootout (below)
+                  │
+   two pass? ─────┤ distil guidance (positives / pitfalls), SAVE the
+   (M = 2)        │ round-1 winner, DISCARD everything else
+                  ▼
+ ┌─ PLAN ROUND 2 ── N fresh attempts + guidance (never round-1 ───┐
+ │                  content), fresh nudges                        │
+ └────────────────────────────────────────────────────────────────┘
+                  │ final pool = round-2 + the carried winner,
+                  ▼ re-labelled blind → decision pipeline again
+          WINNING DESIGN BRIEF            (no `implement` → done)
+                  │
+ ┌─ IMPLEMENT R3 (+ R4 fallback) ── M implementers seeded with ───┐
+ │  the winning brief → code-lens council + deterministic gate    │
+ └────────────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+   ARTIFACTS      mapping.json · SUMMARY.md · review-*/ (council.json,
+                  verdict.md) · TIMELINE.md · run-state.json …
+   Z ≥ 2 ────▶    grand loop: branch → implement → verify → one PR
+                  per loop — never auto-merged
+```
+
+### Plan rounds, then implement rounds
 
 The tournament is a **cheap, wide planning phase** (always) followed by an **optional, narrow implementation phase** — high-N diversity where artifacts are cheap to produce and judge, a small strong pool where they are expensive (`docs/superpowers/specs/2026-07-03-plan-implement-rounds-design.md`):
 
@@ -61,52 +112,113 @@ The tournament is a **cheap, wide planning phase** (always) followed by an **opt
 | **Implement Round 3** | only with the `implement` keyword | M implementers are each seeded with the **winning design brief** (a deliberate exception to "never seed prior artifacts" — the brief is the spec: approach + acceptance criteria, implementation details are theirs); the blind **code-lens council** judges with verify/build/lint evidence folded in, and a deterministic **gate** must pass | small + strong: `2 opus, 2 sonnet, 1 codex-high, 1 glm-5.2` (M=6) |
 | **Implement Round 4** | **only** if Round 3 yields no gate-passing candidate (no council majority, all vetoed, or verify failure) | M fresh implementers, guided by the R3 review; still no consensus → **needs-human**, never a silently-picked winner | same pool |
 
-```text
-PLAN (always)
-  task ──▶ [N plan attempts] ──▶ plan council ──┬▶ distil guidance ─┐
-                                                └▶ save winner ──┐  │
-                                                                 │  ▼
-           [N fresh plan attempts + guidance] ◀──────────────────┼──┘
-                             │                                   │
-                             ▼                                   │
-           final plan pool = N round-2 + saved winner ◀──────────┘
-                             │
-                             ▼
-                  plan council rank ──▶ WINNING BRIEF ✓       (no implement flag → done)
-
-IMPLEMENT (only with the `implement` keyword)
-  winning brief ──▶ [M implementers, brief seeded] ──▶ code council + gate ──▶ winner ✓
-                                                                    │ gate fails
-                                                                    ▼
-                   [M fresh implementers + R3 guidance] ──▶ code council + gate ──▶ winner ✓ / needs-human
-```
-
 The distilled guidance is two short lists — *positives to consider* and *challenges to avoid* — phrased as generic principles, each tagged `[strong]` (held up repeatedly) or `[tentative]` (a single sighting), with no candidate-specific content.
 
 **Why round 2 discards the losing plans but keeps the lessons:** re-using a winner's content would make round 2 copy it and collapse the diversity that makes the loop work. Re-using the *distilled* pros and cons keeps diversity while raising the floor. The carried round-1 champion competes blind in the final pool on the merits — if a guided round-2 plan is genuinely better, it wins.
 
 Three guard rails: a plan-phase `NO_CONSENSUS` stops the run **before any implementation spend** (the split is surfaced for you to resolve); the R3→R4 fallback is **bounded** (one retry, then needs-human); and phase-scoped prose specs pick the pools inline — `Plan: 2 opus, 2 sonnet, 1 glm 5.2 Implement: 2 opus, 1 codex high implement @@JE:5:2` — with the `implement` keyword recognised only marker-adjacent, so prose like "implement a CSV parser" never false-triggers rounds 3–4.
 
-Cost scales with what you enable: plan-only two pass ≈ 2N attempts + 2 council judging points; `implement` adds M (+M on an R4 retry) and a third judging point. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+### Diversity injection (Pool A / Pool B)
+
+Independent attempts only help if they actually differ; same-model siblings on an identical prompt tend to converge. Diversity injection (**default on**) gives each attempt a distinct framing drawn from a modifier pool, so any divergence is attributable to the modifier. The draw is **seeded and logged** for reproducibility, **without replacement** within a round, and biased so same-model siblings get the most-different nudges.
+
+- **Pool A — approach nudges (default on, blind-safe).** These vary *how* an attempt starts and proceeds, not what counts as a good answer (e.g. "from first principles," "test-first," "happy path first then harden," or for prose "lead with your strongest claim," "write for a smart, skeptical reader"). Because they don't move the success criteria, blind review is preserved. Pool A is **task-type-aware**: a light heuristic picks a code-flavoured or prose-flavoured set so a "data model" nudge isn't prepended to an essay.
+- **Pool B — objective lenses (opt-in only).** These deliberately bias the *tradeoff* (`safely`, `quickly`, `efficiently`, `robustly`, `minimally`, …). Useful to fan attempts across a tradeoff frontier on purpose — but an attempt told "quickly" may correctly produce something fast and thin that a completeness-minded blind reviewer marks down. Pick one honest handling and state it: **best-overall** (keep review blind; the lens is exploration spice) or **judge-to-intent** (pass the lens to the reviewer, breaking blindness). If you didn't opt in, only Pool A is used.
+
+In **two pass**, round 2 takes a **fresh Pool A draw only** — the distilled guidance already carries the objective steering, so a conflicting Pool B lens would send mixed signals.
 
 ---
 
-## The judging council
+## The decision pipeline
+
+### The council: six blind seats
 
 Every judging point (the round-1 review and the final rank) is, by default, a **council of six blind judges** — five lenses (**correctness/verification** (runs the code, cites real exit codes), **spec-compliance**, **security** (holds the veto), **robustness/edge-cases**, **craft/efficiency**) plus **security-x**, a second cross-family security gate. The completeness-class and simplicity-class seats and security-x run on **codex-xhigh** (a different model family from the models that author most attempts); the security veto and the verification-heavy lenses are always Anthropic Opus. All six are blind to model identities and must ground every verdict in a required `checks_run` evidence list.
 
 - **The vote is independent, and councils never deliberate (judging-v3)** — no judge sees a peer. The tally runs **in code**: **>50% of living judges' first-place votes** on a candidate neither security gate has flagged `UNSAFE` (high/critical severity **with concrete evidence** — a union veto).
 - **Intermediate reviews fast-tally**: a majority carries one champion into the final pool; a split carries the **top two** non-vetoed. Nothing deliberates; the round's learning goes into the round-2 guidance.
-- **Final decision points run the steelman shootout**: the vote seeds the top-2 finalists, a non-voting steelman distils the judges' cons into minimal change-lists, each finalist is boosted on a copy (validation-gated), and a **cold blind re-judge** (fresh letters, no history) votes again — tie → iterate (max 5) → the orchestrator casts the deciding vote between the two gated finalists. The winner ships with its improvements applied.
+- **Final decision points run the steelman shootout** — walked stage by stage below.
 - **All finalists vetoed → `NO_CONSENSUS`** — surfaced to you (or needs-human + HALT in a grand loop). It is never silently resolved by a score average, Borda, or a meta-judge, and a vetoed candidate can never be picked.
 - A **verdict-integrity guard** rejects schema-valid-but-junk verdicts (placeholder reasoning, collapsed pros/cons, vacuous veto evidence) at every choke point, so a degenerate judge output dies and retries instead of steering the run.
 - `judges: 1` restores the legacy single blind Opus judge (cheap runs); `dualSecurity: false` drops only the security-x seat; `judgeMix: 'anthropic'` forces every seat native Opus.
 
 The design follows the LLM-as-judge research in [issue #22](https://github.com/robanderson/joust-engine/issues/22) and `docs/superpowers/specs/2026-07-02-judge-council-design.md`: diverse lenses over one generalist, independent votes before cross-talk, aggregation in code, evidence-forcing, and fail-closed no-consensus routing.
 
+### How a verdict actually happens, stage by stage
+
+The reference above says *what* the council is; this is *what happens*, in order, when a pool of candidates
+reaches a final decision point. Every stage below is real machinery that runs on every final judgment.
+
+```text
+  staged blind pool (candidates as letters, provenance stripped)
+        │
+        ▼
+  ①  SEED VOTE — 6 judges read the whole pool independently, once.
+        │         Each returns: per-candidate pros/cons, a full ranking,
+        │         ONE first-place vote, and (security seats) SAFETY flags.
+        ▼
+  ②  CODE TALLY — no model involved. >50% majority on a non-vetoed
+        │         candidate = WINNER, done. A veto (UNSAFE + concrete
+        │         evidence from either security seat) removes a candidate
+        │         outright — even the vote leader.
+        ▼         (no majority…)
+  ③  FINALISTS — the top-2 non-vetoed vote-getters advance.
+        ▼
+  ④  STEELMAN — a non-voting agent turns the judges' criticisms of each
+        │         finalist into a minimal, concrete improvement list.
+        ▼
+  ⑤  BOOST — an implementer applies each finalist's list to a COPY
+        │         (validation-gated; the original is never touched).
+        ▼
+  ⑥  COLD RUNOFF — a FRESH council, fresh letters, zero memory of
+        │         round ①, judges just the two boosted finalists.
+        ▼
+  ⑦  majority → WINNER (ships WITH its improvements applied)
+        tie     → repeat ④–⑥ (bounded: `steelmanMaxIters`, default 3,
+                  clamped 1..5), then the orchestrator casts the deciding
+                  vote between the two gated finalists.
+        all finalists vetoed → NO_CONSENSUS (a human decides; never a
+                  score average, never a synthesized winner)
+```
+
+Three properties of this pipeline are worth having in your head when reasoning about results:
+
+- **The seed vote is the stable signal; the shootout is the variance.** Repeated judgments of the same
+  pinned pool tend to agree strongly at stage ① (the same candidate leads the vote across independent
+  councils and letter shuffles) while stage ⑥ outcomes move around more — partly because the runoff
+  judges **boosted copies**, and the boost step (④–⑤) rewrites the finalists somewhat differently every
+  time. When you compare runs, compare at both levels: the seed ranking tells you what the judges think
+  of the *authored* work; the runoff winner tells you what survived improvement-under-criticism.
+- **The shootout is also the cost center.** Stages ④–⑥ roughly double a judgment's wall-clock and token
+  spend versus a clean stage-② majority, and a tie that forces a second iteration doubles it again. If a
+  run's duration surprises you, the first thing to check is how many shootout rounds it took
+  (`review-*/verdict.md` records the vote evolution round by round).
+- **Vetoes are rare but decisive.** A security seat flagging `UNSAFE` with evidence eliminates a
+  candidate regardless of votes — including a seed-vote leader, which reorders the finalists entirely.
+  Veto events are always persisted with their evidence (`council.json`), so a surprising winner should
+  send you to the veto log first.
+
+Everything the pipeline decides is auditable after the fact: per-judge verdicts and rankings
+(`review-*/council.json`), the tally and vote evolution (`verdict.md`), the steelman's change-lists and
+each boost's diff (the `review-*-steelman/` and runoff directories), and the seat-integrity audit
+(`rc_summary.judge_seats` — which model each seat was *intended* to run on versus what it actually ran
+on, so a silent model substitution can never hide).
+
 ---
 
-## Invoking it: the sigil and prose forms
+## Where the cost and the variance live
+
+No run data here — just the structural map of where a tournament spends, so you know where the system improves:
+
+- **Wall-clock: the slowest seat sets each phase.** Attempts run in parallel, so a round's duration is its slowest attempt — typically GLM or a local MLX model on heavy code (which is why they get their own, roomier timeouts; see [task size](#task-size-dynamic-limits)). Judging points are the serial spine between rounds.
+- **Tokens: judging dominates; the shootout doubles it.** Every judge reads the *whole* pool, so a judging point scales with N × deliverable size — and a steelman shootout roughly doubles that judgment again (a tie doubles it once more). Attempts scale linearly with N but are the cheap, wide part, and much of that spend can sit on non-Anthropic budgets.
+- **Variance: shootout rounds, then attempt diversity.** The seed vote is the stable signal; the boost-and-runoff loop is where run-to-run outcome variance concentrates (deliberately — the finalists get rewritten). Candidate diversity is *intended* variance, injected and logged.
+- **Cost formula.** Plan-only two pass ≈ 2N attempts + 2 council judging points; `implement` adds M (+M on an R4 retry) and a third judging point; grand loops multiply by Z. The skill confirms volume before spending at `N ≥ 8` (single pass) or `N ≥ 6` (two pass).
+- **Where to look.** `TIMELINE.md` shows where the wall-clock went, seat by seat; `verdict.md` shows how many shootout rounds a verdict took; `SUMMARY.md`'s `rc_summary` table shows dead seats you paid for. See [what a run leaves behind](#what-a-run-leaves-behind).
+
+---
+
+## Using it
 
 Put a trigger anywhere in your message; **the text before it is the task**. All forms are case-insensitive with optional spaces around the colons. Phase 0 of the skill runs a bundled parser (`bin/je-parse.mjs`) on your raw message — it does **not** hand-parse the sigil — and acts on the JSON it returns.
 
@@ -169,13 +281,7 @@ A spec is recognised as `<count> <model>` items only; an ordinary `<digit> <noun
 @@JE:6 top mixed  Design a rate-limiter.
 ```
 
-N = 6 over three buckets → 2 each → `[opus, opus, glm-5.2, glm-5.2, codex-high, codex-high]`.
-
-```text
-@@JE:5 top mixed  ...
-```
-
-N = 5 → base 1 each (3), remainder 2 by priority → opus +1, glm-5.2 +1 → `[opus, opus, glm-5.2, glm-5.2, codex-high]`.
+N = 6 over three buckets → 2 each → `[opus, opus, glm-5.2, glm-5.2, codex-high, codex-high]`. With `@@JE:5 top mixed`: base 1 each (3), remainder 2 by priority → opus +1, glm-5.2 +1 → `[opus, opus, glm-5.2, glm-5.2, codex-high]`.
 
 ### Worked examples
 
@@ -199,14 +305,14 @@ If you describe a generate-and-rank tournament in plain English with no marker a
 
 ### The slash-command form
 
-The plugin also ships its triggers as **Claude Code slash commands**, so you can launch a tournament without writing a sigil at all. There are two:
+The plugin also ships its triggers as **Claude Code slash commands**, so you can launch a tournament without writing a sigil at all:
 
 ```text
 /joust-engine:joust-engine   ...      runs a tournament
 /joust-engine:joust-bench    ...      runs the throughput benchmark (see je-bench, below)
 ```
 
-The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament skill are both named `joust-engine`, hence the doubled `/joust-engine:joust-engine`.
+The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament skill are both named `joust-engine`, hence the doubled `/joust-engine:joust-engine`. (A third bundled skill, `fable-engine`, triggers on `@@FE[:N]` — a fast composer variant where the orchestrating model itself reviews one wide blind round and composes the winner, with no councils; `@@JE` remains the calibration baseline.)
 
 **Whatever you type after the slash command is the arguments**, and Phase 0 feeds those arguments **verbatim** into the same `bin/je-parse.mjs` it would run on the body of an `@@JE` / `joust:` message. So the slash command is just a **different entry point into the same parser and the same skill** — it adds **no new flags** and changes **no behaviour**. Everything documented above (N, mode `M`, grand loops `Z`, task size, prose model specs, Top Mixed) works identically as slash-command arguments. You can even supply an explicit sigil in the arguments if you like:
 
@@ -216,9 +322,7 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 /joust-engine:joust-engine Design a rate-limiter.
 ```
 
-- The **first** form passes an explicit `@@JE:5` as the arguments → 5 attempts, single pass.
-- The **second** is a prose model spec → N is inferred from the counts (`2 + 2 = 4`, `[opus, opus, glm-5.2, glm-5.2]`); no sigil needed.
-- The **third** is a bare task with no sigil and no spec → it falls back to the interactive model gate (where N defaults to 6 and passes to 2), exactly as a bare `@@JE` would.
+The first form passes an explicit `@@JE:5` as the arguments → 5 attempts, single pass. The second is a prose model spec → N inferred from the counts (`2 + 2 = 4`, `[opus, opus, glm-5.2, glm-5.2]`); no sigil needed. The third is a bare task with no sigil and no spec → the interactive model gate (where N defaults to 6 and passes to 2), exactly as a bare `@@JE` would.
 
 > **Don't confuse this with the install commands.** `/plugin marketplace add …` and `/plugin install …` (see [Installation & setup](#installation--setup)) are Claude Code's built-in commands for *adding* the plugin. `/joust-engine:joust-engine` and `/joust-engine:joust-bench` are the engine's own commands for *invoking* it once it's installed.
 
@@ -226,39 +330,30 @@ The canonical name is `/<plugin>:<skill>`; here the plugin and the tournament sk
 
 ## Model providers
 
-Attempts can run on seven providers. The **judge panel is held fixed** (the 6-seat council anchored on Anthropic Opus — the security veto and verification-heavy lenses are always Opus, three seats run codex-xhigh — or the `judges:1` single Opus judge) so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
+The engine knows seven providers. **Six are selectable for tournament attempts** (the seventh, Claudex, ships as a runner + benchmark provider — see its row). The **judge panel is held fixed** (the 6-seat council anchored on Anthropic Opus — the security veto and verification-heavy lenses are always Opus, three seats run codex-xhigh — or the `judges:1` single Opus judge) so scoring stays consistent across attempts and rounds. Each non-Anthropic provider runs through a bundled runner script invoked by a thin command-runner agent (see [layout](#repository-layout)); this indirection is what makes those paths reliable.
 
 | Provider | Models (selectable axis) | Dispatch | Auth (from the **environment**) |
 |---|---|---|---|
-| **Anthropic** | `opus` · `sonnet` · `haiku` | Task tool, native in-process | the session's own Claude auth (no extra key) |
+| **Anthropic** | `opus` · `sonnet` · `haiku` (a `fable` token is also spellable in prose specs when the session's Agent tool offers the Fable tier) | Task tool, native in-process | the session's own Claude auth (no extra key) |
 | **GLM (z.ai)** | `glm-5.2` · `glm-5.1` · `glm-4.7` · `glm-4.5-air` | `claude` pointed at z.ai via `bin/glm-run.sh` | `ZAI_API_KEY` |
 | **Local MLX** | dynamic on-device list (via the `omlx` server) | `claude` pointed at `http://127.0.0.1:8000` via `bin/local-run.sh` | `OMLX_AUTH_TOKEN` |
 | **Codex (OpenAI)** | `gpt-5.5` (axis = reasoning effort: `codex-low/medium/high/xhigh`) · `gpt-5.6` family (`gpt-5.6` base + variants `codex-sol/terra/luna`, effort pinned high) | `codex exec` via `bin/codex-run.sh` | `~/.codex/auth.json` (no env var) |
 | **MiniMax** | `MiniMax-M3` (the only model) | `claude` pointed at the MiniMax endpoint via `bin/minimax-run.sh` | `MINIMAX_API_KEY` |
-| **Claudex (CLIProxyAPI)** | `gpt-5.6-sol` · `gpt-5.6-terra` · `gpt-5.6-luna` | `claude` pointed at a **local CLIProxyAPI proxy** via `bin/claudex-run.sh` | client-token **file** (`JE_CLAUDEX_TOKEN_FILE`, default `~/.config/cliproxyapi/client-token`); endpoint `JE_CLAUDEX_BASE_URL` (default `http://127.0.0.1:8317`) |
+| **Grok (xAI)** | `grok-build` · `grok-composer-2.5-fast` | `grok -p` (headless CLI) via `bin/grok-run.sh` | the `grok` CLI resolves its **own** credential: OAuth session **or** `XAI_API_KEY` — neither is required in the environment |
+| **Claudex (CLIProxyAPI)** | `gpt-5.6-sol` · `gpt-5.6-terra` · `gpt-5.6-luna` — *runner + [je-bench](#the-benchmarking-system-je-bench) provider today; not offered as a tournament attempt seat* | `claude` pointed at a **local CLIProxyAPI proxy** via `bin/claudex-run.sh` | client-token **file** (`JE_CLAUDEX_TOKEN_FILE`, default `~/.config/cliproxyapi/client-token`); endpoint `JE_CLAUDEX_BASE_URL` (default `http://127.0.0.1:8317`) |
 
 A few provider specifics worth knowing:
 
 - **Anthropic** model aliases map to API strings `claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5`.
-- **GLM** is the `claude` CLI pointed at z.ai's Anthropic-compatible endpoint. The selection maps through `glm`'s `--model` flag, which is **not** the GLM name: `glm-5.2 → --model opus`, `glm-5.1 → --model glm-5.1`, `glm-4.7 → --model sonnet`, `glm-4.5-air → --model haiku`. (Those aliases resolve to GLM models because the wrapper sets `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`.) GLM bills the z.ai plan and is the slow one on large multi-file tasks — give it a generous `glmTimeoutSecs`.
+- **GLM** is the `claude` CLI pointed at z.ai's Anthropic-compatible endpoint. The selection maps through `glm`'s `--model` flag, which is **not** the GLM name: `glm-5.2 → --model opus`, `glm-5.1 → --model glm-5.1`, `glm-4.7 → --model sonnet`, `glm-4.5-air → --model haiku`. (Those aliases resolve to GLM models because the wrapper sets `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`; the opus alias resolves to `glm-5.2[1m]`, the 1M-context variant.) GLM bills the z.ai plan and is the slow one on large multi-file tasks — give it a generous `glmTimeoutSecs`.
 - **Local MLX** has a **dynamic** catalogue: fetch it live with `omlx-models` (or `curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_AUTH_TOKEN" | jq -r '.data[].id'`). Ids pass straight through as `--model <exact-id>`. Local models are **free** (on-device) but slower, and small ones can be unreliable at saving a deliverable; prefer hosted providers for heavy writing tasks.
 - **Codex** serves **two model families**. On `gpt-5.5` the lever is **reasoning effort**: `low | medium | high | xhigh` ("Extra high"; `minimal` is rejected) — these tiers remain fully selectable, and the engine's default pools and judge seats stay pinned to `codex-xhigh`/`codex-high`. The **`gpt-5.6` family** (2026-07-14) adds the base `gpt-5.6` plus the named variants `codex-sol`/`codex-terra`/`codex-luna` (real CLI ids `gpt-5.6-sol` etc., verified on codex-cli 0.144.1), each pinned to effort `high`; a bare `codex` in a prose spec now means `codex-sol`. Codex has **no turn cap**, so its only per-attempt backstop is the wall clock (`codexTimeoutSecs`, default 600s). It bills your OpenAI/ChatGPT plan.
 - **MiniMax** exposes one model, `MiniMax-M3` (512K context), pinned via `ANTHROPIC_MODEL=MiniMax-M3` (so there's no `--model` flag). It bills your MiniMax plan; M3 was fast and clean on a heavy multi-file build in testing.
+- **Grok** has two variants on the `-m` axis; a bare `grok` in a prose spec means `grok-build` (deliberately *not* the CLI's own config default, which is `grok-composer-2.5-fast` — the Composer variant needs an explicit spelling). Grok has **both** guards (a real `--max-turns` cap and a wall clock), and its web search is **off by default** for hermetic, fair attempts (opt in with `JE_GROK_WEB=1`).
 
 **Every runner reads its key from the environment** — never by sourcing or grepping rc files — so the providers stay uniform. A provider whose key is unset produces an honest failure, not a fake fallback.
 
-**Provenance check (the anti-spoofing guard).** Every non-Anthropic attempt writes a marker into its run log proving it actually hit the intended endpoint — `JOUST-GLM-PROVENANCE endpoint=api.z.ai`, `JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000`, `JOUST-CODEX-PROVENANCE endpoint=api.openai.com`, `JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io`, `JOUST-CLAUDEX-PROVENANCE endpoint=127.0.0.1:8317` — plus a `DONE exit=0` with no `TIMEOUT`/`ERROR`. The validator is **line-anchored and provider-specific** (`^JOUST-<PROV>-…`), so an attempt whose own deliverable merely *mentions* a marker token can't false-fail. A candidate with no marker or no saved file is treated as a failed attempt and excluded; the round proceeds over the survivors.
-
----
-
-## Diversity injection (Pool A / Pool B)
-
-Independent attempts only help if they actually differ; same-model siblings on an identical prompt tend to converge. Diversity injection (**default on**) gives each attempt a distinct framing drawn from a modifier pool, so any divergence is attributable to the modifier. The draw is **seeded and logged** for reproducibility, **without replacement** within a round, and biased so same-model siblings get the most-different nudges.
-
-- **Pool A — approach nudges (default on, blind-safe).** These vary *how* an attempt starts and proceeds, not what counts as a good answer (e.g. "from first principles," "test-first," "happy path first then harden," or for prose "lead with your strongest claim," "write for a smart, skeptical reader"). Because they don't move the success criteria, blind review is preserved. Pool A is **task-type-aware**: a light heuristic picks a code-flavoured or prose-flavoured set so a "data model" nudge isn't prepended to an essay.
-- **Pool B — objective lenses (opt-in only).** These deliberately bias the *tradeoff* (`safely`, `quickly`, `efficiently`, `robustly`, `minimally`, …). Useful to fan attempts across a tradeoff frontier on purpose — but an attempt told "quickly" may correctly produce something fast and thin that a completeness-minded blind reviewer marks down. Pick one honest handling and state it: **best-overall** (keep review blind; the lens is exploration spice) or **judge-to-intent** (pass the lens to the reviewer, breaking blindness). If you didn't opt in, only Pool A is used.
-
-In **two pass**, round 2 takes a **fresh Pool A draw only** — the distilled guidance already carries the objective steering, so a conflicting Pool B lens would send mixed signals.
+**Provenance check (the anti-spoofing guard).** Every non-Anthropic attempt writes a marker into its run log proving it actually hit the intended endpoint — `JOUST-GLM-PROVENANCE endpoint=api.z.ai`, `JOUST-LOCAL-PROVENANCE endpoint=127.0.0.1:8000`, `JOUST-CODEX-PROVENANCE endpoint=api.openai.com`, `JOUST-MINIMAX-PROVENANCE endpoint=api.minimax.io`, `JOUST-GROK-PROVENANCE endpoint=cli-chat-proxy.grok.com`, `JOUST-CLAUDEX-PROVENANCE endpoint=127.0.0.1:8317` — plus a `DONE exit=0` with no `TIMEOUT`/`ERROR`. The validator is **line-anchored and provider-specific** (`^JOUST-<PROV>-…`), so an attempt whose own deliverable merely *mentions* a marker token can't false-fail. A candidate with no marker or no saved file is treated as a failed attempt and excluded; the round proceeds over the survivors.
 
 ---
 
@@ -271,7 +366,7 @@ Per loop `k` (FAN topology — the default):
 1. **STOP-file kill switch** checked at the top of every iteration — create `<runDir>/STOP` at any time to halt before the next loop, without killing the harness.
 2. **Branch off base:** `JE-<loop>-<random7>` off the branch you started on. *(This fixed name is used as-is, overriding any branch-prefix rule you have configured, for loop branches only.)*
 3. **Run the tournament** (the unchanged engine), with the task augmented by a **cross-loop ledger** of what prior loops already proposed, so each loop attacks something different.
-4. **Implement the winner** via the Opus `joust-implementer` agent — the *only* actor that writes to the real repo. It makes the smallest coherent change on the branch, leaves it **unstaged**, records ambiguities in `JE-NOTES.md`, and never runs git.
+4. **Implement the winner.** In the self-contained mode this is the Opus `joust-implementer` agent — the *only* actor that writes to the real repo. It makes the smallest coherent change on the branch, leaves it **unstaged**, records ambiguities in `JE-NOTES.md`, and never runs git. (In repo-anchored runs, where attempts already work on real worktree branches, the winning attempt's gate-passing commit is adopted directly via `je-git.sh adopt_winner_branch` instead.)
 5. **Verify, fail-closed.** Auto-detected commands (npm scripts, `ruff`/`pytest`, `make test/check`, `cargo`, `go`) run **fail-fast**; a failure or "no verify commands" routes the PR to **draft + `needs-human`** (with a capped tail of the failing output) and **halts the chain**.
 6. **Commit, push, open the PR** (one per loop, individually mergeable off base). A per-loop **DONE marker** is written only after the PR exists, so a re-run skips completed loops.
 
@@ -287,30 +382,36 @@ The orchestration home is the skill procedure plus `bin/je-git.sh` (which owns *
 
 ---
 
-## Run state: heartbeat, abort stamping, resume
+## Operations & audit
 
-Every run writes a `run-state.json` sidecar into its run directory — the same trust class
-as `mapping.json` (unblinding bookkeeping; never judge-visible). It is updated atomically
-at every phase boundary through the engine's verified persist dataplane, and it is an
-**index, never an authority**: resume decisions are re-derived from the artifacts on disk.
+### Run state: heartbeat, abort stamping, resume
 
-- **Heartbeat** — phase, a monotonic `phase_index`, and a per-seat status table land at
-  each phase boundary, so a dead run is inspectable at a glance.
-- **Abort stamping** — seats that were in flight when a run died are reclassified
-  `aborted` on the next launch from on-disk truth (empty workspace, no `JOUST-RC` line),
-  never from the file's own claims.
-- **Resume** — relaunch with `resume: true` and the SAME `runDir`: completed seats are
-  reused **in place** (same blind-letter index, so blind judging determinism holds) and
-  only missing/failed seats re-dispatch. Reuse is gated by a config fingerprint (attempts,
-  rotations, task); any drift refuses reuse and falls back to a clean full run. A
-  `resume.lock` (atomic, symlink-refusing) stops two resumes racing one run directory.
-  The SUMMARY of a resumed run discloses exactly which seats were reused vs re-run.
+Every run writes a `run-state.json` sidecar into its run directory — the same trust class as `mapping.json` (unblinding bookkeeping; never judge-visible). It is updated atomically at every phase boundary through the engine's verified persist dataplane, and it is an **index, never an authority**: resume decisions are re-derived from the artifacts on disk.
 
-A hand-edited `run-state.json` cannot inject a fake completed seat: there is no code path
-from its status fields to any reuse decision — the on-disk probe is the single source of
-truth, so the worst a forged file can cause is a re-dispatch.
+- **Heartbeat** — phase, a monotonic `phase_index`, and a per-seat status table land at each phase boundary, so a dead run is inspectable at a glance.
+- **Abort stamping** — seats that were in flight when a run died are reclassified `aborted` on the next launch from on-disk truth (empty workspace, no `JOUST-RC` line), never from the file's own claims.
+- **Resume** — relaunch with `resume: true` and the SAME `runDir`: completed seats are reused **in place** (same blind-letter index, so blind judging determinism holds) and only missing/failed seats re-dispatch. Reuse is gated by a config fingerprint (attempts, rotations, task); any drift refuses reuse and falls back to a clean full run. A `resume.lock` (atomic, symlink-refusing) stops two resumes racing one run directory. The SUMMARY of a resumed run discloses exactly which seats were reused vs re-run.
 
-## The dogfood backlog
+A hand-edited `run-state.json` cannot inject a fake completed seat: there is no code path from its status fields to any reuse decision — the on-disk probe is the single source of truth, so the worst a forged file can cause is a re-dispatch.
+
+### What a run leaves behind
+
+Two roots, not one. The **run directory** (default `<plugin-root>/.runs/<run-id>`) holds every persisted artifact; each attempt's raw **workspace** lives under a separate root (default `/tmp/je-workspaces/<run-id>`), because nested CLI runners refuse to write under the plugin's config path — and parallel agents must never share a directory anyway. `.runs/` is gitignored: anything worth keeping goes to [the dogfood backlog](#the-dogfood-backlog) or a PR.
+
+What lands in a `runDir`, and what each file answers:
+
+| Artifact | What it tells you |
+|---|---|
+| `mapping.json` | the unblinding map — which model was behind each candidate letter, per round, plus the winner and the run's `rc_summary` (per-seat two-digit return codes; seat-integrity: intended vs actual judge models) |
+| `SUMMARY.md` / `SUMMARY.blind.md` | the human-readable run report (unblinded / letters-only twin, safe to share) |
+| `review-*/` | one directory per judging point: the staged blind `_pool.md` the judges read, `verdict.md` (the tally and vote evolution, round by round), `council.json` (per-judge verdicts, rankings, veto evidence), and the steelman/runoff subdirectories with each boost's diff |
+| `winner/`, `_winning-plan/plan.md` | the saved round-1 champion (two pass) and the winning brief handed to implementers |
+| `implement.json`, `contributions.json` | implement-phase outcome (rounds, winner, `needs_human`) and per-candidate credit |
+| `TIMELINE.md` + `timeline.jsonl` | the per-agent wall-clock timeline (who ran when, for how long, gated on what), mined deterministically from transcripts by `bin/je-timeline.mjs` — zero tokens |
+| `_context/_context.md` | the shared context bundle, if the run was given known input files (`contextFiles`) — bundled once so N attempts don't all re-read the same files; it lives outside every candidate workspace so staging never leaks it to the judges |
+| `run-state.json` | the heartbeat/resume sidecar above |
+
+### The dogfood backlog
 
 Problems found while running tournaments are filed as **GitHub Issues labelled `dogfood`** (the live backlog), so they survive the gitignored `.runs/` directory and get triaged later. All forge access is confined to one helper, `bin/je-issue.sh`, so the engine stays forge-agnostic.
 
@@ -330,49 +431,7 @@ bin/je-issue.sh claim <N> <run-id>                             # best-effort cla
 - **No `gh` / offline?** `new` degrades to a committed draft under `docs/dogfood/inbox/` (never `.runs/`); re-file later with `drain-inbox`.
 - Legacy `D-NNNN` items were imported as **closed `dogfood` issues** (full evidence in each body); there is no in-repo archive.
 
----
-
-## Installation & setup
-
-Install Joust Engine **from inside Claude Code** — it installs straight from this GitHub repo, so there is no external marketplace or registry to register with first. Run the first command, then the second, then apply it:
-
-```text
-/plugin marketplace add robanderson/joust-engine
-/plugin install joust-engine@joust-engine
-/reload-plugins
-```
-
-What each line does:
-
-1. **`/plugin marketplace add robanderson/joust-engine`** — register this repo as a plugin marketplace (Claude Code accepts the GitHub `owner/repo` shorthand). The repo root holds `.claude-plugin/marketplace.json` (marketplace name `joust-engine`).
-2. **`/plugin install joust-engine@joust-engine`** — install the plugin. The form is `<plugin-name>@<marketplace-name>`; here both are `joust-engine` (the plugin manifest is `.claude-plugin/plugin.json`, name `joust-engine`, version `0.1.0`). It ships two skills (`joust-engine`, `joust-bench`) and ten agents.
-3. **`/reload-plugins`** — **apply it.** This is the step the install command doesn't do for you: the newly installed plugin's skills and agents only load once you reload (or restart the session). *(If you install interactively instead — see below — Claude Code prints "Run /reload-plugins to apply" for you.)*
-
-**Interactive alternative:** if you prefer to browse, run `/plugin` with **no arguments** after step 1 to open the marketplace, then install `joust-engine` through the menu. Either path ends the same way — at step 3, apply it with `/reload-plugins`.
-
-After install + reload, the `joust-engine` and `joust-bench` skills and the `@@JE` trigger are available in your sessions; the bundled scripts under `bin/` run via `node` / `bash` from the resolved plugin root. **Confirm the install:** check that the `joust-engine` skill appears (e.g. it's listed in the skills list, or the `@@JE` trigger is recognised when you type it). (To launch a tournament once installed, use the `@@JE` sigil, the `joust:` prose marker, or the [`/joust-engine:joust-engine` slash command](#the-slash-command-form) — all three feed the same parser.)
-
-> **You need a recent Claude Code with plugin support.** Anthropic auth alone — your session's own Claude login — is enough to start: Opus/Sonnet/Haiku attempts and the Opus judge need no extra keys. Optional per-provider keys (GLM / local / codex / minimax / grok) are listed in the table below and only matter if you want attempts on those providers.
-
-> **Enabling dynamic workflows.** The preferred backend runs on Claude Code's dynamic-workflow orchestration. Turn it on by upgrading effort to its maximum: run `/effort` and select **ultracode** (max = xhigh reasoning + dynamic workflow orchestration). With it on, the tournament fans out through the `Workflow` engine and is watchable live in `/workflows`. Without it, the skill automatically falls back to manual Task-tool + `glm` CLI dispatch — the same tournament, just not driven by the workflow engine.
-
-### What you need per provider
-
-**Anthropic only is enough to start.** Opus/Sonnet/Haiku attempts and the Opus judge use your session's own Claude auth — no extra keys. Everything below is **optional**, needed only if you want attempts on that provider:
-
-| Provider | You need | Set how |
-|---|---|---|
-| Anthropic | nothing extra | session auth |
-| GLM (z.ai) | the `glm` CLI + `ZAI_API_KEY` | export `ZAI_API_KEY` in your shell profile |
-| Local MLX | the `omlx` server running on `127.0.0.1:8000` + `OMLX_AUTH_TOKEN` | start `omlx`; export `OMLX_AUTH_TOKEN` |
-| Codex (OpenAI) | the `codex` CLI, signed in (`~/.codex/auth.json`) | `codex` login; optional `OPENAI_API_KEY` for ids outside the `gpt-5.5`/`gpt-5.6` families |
-| MiniMax | the `claude` CLI + `MINIMAX_API_KEY` | export `MINIMAX_API_KEY` in your shell profile |
-
-Every runner reads its key **from the environment** (exported in your shell profile and inherited into the session at launch), exactly the same way for every provider. The skill probes liveness before spending a round where it can — e.g. a one-line Codex probe, an `omlx-models` fetch — and offers another tier if a provider is down or its CLI is stale (e.g. `brew upgrade codex`).
-
----
-
-## The benchmarking system (`je-bench`)
+### The benchmarking system (`je-bench`)
 
 The `joust-bench` skill (trigger: ask to benchmark model speed, run `/je-bench`, or the [`/joust-engine:joust-bench` slash command](#the-slash-command-form)) is a thin wrapper over `bin/je-bench.mjs`. It measures **generation throughput (tokens/second)** for every model the system can call, on a **cold** call (first call — connection/cache/route warmup for hosted providers, a genuine weight-load only for local MLX) and an immediate **hot** call (second identical call). It prints a table and **appends every result** to `<plugin>/.bench/results.jsonl` (append-only, written per-model immediately, so a crashed sweep keeps what it produced).
 
@@ -391,7 +450,7 @@ node "<plugin-root>/bin/je-bench.mjs" --list --models all
 node "<plugin-root>/bin/je-bench.mjs" --models opus,minimax-m3 --profile heavy
 ```
 
-**Selection grammar** (`--models`, comma-separated, de-duped): `all` (default) · a provider (`anthropic|glm|local|codex|minimax`) · `<provider>:<id>` (e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`) · a bare id (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, a local id).
+**Selection grammar** (`--models`, comma-separated, de-duped): `all` (default) · a provider (`anthropic|glm|local|codex|minimax|grok|claudex`) · `<provider>:<id>` (e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`) · a bare id (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, `grok-build`, a local id).
 
 **Two workload profiles** (`--profile`, default `light`; `--heavy`/`--light` shorthand):
 
@@ -408,56 +467,91 @@ Useful tips: run `--list` first to confirm (and price) the plan before the real 
 
 ---
 
+## Installation & setup
+
+Install Joust Engine **from inside Claude Code** — it installs straight from this GitHub repo, so there is no external marketplace or registry to register with first. Run the first command, then the second, then apply it:
+
+```text
+/plugin marketplace add robanderson/joust-engine
+/plugin install joust-engine@joust-engine
+/reload-plugins
+```
+
+What each line does:
+
+1. **`/plugin marketplace add …`** — register this repo as a plugin marketplace (Claude Code accepts the GitHub `owner/repo` shorthand; the repo holds `.claude-plugin/marketplace.json`, marketplace name `joust-engine`).
+2. **`/plugin install …`** — install the plugin. The form is `<plugin-name>@<marketplace-name>`; here both are `joust-engine` (the plugin manifest is `.claude-plugin/plugin.json`, name `joust-engine`, version `0.1.0`). It ships three skills (`joust-engine`, `joust-bench`, `fable-engine`) and ten agents.
+3. **`/reload-plugins`** — **apply it.** This is the step the install command doesn't do for you: the newly installed plugin's skills and agents only load once you reload (or restart the session). *(If you install interactively instead — see below — Claude Code prints "Run /reload-plugins to apply" for you.)*
+
+**Interactive alternative:** if you prefer to browse, run `/plugin` with **no arguments** after step 1 to open the marketplace, then install `joust-engine` through the menu. Either path ends the same way — apply it with `/reload-plugins`.
+
+After install + reload, the `joust-engine` and `joust-bench` skills and the `@@JE` trigger are available in your sessions; the bundled scripts under `bin/` run via `node` / `bash` from the resolved plugin root. **Confirm the install:** check that the `joust-engine` skill appears (e.g. it's listed in the skills list, or the `@@JE` trigger is recognised when you type it). (To launch a tournament once installed, use the `@@JE` sigil, the `joust:` prose marker, or the [`/joust-engine:joust-engine` slash command](#the-slash-command-form) — all three feed the same parser.)
+
+> **You need a recent Claude Code with plugin support.** Anthropic auth alone — your session's own Claude login — is enough to start: Opus/Sonnet/Haiku attempts and the Opus judge need no extra keys. Optional per-provider keys (GLM / local / codex / minimax / grok) are listed in the table below and only matter if you want attempts on those providers.
+
+> **Enabling dynamic workflows.** The preferred backend runs on Claude Code's dynamic-workflow orchestration. Turn it on by upgrading effort to its maximum: run `/effort` and select **ultracode** (max = xhigh reasoning + dynamic workflow orchestration). With it on, the tournament fans out through the `Workflow` engine and is watchable live in `/workflows`. Without it, the skill automatically falls back to manual Task-tool + `glm` CLI dispatch — the same tournament, just not driven by the workflow engine.
+
+### What you need per provider
+
+**Anthropic only is enough to start.** Opus/Sonnet/Haiku attempts and the Opus judge use your session's own Claude auth — no extra keys. Everything below is **optional**, needed only if you want attempts on that provider:
+
+| Provider | You need | Set how |
+|---|---|---|
+| Anthropic | nothing extra | session auth |
+| GLM (z.ai) | the `glm` CLI + `ZAI_API_KEY` | export `ZAI_API_KEY` in your shell profile |
+| Local MLX | the `omlx` server running on `127.0.0.1:8000` + `OMLX_AUTH_TOKEN` | start `omlx`; export `OMLX_AUTH_TOKEN` |
+| Codex (OpenAI) | the `codex` CLI, signed in (`~/.codex/auth.json`) | `codex` login; optional `OPENAI_API_KEY` for ids outside the `gpt-5.5`/`gpt-5.6` families |
+| MiniMax | the `claude` CLI + `MINIMAX_API_KEY` | export `MINIMAX_API_KEY` in your shell profile |
+| Grok (xAI) | the `grok` CLI, signed in | `grok` login (OAuth session) **or** export `XAI_API_KEY` — the CLI resolves its own credential |
+| Claudex *(je-bench only today)* | a local CLIProxyAPI proxy + its client-token file | defaults: `JE_CLAUDEX_BASE_URL=http://127.0.0.1:8317`, token at `~/.config/cliproxyapi/client-token` |
+
+Every runner reads its key **from the environment** (exported in your shell profile and inherited into the session at launch), exactly the same way for every provider. The skill probes liveness before spending a round where it can — e.g. a one-line Codex probe, an `omlx-models` fetch — and offers another tier if a provider is down or its CLI is stale (e.g. `brew upgrade codex`).
+
+---
+
 ## Repository layout
 
-A Claude Code plugin: a manifest, two skills, ten agents, the workflow engine, and the bin helpers. How the pieces fit:
+A Claude Code plugin: a manifest, three skills, ten agents, the workflow engine, and the bin helpers. How the pieces fit:
 
 ```text
 joust-engine/
-├── plugin.json                         # plugin manifest (name, version, skills, agents)
+├── .claude-plugin/
+│   ├── plugin.json                     # plugin manifest (name, version, skills, agents)
+│   └── marketplace.json                # lets this repo act as its own marketplace
 ├── package.json                        # toolchain pin + test entry points (not published to npm)
 ├── .nvmrc                              # pinned Node version for local dev + CI
-├── .github/workflows/ci.yml            # CI lane 1: runs `npm run ci` on push + PR
+├── .github/workflows/ci.yml            # CI: runs `npm run ci` on push + PR
 ├── scripts/                            # dev tooling (run-tests, static checks)
 ├── DOGFOOD.md                          # pointer stub → live backlog is GitHub Issues
 ├── skills/
 │   ├── joust-engine/
 │   │   ├── SKILL.md                    # the orchestration procedure (Phases 0–7); runs the loop
-│   │   └── references/
-│   │       ├── orchestration.md        # dispatch mechanics, model ids, runner args, run layout
-│   │       ├── diversity-injection.md  # Pool A / Pool B, sampling rules
-│   │       ├── review-rubric.md        # the Opus reviewer/ranker scoring + distillation rubric
-│   │       └── dogfood.md              # the dogfood-backlog convention
-│   └── joust-bench/
-│       └── SKILL.md                    # /je-bench wrapper over bin/je-bench.mjs
+│   │   └── references/                 # orchestration.md (dispatch mechanics, model ids, runner
+│   │                                   #   args, run layout) · diversity-injection.md (Pool A/B,
+│   │                                   #   sampling rules) · review-rubric.md · dogfood.md
+│   ├── joust-bench/SKILL.md            # /je-bench wrapper over bin/je-bench.mjs
+│   └── fable-engine/SKILL.md           # @@FE fast composer variant (composeOnly mode)
 ├── agents/                             # bundled worker agents
-│   ├── joust-glm-5-2.md           # GLM workers (one per GLM model) — run bin/glm-run.sh
-│   ├── joust-glm-5-1.md
-│   ├── joust-glm-4-7.md
-│   ├── joust-glm-4-5-air.md
-│   ├── joust-local.md             # one generic local worker — runs bin/local-run.sh
-│   ├── joust-codex.md             # one generic codex worker — runs bin/codex-run.sh
-│   ├── joust-minimax.md           # one generic minimax worker — runs bin/minimax-run.sh
-│   ├── joust-grok.md              # one generic grok worker (both variants) — runs bin/grok-run.sh
-│   ├── joust-implementer.md       # (grand loops) Opus; applies the winner to the real repo
-│   └── joust-cleanup.md           # (on request) Opus; ASK-FIRST disk reclaim via bin/je-git.sh je_cleanup
+│   ├── joust-glm-*.md                  # GLM workers (one per GLM model) — run bin/glm-run.sh
+│   ├── joust-{local,codex,minimax,grok}.md   # one generic worker per runner provider
+│   ├── joust-implementer.md            # (grand loops) Opus; applies the winner to the real repo
+│   └── joust-cleanup.md                # (on request) Opus; ASK-FIRST disk reclaim via bin/je-git.sh je_cleanup
 ├── workflows/
-│   ├── tournament.mjs                  # the dynamic-workflow engine: plan rounds → council review → (implement) rounds 3-4 → council rank
-│   └── tournament-*.test.mjs           # engine test suite (worktree mode, workspace root, verdict integrity, contributions, ...)
+│   ├── tournament.mjs                  # the engine: plan rounds → council → (implement) rounds 3-4 → final rank
+│   └── tournament-*.test.mjs           # engine test suite
 ├── bin/                                # runners + helpers (run with node / bash)
 │   ├── je-parse.mjs                    # Phase 0 invocation parser (sigil, prose spec, Top Mixed, Z, task size)
 │   ├── je-git.sh                       # ALL git/gh side effects for grand loops (preflight, branch, verify, PR, markers, cleanup)
 │   ├── je-issue.sh                     # the only forge-touching part: dogfood GitHub-Issues helper
-│   ├── glm-run.sh                      # provider runner scripts (build a benign command, set env,
-│   ├── local-run.sh                    #   call the nested claude/codex, write provenance markers)
-│   ├── codex-run.sh
-│   ├── minimax-run.sh
-│   ├── grok-run.sh
-│   ├── claudex-run.sh                  #   (claudex = claude on gpt-5.6-* via a local CLIProxyAPI proxy)
+│   ├── glm-run.sh · local-run.sh       # provider runner scripts (build a benign command, set env,
+│   ├── codex-run.sh · minimax-run.sh   #   call the nested claude/codex/grok, write provenance markers)
+│   ├── grok-run.sh · claudex-run.sh
+│   ├── je-timeline.mjs                 # mines TIMELINE.md from run transcripts (deterministic, zero tokens)
 │   ├── je-bench.mjs                    # the throughput benchmark
-│   └── README.je-bench.md              # je-bench usage + results-format reference
+│   ├── README.je-bench.md              # je-bench usage + results-format reference
+│   └── … (*.test.mjs / *.test.sh twins for the above)
 ├── docs/
-│   ├── superpowers/specs/              # approved design specs (judge council, plan/implement rounds)
+│   ├── superpowers/specs/              # approved design specs (judge council, plan/implement rounds, steelman loop, …)
 │   └── dogfood/inbox/                  # committed offline drafts (no-gh fallback)
 └── .bench/results.jsonl                # append-only je-bench history
 ```
@@ -465,40 +559,29 @@ joust-engine/
 **How the pieces fit together at run time:**
 
 - **SKILL.md is the driver.** On a trigger it runs `bin/je-parse.mjs` (Phase 0), the mandatory model gate (Phase 1), diversity injection (Phase 1b), then dispatches.
-- **`workflows/tournament.mjs` is the preferred backend.** Invoked via the `Workflow` tool, it runs the parallel attempts, the blind Opus council reviews, and (two pass) round 2 + final rank — plus the optional implement rounds — deterministically — watchable live in `/workflows`. It returns the structured mapping + rankings the skill reports in Phase 6. (Fallback when workflows are unavailable: manual Task-tool + `glm` CLI dispatch.)
-- **Agents are thin command-runners.** Anthropic attempts run native via the Task tool. Each non-Anthropic attempt runs through its wrapper agent (a cheap Bash-only driver) executing the matching `bin/*-run.sh` — the script sets provider env, closes stdin, calls the nested `claude`/`codex`, and writes the provenance marker. This indirection exists because a wrapper handed a *raw* nested command proved unreliable (it would solve the task itself, refuse on "safety," or let the weak inner model bail without saving); it matters most for **codex**, a fully autonomous external agent.
-- **The judge is fixed.** Reviewer and final ranker are always Opus via the Task tool. Before judging, the engine **stages** each deliverable into a clean blind tree (copying files and deleting the known engine files — `_brief.txt`, the run logs — by exact name, an *allowlist* that keeps legitimately `_`-prefixed deliverables), **validates** the success provenance contract, and **pools** the valid deliverables into one blind-labelled `_pool.md` the judge reads — failing closed on any invalid candidate.
-- **Grand loops** add `joust-implementer` (the only repo-writer) and `bin/je-git.sh` (all git/gh); the tournament engine itself stays repo-pure.
+- **`workflows/tournament.mjs` is the preferred backend.** Invoked via the `Workflow` tool, it runs the parallel attempts, the blind council reviews, and (two pass) round 2 + final rank — plus the optional implement rounds — deterministically, watchable live in `/workflows`. It returns the structured mapping + rankings the skill reports in Phase 6. (Fallback when workflows are unavailable: manual Task-tool + `glm` CLI dispatch.)
+- **Agents are thin command-runners.** Anthropic attempts run native via the Task tool. Each non-Anthropic attempt runs through its wrapper agent (a cheap Bash-only driver) executing the matching `bin/*-run.sh` — the script sets provider env, closes stdin, calls the nested `claude`/`codex`/`grok`, and writes the provenance marker. This indirection exists because a wrapper handed a *raw* nested command proved unreliable (it would solve the task itself, refuse on "safety," or let the weak inner model bail without saving); it matters most for **codex**, a fully autonomous external agent.
+- **The judge is fixed.** Reviewer and final ranker are always Opus-anchored via the Task tool. Before judging, the engine **stages** each deliverable into a clean blind tree (copying files and deleting the known engine files — `_brief.txt`, the run logs — by exact name, an *allowlist* that keeps legitimately `_`-prefixed deliverables), **validates** the success provenance contract, and **pools** the valid deliverables into one blind-labelled `_pool.md` the judge reads — failing closed on any invalid candidate.
+- **Grand loops** add `joust-implementer` (the only repo-writer in self-contained mode) and `bin/je-git.sh` (all git/gh); the tournament engine itself stays repo-pure.
 
 ---
 
 ## Development
 
-The deterministic tooling (the `bin/` runners, the pure helpers in
-`workflows/tournament.mjs`) ships with a test suite. There is one entry point —
-the same command runs locally and in CI:
+The deterministic tooling (the `bin/` runners, the pure helpers in `workflows/tournament.mjs`) ships with a test suite. There is one entry point — the same command runs locally and in CI:
 
 ```bash
 npm test       # run every test (node:test + the hand-rolled harnesses + the bash tests)
 npm run check  # static, model-free checks: manifests are valid JSON; every agent/skill
-               # named in plugin.json has its file on disk
+               # named in the plugin manifest has its file on disk
 npm run ci     # check + test, exactly what CI runs
 ```
 
-No dependencies to install — the tests are Node/Bash stdlib only. Node is pinned in
-`.nvmrc` (run `nvm use`). `npm test` discovers and runs each `*.test.mjs` /
-`*.test.sh` under `workflows/` and `bin/`; add a test by dropping a new file there.
+No dependencies to install — the tests are Node/Bash stdlib only. Node is pinned in `.nvmrc` (run `nvm use`). `npm test` discovers and runs each `*.test.mjs` / `*.test.sh` under `workflows/` and `bin/`; add a test by dropping a new file there.
 
-**Scope:** this covers the *tooling* — the parser, git/gh helpers, contribution
-math, output parsing, and key-hygiene guards — which call no model and need no
-network. It does **not** test skill *behaviour* (whether Claude triggers on `@@JE`,
-runs blind attempts, etc.); that needs a model in the loop and is an evals concern,
-not a unit test. CI runs on every push and PR via
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+**Scope:** this covers the *tooling* — the parser, git/gh helpers, contribution math, output parsing, and key-hygiene guards — which call no model and need no network. It does **not** test skill *behaviour* (whether Claude triggers on `@@JE`, runs blind attempts, etc.); that needs a model in the loop and is an evals concern, not a unit test. CI runs on every push and PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-> **Naming caveat:** the top-level `workflows/` directory is the tournament
-> **engine source**, *not* GitHub Actions. CI workflows live under
-> `.github/workflows/`.
+> **Naming caveat:** the top-level `workflows/` directory is the tournament **engine source**, *not* GitHub Actions. CI workflows live under `.github/workflows/`.
 
 ---
 
