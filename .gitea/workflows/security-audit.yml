@@ -1,8 +1,11 @@
 # 1hut security audit stub — DO NOT grow logic here; everything lives in claude/1hut-ci.
 # Two parallel jobs, blind to each other: same brief, same diff, zero shared state.
 # Advisory: statuses audit/codex + audit/opus are informative, never required.
-# Private uses: is unsupported (probe 2026-07-19) — logic arrives via read-only deploy-key clone.
-# This file is public-safe: all infrastructure comes from user-level secrets.
+# This file is public-safe: all infrastructure (clone URL, deploy key, runner image) comes from
+# secrets, so the workflow names nothing about the LAN. Private uses: is unsupported (probe
+# 2026-07-19) — central logic arrives via read-only deploy-key clone, and the jobs run INSIDE the
+# baked je-ci-runner image (bubblewrap + pinned CLIs) via `container:` — no runner reconfig, and
+# the shared runner's other workflows keep using stock ubuntu-latest untouched.
 name: security audit
 on:
   pull_request:
@@ -10,14 +13,13 @@ on:
 jobs:
   audit-codex:
     runs-on: ubuntu-latest
+    container:
+      image: ${{ secrets.HUT_CI_RUNNER_IMAGE }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
       - name: Fetch central CI logic (read-only deploy key)
         run: |
           umask 077
@@ -32,14 +34,13 @@ jobs:
         run: /tmp/1hut-ci/actions/security-audit/run-local.sh codex
   audit-opus:
     runs-on: ubuntu-latest
+    container:
+      image: ${{ secrets.HUT_CI_RUNNER_IMAGE }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
       - name: Fetch central CI logic (read-only deploy key)
         run: |
           umask 077
